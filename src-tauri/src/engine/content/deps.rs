@@ -1,0 +1,1973 @@
+// Mod dependency check: builds a "what else to install" plan and finds version conflicts. Gets data from Modrinth (api.modrinth.com), project and version ids are sent. Files are installed only by install_dep_items, which a UI button calls.
+use crate::engine::*;
+use serde_json::Value;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use futures::StreamExt;
+use tauri::AppHandle;
+
+/// Dotted-numeric precedence, ignoring `+build.metadata` — enough to tell
+/// `0.155.2+26.1.2` is newer than `0.144.3+26.1` the way Fabric mod authors mean
+/// it, without pulling in a full semver crate for four comparison operators.
+fn cmp_version(a: &str, b: &str) -> Ordering {
+    let parts = |s: &str| -> Vec<i64> {
+        s.split('+')
+            .next()
+            .unwrap_or(s)
+            .split(['.', '-'])
+            .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+            .map(|p| p.parse::<i64>().unwrap_or(0))
+            .collect()
+    };
+    let (pa, pb) = (parts(a), parts(b));
+    for i in 0..pa.len().max(pb.len()) {
+        match pa.get(i).copied().unwrap_or(0).cmp(&pb.get(i).copied().unwrap_or(0)) {
+            Ordering::Equal => continue,
+            o => return o,
+        }
+    }
+    Ordering::Equal
+}
+
+/// A minimal reading of Fabric's version predicate syntax: `>=`, `<=`, `>`, `<`,
+/// `=` (or a bare version, which means `=`), ANDed by whitespace, and `*` for
+/// "any version". `breaks: {"fabric-api": "<0.144.3+26.1"}` is how a mod says
+/// "needs a newer Fabric API", not "never install with Fabric API" — treating
+/// every breaks entry as unconditional flags that pairing as a hard conflict
+/// even when the version about to land clears the guard.
+/// Anything this cannot parse (carets, tildes, OR-groups) is left unresolved and
+/// counted as a match, so an incompatibility the launcher cannot verify still
+/// gets flagged instead of silently disappearing.
+pub(crate) fn version_satisfies(version: &str, range: &str) -> bool {
+    let range = range.trim();
+    if range.is_empty() || range == "*" {
+        return true;
+    }
+    if range.starts_with(['[', '(']) {
+        return maven_ranges(range).into_iter().any(|r| version_satisfies(version, &maven_range(r)));
+    }
+    range.split_whitespace().all(|clause| clause_satisfies(version, clause))
+}
+
+/// Forge and NeoForge write ranges the Maven way, `(,1.13.3]` or `[1.0,2.0),[3.0,)`; a comma
+/// separates both the bounds and the alternatives, so the split is after a closing bracket.
+fn maven_ranges(spec: &str) -> Vec<&str> {
+    let mut out = vec![];
+    let mut start = 0;
+    for (i, c) in spec.char_indices() {
+        if matches!(c, ']' | ')') {
+            out.push(spec[start..=i].trim().trim_start_matches(',').trim());
+            start = i + 1;
+        }
+    }
+    out.retain(|r| !r.is_empty());
+    out
+}
+
+fn clause_satisfies(version: &str, clause: &str) -> bool {
+    let (op, rhs) = if let Some(r) = clause.strip_prefix(">=") {
+        (">=", r)
+    } else if let Some(r) = clause.strip_prefix("<=") {
+        ("<=", r)
+    } else if let Some(r) = clause.strip_prefix('>') {
+        (">", r)
+    } else if let Some(r) = clause.strip_prefix('<') {
+        ("<", r)
+    } else if let Some(r) = clause.strip_prefix('=') {
+        ("=", r)
+    } else if clause.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        ("=", clause)
+    } else {
+        return true;
+    };
+    match op {
+        ">=" => cmp_version(version, rhs) != Ordering::Less,
+        "<=" => cmp_version(version, rhs) != Ordering::Greater,
+        ">" => cmp_version(version, rhs) == Ordering::Greater,
+        "<" => cmp_version(version, rhs) == Ordering::Less,
+        _ => cmp_version(version, rhs) == Ordering::Equal,
+    }
+}
+
+/// A pack of 300 mods would otherwise walk the whole catalog graph on every
+/// install; the resolver stops early and says so instead of hanging.
+const MAX_NODES: usize = 80;
+/// Сколько загрузок разом: быстрее в разы, а Modrinth и CDN не душим.
+const PARALLEL: usize = 6;
+
+/// One project the resolver decided about: what would be installed, from where,
+/// and why it came up. `problem` is non-empty when nothing fits the build.
+#[derive(Clone, Default, serde::Serialize)]
+pub struct DepNode {
+    pub source: String,
+    pub project_id: String,
+    pub version_id: String,
+    pub title: String,
+    pub icon: String,
+    pub version_number: String,
+    pub file_name: String,
+    pub size: u64,
+    pub relation: String,
+    pub required_by: String,
+    pub problem: String,
+}
+
+#[derive(Clone, Default, serde::Serialize)]
+pub struct DepConflict {
+    pub title: String,
+    pub file_name: String,
+    pub with: String,
+    pub reason: String,
+}
+
+/// The answer to "what happens if I install this": everything that would be
+/// pulled in, everything optional, and everything already in the build that
+/// would fight it. Nothing here touches disk.
+#[derive(Default, serde::Serialize)]
+pub struct DepPlan {
+    pub title: String,
+    pub version_number: String,
+    /// Non-empty when the project itself has nothing for this build; the caller
+    /// falls back to the existing "install anyway?" confirmation.
+    pub mismatch: String,
+    pub required: Vec<DepNode>,
+    pub optional: Vec<DepNode>,
+    pub missing: Vec<DepNode>,
+    pub conflicts: Vec<DepConflict>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Default, serde::Deserialize)]
+pub struct PlanItem {
+    pub source: String,
+    pub project_id: String,
+    #[serde(default)] pub version_id: String,
+}
+
+#[derive(Default, serde::Serialize)]
+pub struct DepReport {
+    pub installed: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+#[derive(Clone, Default, serde::Serialize)]
+pub struct AuditIssue {
+    /// missing | conflict | version | loader
+    pub kind: String,
+    pub title: String,
+    pub detail: String,
+    pub file_name: String,
+    /// Present when the launcher knows what to install to close the issue.
+    pub fix: Option<DepNode>,
+    /// Modrinth project a missing dependency is looked up by when the audit
+    /// could not resolve a fix, so one click can try again.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub dep: String,
+}
+
+#[derive(Default, serde::Serialize)]
+pub struct DepAudit {
+    pub checked: u32,
+    pub issues: Vec<AuditIssue>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RawDep {
+    pub source: String,
+    pub project_id: String,
+    pub version_id: String,
+    pub relation: String,
+}
+
+pub(crate) struct Ctx {
+    pub profile: String,
+    pub kind: String,
+    pub game_version: String,
+    pub loader_id: String,
+    pub loaders: Vec<String>,
+    /// Loaders this build runs only through a bridge mod (Fabric under Sinytra
+    /// Connector). Kept apart from `loaders` so a build of the profile's own
+    /// loader always wins when a project ships both.
+    pub bridge: Vec<String>,
+}
+
+pub(crate) fn ctx_of(profile: &str, kind: &str) -> Ctx {
+    let prof = load_profiles().into_iter().find(|p| p.name == profile);
+    let loader_id = prof.as_ref().map(|p| p.loader_id()).unwrap_or_else(|| "vanilla".into());
+    Ctx {
+        profile: profile.to_string(),
+        kind: kind.to_string(),
+        game_version: prof.map(|p| p.version).unwrap_or_default(),
+        loaders: modrinth_loaders(&loader_id, kind),
+        bridge: bridge_loaders(profile, &loader_id, kind),
+        loader_id,
+    }
+}
+
+/// Fabric mods run on Forge and NeoForge when Sinytra Connector is in the build.
+/// The mix is what the bridge exists for, so the launcher must offer Fabric
+/// files, keep them updated and stop calling them foreign.
+pub(crate) fn bridge_loaders(profile: &str, loader_id: &str, kind: &str) -> Vec<String> {
+    if kind != "mod" || !matches!(loader_id, "forge" | "neoforge") {
+        return vec![];
+    }
+    if fabric_bridge_installed(profile) { vec!["fabric".into()] } else { vec![] }
+}
+
+/// Modrinth ids of Fabric API and its Forge/NeoForge implementation.
+const FABRIC_API: &str = "P7dR8mSH";
+const FORGIFIED_FABRIC_API: &str = "Aqlf1Shp";
+
+/// A Fabric mod bridged onto Forge asks for Fabric API, and the Fabric build of
+/// it does not load there at all — Connector's own port does. Installing the
+/// dependency as written would leave a build that cannot start.
+pub(crate) fn bridged_project<'a>(ctx: &Ctx, project_id: &'a str) -> &'a str {
+    if ctx.bridge.is_empty() {
+        return project_id;
+    }
+    match project_id {
+        FABRIC_API | "fabric-api" => FORGIFIED_FABRIC_API,
+        other => other,
+    }
+}
+
+/// Fabric API in either of its two Modrinth guises: the stock project and the
+/// Forge/NeoForge port Connector installs in its place.
+pub(crate) fn is_fabric_api_family(project_id: &str) -> bool {
+    matches!(project_id, FABRIC_API | FORGIFIED_FABRIC_API | "fabric-api")
+}
+
+/// A build installed from the catalogue, rather than assembled by the player.
+/// Its mod set is one tested whole shipped by us, so a jar it carries is not a
+/// free choice the launcher may second-guess against Modrinth "latest".
+fn is_catalog_pack(profile: &str) -> bool {
+    catalog_pack_settings(&profile_settings(profile))
+}
+
+pub(crate) fn catalog_pack_settings(settings: &Value) -> bool {
+    settings["catalogPackSlug"].as_str().is_some_and(|s| !s.is_empty())
+}
+
+/// Whether this build's Fabric API is load-bearing and must stay exactly as it
+/// was installed. It is on a catalogue pack (Celestia 3.0 ships Fabric API 0.92.7
+/// under Kilt, and the stock 0.92.12 installs cleanly by loader tag, then its
+/// tag mixins collide with Kilt and the world never loads), and on a bridged
+/// build, where Connector's own port is the only Fabric API that loads at all.
+/// In both cases the launcher did not pick the version freely, so "newer on
+/// Modrinth" is not a reason to swap the jar out from under the pack.
+pub(crate) fn fabric_api_pinned(profile: &str, bridge: &[String], project_id: &str) -> bool {
+    is_fabric_api_family(project_id) && (!bridge.is_empty() || is_catalog_pack(profile))
+}
+
+/// Modrinth spells the relation out; anything else (embedded libraries, tools)
+/// is already inside the jar and must not become an install of its own.
+pub(crate) fn mr_relation(t: &str) -> &'static str {
+    match t {
+        "required" => "required",
+        "optional" => "optional",
+        "incompatible" => "incompatible",
+        _ => "skip",
+    }
+}
+
+/// CurseForge relationType: 1 embedded, 2 optional, 3 required, 4 tool,
+/// 5 incompatible, 6 include.
+pub(crate) fn cf_relation(t: u64) -> &'static str {
+    match t {
+        3 => "required",
+        2 => "optional",
+        5 => "incompatible",
+        _ => "skip",
+    }
+}
+
+pub(crate) fn mr_deps(version: &Value) -> Vec<RawDep> {
+    let mut out = vec![];
+    for d in version["dependencies"].as_array().into_iter().flatten() {
+        let relation = mr_relation(d["dependency_type"].as_str().unwrap_or(""));
+        if relation == "skip" {
+            continue;
+        }
+        let pid = d["project_id"].as_str().unwrap_or("").to_string();
+        if pid.is_empty() {
+            continue;
+        }
+        out.push(RawDep {
+            source: "modrinth".into(),
+            project_id: pid,
+            version_id: d["version_id"].as_str().unwrap_or("").to_string(),
+            relation: relation.into(),
+        });
+    }
+    out
+}
+
+pub(crate) fn cf_deps(file: &Value) -> Vec<RawDep> {
+    let mut out = vec![];
+    for d in file["dependencies"].as_array().into_iter().flatten() {
+        let relation = cf_relation(d["relationType"].as_u64().unwrap_or(0));
+        if relation == "skip" {
+            continue;
+        }
+        let Some(id) = d["modId"].as_u64() else { continue };
+        out.push(RawDep {
+            source: "curseforge".into(),
+            project_id: format!("cf:{}", id),
+            version_id: String::new(),
+            relation: relation.into(),
+        });
+    }
+    out
+}
+
+fn cf_mod_id(project_id: &str) -> Option<u32> {
+    project_id.strip_prefix("cf:").and_then(|s| s.parse().ok())
+}
+
+/// Titles are the only bridge between the two catalogs: the same mod carries
+/// different ids on Modrinth and CurseForge, so "Sodium" installed from one must
+/// not be offered again by the other.
+fn norm_title(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
+}
+
+#[derive(Default)]
+pub(crate) struct Installed {
+    ids: HashSet<String>,
+    titles: HashSet<String>,
+    pub mod_ids: HashSet<String>,
+}
+
+impl Installed {
+    pub(crate) fn has(&self, project_id: &str, title: &str) -> bool {
+        if !project_id.is_empty() && self.ids.contains(project_id) {
+            return true;
+        }
+        if !project_id.is_empty() && self.mod_ids.contains(project_id) {
+            return true;
+        }
+        let t = norm_title(title);
+        !t.is_empty() && (self.titles.contains(&t) || self.mod_ids.iter().any(|id| norm_title(id) == t))
+    }
+}
+
+/// Mod ids that are not the catalog slug of the project publishing them. A jar
+/// declares `depends: {"fabric": "*"}`, and asking Modrinth for a project called
+/// "fabric" gets a 404 — so the launcher listed "нужен мод «fabric»" and had
+/// nothing to offer, on the single most common missing dependency there is.
+const ID_TO_SLUG: [(&str, &str); 10] = [
+    ("fabric", "fabric-api"),
+    ("architectury", "architectury-api"),
+    ("forgeconfigapiport", "forge-config-api-port"),
+    ("geckolib3", "geckolib"),
+    ("balm-fabric", "balm"),
+    ("puzzleslib", "puzzles-lib"),
+    ("yungsapi", "yungs-api"),
+    ("creative_core", "creativecore"),
+    ("roughlyenoughitems", "rei"),
+    ("kotlinforforge", "kotlin-for-forge"),
+];
+
+/// The catalog slug for a mod id read out of a jar. Ids the table does not know
+/// are their own slug far more often than not, so they pass through unchanged.
+pub(crate) fn catalog_slug(mod_id: &str) -> &str {
+    ID_TO_SLUG
+        .iter()
+        .find(|(id, _)| *id == mod_id)
+        .map(|(_, slug)| *slug)
+        .unwrap_or(mod_id)
+}
+
+pub(crate) fn installed_index(profile: &str) -> Installed {
+    let mut idx = Installed::default();
+    for e in load_content_manifest(profile) {
+        if e.kind != "mod" {
+            continue;
+        }
+        if !e.project_id.is_empty() {
+            idx.ids.insert(e.project_id);
+        }
+        let t = norm_title(&e.title);
+        if !t.is_empty() {
+            idx.titles.insert(t);
+        }
+    }
+    for m in local_meta_map(profile, "mod").into_values() {
+        let t = norm_title(&m.title);
+        if !t.is_empty() {
+            idx.titles.insert(t);
+        }
+        if !m.mod_id.is_empty() {
+            idx.mod_ids.insert(m.mod_id);
+        }
+        for p in m.provides {
+            idx.mod_ids.insert(p);
+        }
+    }
+    idx
+}
+
+struct Pick {
+    node: DepNode,
+    deps: Vec<RawDep>,
+    raw: Value,
+}
+
+fn mr_node(project_id: &str, meta: &MetaTriple, version: &Value) -> DepNode {
+    let file = version["files"]
+        .as_array()
+        .and_then(|fs| fs.iter().find(|f| f["primary"] == true).or_else(|| fs.first()))
+        .cloned()
+        .unwrap_or_default();
+    DepNode {
+        source: "modrinth".into(),
+        project_id: if meta.0.is_empty() { project_id.to_string() } else { meta.0.clone() },
+        version_id: version["id"].as_str().unwrap_or("").to_string(),
+        title: if meta.1.is_empty() { project_id.to_string() } else { meta.1.clone() },
+        icon: meta.2.clone(),
+        version_number: version["version_number"].as_str().unwrap_or("").to_string(),
+        file_name: file["filename"].as_str().unwrap_or("").to_string(),
+        size: file["size"].as_u64().unwrap_or(0),
+        ..Default::default()
+    }
+}
+
+async fn pick_modrinth(ctx: &Ctx, project_id: &str, version_id: &str) -> Result<Pick, String> {
+    let pinned = if version_id.is_empty() {
+        None
+    } else {
+        get_json(&format!("https://api.modrinth.com/v2/version/{}", version_id))
+            .await
+            .ok()
+            .filter(|v| fits_build(v, &ctx.game_version, &ctx.loaders, &ctx.bridge))
+    };
+    let version = match pinned {
+        Some(v) => v,
+        None => best_version_bridged(project_id, &ctx.game_version, &ctx.loaders, &ctx.bridge).await?,
+    };
+    let meta = fetch_project_meta(project_id).await;
+    Ok(Pick { node: mr_node(project_id, &meta, &version), deps: mr_deps(&version), raw: version })
+}
+
+async fn pick_curseforge(ctx: &Ctx, mod_id: u32, file_id: Option<u64>) -> Result<Pick, String> {
+    // A dependency may pin a file built for another loader; the pin is a hint,
+    // the build is the requirement.
+    let pinned = match file_id {
+        Some(fid) => cf_get(&format!("v1/mods/{}/files/{}", mod_id, fid), &[]).await.ok()
+            .map(|j| j["data"].clone())
+            .filter(|f| cf_file_fits(f, &ctx.game_version, &ctx.loaders, &ctx.bridge)),
+        None => None,
+    };
+    let file = match pinned {
+        Some(f) => f,
+        None => {
+            let lt = if ctx.kind == "mod" { cf_loader_type(&ctx.loader_id) } else { 0 };
+            cf_files_for(mod_id, &ctx.game_version, lt)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    format!("нет файла под {} на CurseForge", if ctx.game_version.is_empty() { "эту сборку" } else { &ctx.game_version })
+                })?
+        }
+    };
+    let (title, icon) = match cf_get(&format!("v1/mods/{}", mod_id), &[]).await {
+        Ok(j) => (
+            j["data"]["name"].as_str().unwrap_or("").to_string(),
+            j["data"]["logo"]["thumbnailUrl"].as_str().unwrap_or("").to_string(),
+        ),
+        Err(_) => (String::new(), String::new()),
+    };
+    let node = DepNode {
+        source: "curseforge".into(),
+        project_id: format!("cf:{}", mod_id),
+        version_id: file["id"].as_u64().unwrap_or(0).to_string(),
+        title: if title.is_empty() { format!("CurseForge #{}", mod_id) } else { title },
+        icon,
+        version_number: file["displayName"].as_str().unwrap_or("").to_string(),
+        file_name: file["fileName"].as_str().unwrap_or("").to_string(),
+        size: file["fileLength"].as_u64().unwrap_or(0),
+        ..Default::default()
+    };
+    Ok(Pick { node, deps: cf_deps(&file), raw: file })
+}
+
+async fn pick_any(ctx: &Ctx, source: &str, project_id: &str, version_id: &str) -> Result<Pick, String> {
+    let swapped = bridged_project(ctx, project_id);
+    // The pinned version belongs to the project that was asked for; once the
+    // project itself is swapped, the pin points at a file of another mod.
+    let (project_id, version_id) =
+        if swapped == project_id { (project_id, version_id) } else { (swapped, "") };
+    match cf_mod_id(project_id) {
+        Some(id) => pick_curseforge(ctx, id, version_id.parse().ok()).await,
+        None if source == "curseforge" => match project_id.parse::<u32>() {
+            Ok(id) => pick_curseforge(ctx, id, version_id.parse().ok()).await,
+            Err(_) => Err("непонятный проект CurseForge".into()),
+        },
+        None => pick_modrinth(ctx, project_id, version_id).await,
+    }
+}
+
+async fn install_pick(ctx: &Ctx, p: &Pick) -> Result<String, String> {
+    match cf_mod_id(&p.node.project_id) {
+        Some(id) => cf_install_file(&ctx.profile, &ctx.kind, id, &p.raw).await,
+        None => install_project_version(&ctx.profile, &ctx.kind, &p.node.project_id, &p.raw).await,
+    }
+}
+
+/// Walks the graph without touching disk. `seen` starts from what the build
+/// already has, so a dependency chain that is satisfied costs nothing.
+pub async fn dep_plan(
+    profile: String,
+    kind: String,
+    source: String,
+    project: String,
+    version_id: Option<String>,
+) -> Result<DepPlan, String> {
+    let ctx = ctx_of(&profile, &kind);
+    let vid = version_id.unwrap_or_default();
+    let root = match pick_any(&ctx, &source, &project, &vid).await {
+        Ok(p) => p,
+        Err(_) => {
+            return Ok(DepPlan { title: project.clone(), mismatch: mismatch_text(&source, &project).await, ..Default::default() })
+        }
+    };
+    let installed = installed_index(&profile);
+    let mut plan = DepPlan {
+        title: root.node.title.clone(),
+        version_number: root.node.version_number.clone(),
+        ..Default::default()
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(root.node.project_id.clone());
+    let mut queue: Vec<(RawDep, String)> = root.deps.iter().cloned().map(|d| (d, root.node.title.clone())).collect();
+    while let Some((dep, parent)) = queue.pop() {
+        if plan.required.len() + plan.optional.len() + plan.missing.len() >= MAX_NODES {
+            plan.truncated = true;
+            break;
+        }
+        if !seen.insert(dep.project_id.clone()) {
+            continue;
+        }
+        if dep.relation == "incompatible" {
+            if let Some(c) = conflict_if_present(&installed, &ctx, &dep, &plan.title).await {
+                plan.conflicts.push(c);
+            }
+            continue;
+        }
+        let picked = pick_any(&ctx, &dep.source, &dep.project_id, &dep.version_id).await;
+        match picked {
+            Ok(p) => {
+                if installed.has(&p.node.project_id, &p.node.title) {
+                    continue;
+                }
+                let mut node = p.node.clone();
+                node.relation = dep.relation.clone();
+                node.required_by = parent.clone();
+                if dep.relation == "required" {
+                    for d in p.deps {
+                        queue.push((d, node.title.clone()));
+                    }
+                    plan.required.push(node);
+                } else {
+                    plan.optional.push(node);
+                }
+            }
+            Err(e) => {
+                if dep.relation != "required" {
+                    continue;
+                }
+                let title = fetch_project_meta(&dep.project_id).await.1;
+                if installed.has(&dep.project_id, &title) {
+                    continue;
+                }
+                plan.missing.push(DepNode {
+                    source: dep.source.clone(),
+                    project_id: dep.project_id.clone(),
+                    title: if title.is_empty() { dep.project_id.clone() } else { title },
+                    relation: "required".into(),
+                    required_by: parent.clone(),
+                    problem: e,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    plan.conflicts.extend(local_conflicts(&profile, &root.node));
+    Ok(plan)
+}
+
+/// Which game versions the project does ship, so the caller can explain the
+/// refusal instead of showing an empty plan.
+async fn mismatch_text(source: &str, project: &str) -> String {
+    let have = match cf_mod_id(project).or_else(|| if source == "curseforge" { project.parse().ok() } else { None }) {
+        Some(id) => cf_files_for(id, "", 0).await.map(|f| cf_short_mc_versions(&f)).unwrap_or_default(),
+        None => project_versions(project).await.map(|v| known_game_versions(&v)).unwrap_or_default(),
+    };
+    if have.is_empty() { "другие версии".into() } else { have }
+}
+
+async fn conflict_if_present(installed: &Installed, ctx: &Ctx, dep: &RawDep, with: &str) -> Option<DepConflict> {
+    let title = match cf_mod_id(&dep.project_id) {
+        Some(id) => cf_get(&format!("v1/mods/{}", id), &[]).await.ok()
+            .and_then(|j| j["data"]["name"].as_str().map(String::from))
+            .unwrap_or_else(|| dep.project_id.clone()),
+        None => fetch_project_meta(&dep.project_id).await.1,
+    };
+    if !installed.has(&dep.project_id, &title) {
+        return None;
+    }
+    let file = load_content_manifest(&ctx.profile)
+        .into_iter()
+        .find(|e| e.project_id == dep.project_id || norm_title(&e.title) == norm_title(&title))
+        .map(|e| e.file_name)
+        .unwrap_or_default();
+    Some(DepConflict {
+        title,
+        file_name: file,
+        with: with.to_string(),
+        reason: "автор мода отметил их как несовместимые".into(),
+    })
+}
+
+/// The other direction: a mod already in the build declaring that it breaks with
+/// what is about to be installed. Read from the jars, so it works offline.
+fn local_conflicts(profile: &str, incoming: &DepNode) -> Vec<DepConflict> {
+    let wanted = [norm_title(&incoming.title), norm_title(&incoming.project_id)];
+    local_meta_map(profile, "mod")
+        .into_values()
+        .filter(|m| {
+            m.breaks
+                .iter()
+                .any(|b| wanted.contains(&norm_title(&b.id)) && version_satisfies(&incoming.version_number, &b.range))
+        })
+        .map(|m| DepConflict {
+            title: m.title.clone(),
+            file_name: m.file_name.clone(),
+            with: incoming.title.clone(),
+            reason: "мод в сборке объявляет несовместимость".into(),
+        })
+        .collect()
+}
+
+/// What in the jars themselves would stop the loader before the window opens:
+/// `missing` — mod ids the incoming jar requires and no file of the build answers
+/// for, `clashes` — `breaks` rules either side declares against the other.
+#[derive(Default, Debug, PartialEq)]
+pub(crate) struct JarBlockers {
+    pub missing: Vec<String>,
+    pub clashes: Vec<String>,
+}
+
+impl JarBlockers {
+    pub(crate) fn is_clear(&self) -> bool {
+        self.missing.is_empty() && self.clashes.is_empty()
+    }
+
+    pub(crate) fn describe(&self) -> Vec<String> {
+        self.missing
+            .iter()
+            .map(|id| format!("нужен мод «{}», его нет", id))
+            .chain(self.clashes.iter().cloned())
+            .collect()
+    }
+}
+
+fn answers_for(m: &LocalMeta, id: &str) -> bool {
+    m.mod_id == id || m.provides.iter().any(|p| p == id)
+}
+
+pub(crate) fn jar_blockers(
+    incoming: &LocalMeta,
+    others: &[LocalMeta],
+    runs: &[String],
+    loader_id: &str,
+    loader_version: Option<&str>,
+) -> JarBlockers {
+    let mut out = JarBlockers::default();
+    let Some((requires, breaks)) = relations_on(incoming, runs) else {
+        let declared: &[String] = if incoming.loaders.is_empty() { std::slice::from_ref(&incoming.loader) } else { &incoming.loaders };
+        out.clashes.push(wrong_loader_text(declared, loader_id));
+        return out;
+    };
+    for id in requires {
+        if !others.iter().any(|o| answers_for(o, id)) && !loader_provides(loader_id, loader_version, id) && !out.missing.contains(id) {
+            out.missing.push(id.clone());
+        }
+    }
+    for b in breaks {
+        if let Some(o) = others.iter().find(|o| answers_for(o, &b.id) && version_satisfies(&o.version, &b.range)) {
+            out.clashes.push(format!("несовместим с «{}» {}", o.title, o.version));
+        }
+    }
+    let ours = |id: &str| answers_for(incoming, id);
+    for o in others {
+        let Some((_, their_breaks)) = relations_on(o, runs) else { continue };
+        if their_breaks.iter().any(|b| ours(&b.id) && version_satisfies(&incoming.version, &b.range)) {
+            out.clashes.push(format!("«{}» объявляет несовместимость с ним", o.title));
+        }
+    }
+    out
+}
+
+async fn scan_mods(profile: &str) -> Vec<LocalMeta> {
+    let prof = profile.to_string();
+    tauri::async_runtime::spawn_blocking(move || scan_local_meta(&prof, "mod", false))
+        .await
+        .unwrap_or_default()
+}
+
+fn split_incoming(all: Vec<LocalMeta>, file_name: &str) -> Option<(LocalMeta, Vec<LocalMeta>)> {
+    let (mine, others): (Vec<LocalMeta>, Vec<LocalMeta>) = all.into_iter().partition(|m| m.file_name == file_name);
+    mine.into_iter().next().map(|m| (m, others))
+}
+
+/// Brings a jar the launcher has just put into a build to a state it starts in,
+/// judged by the jar and not by the catalogue page: a catalogue page may list no
+/// dependency while fabric.mod.json demands one, or the newest file may declare
+/// `breaks` against the only renderer published for that game version. Missing
+/// requirements are installed; whatever still blocks the start comes back, and
+/// the caller decides.
+pub(crate) async fn settle_installed_jar(profile: &str, file_name: &str) -> JarBlockers {
+    let ctx = ctx_of(profile, "mod");
+    let loader_version = load_profiles().into_iter().find(|p| p.name == profile).and_then(|p| p.loader_version);
+    let runs: Vec<String> = std::iter::once(ctx.loader_id.clone()).chain(ctx.bridge.iter().cloned()).collect();
+    let Some((incoming, others)) = split_incoming(scan_mods(profile).await, file_name) else {
+        return JarBlockers::default();
+    };
+    let first = jar_blockers(&incoming, &others, &runs, &ctx.loader_id, loader_version.as_deref());
+    if first.missing.is_empty() {
+        return first;
+    }
+    for id in &first.missing {
+        if let Ok(p) = pick_modrinth(&ctx, catalog_slug(id), "").await {
+            if install_pick(&ctx, &p).await.is_ok() {
+                install_required(&ctx, p.deps).await;
+            }
+        }
+    }
+    match split_incoming(scan_mods(profile).await, file_name) {
+        Some((incoming, others)) => jar_blockers(&incoming, &others, &runs, &ctx.loader_id, loader_version.as_deref()),
+        None => first,
+    }
+}
+
+/// Installs every hard dependency the given relations pull in, transitively.
+/// Returns the ones nothing could be found for, so the caller can say so instead
+/// of leaving a build that will not start.
+async fn pick_dep(ctx: &Ctx, dep: RawDep) -> (RawDep, Result<Pick, String>) {
+    let p = pick_any(ctx, &dep.source, &dep.project_id, &dep.version_id).await;
+    (dep, p)
+}
+
+async fn install_one(ctx: &Ctx, p: Pick) -> (Pick, Result<String, String>) {
+    let r = install_pick(ctx, &p).await;
+    (p, r)
+}
+
+/// Один выбранный материал: найти версию и поставить. Ok — файл и его зависимости.
+async fn install_item(app: &AppHandle, job: &Job, ctx: &Ctx, it: &PlanItem, ready: &std::sync::atomic::AtomicUsize, total: usize) -> Result<(String, Vec<RawDep>), String> {
+    if job.check().is_err() {
+        return Err(format!("{}: отменено", it.project_id));
+    }
+    let out = match pick_any(ctx, &it.source, &it.project_id, &it.version_id).await {
+        Ok(p) => match install_pick(ctx, &p).await {
+            Ok(file) => Ok((file, p.deps)),
+            Err(e) => Err(format!("{}: {}", p.node.title, e)),
+        },
+        Err(e) => Err(format!("{}: {}", it.project_id, e)),
+    };
+    let n = ready.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    job.emit(app, 5.0 + 80.0 * (n as f32 / total as f32), &format!("Ставим {}/{}…", n, total));
+    out
+}
+
+pub(crate) async fn install_required(ctx: &Ctx, deps: Vec<RawDep>) -> Vec<String> {
+    let mut installed = installed_index(&ctx.profile);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen_pick: HashSet<String> = HashSet::new();
+    let mut missed: Vec<String> = vec![];
+    let mut level: Vec<RawDep> = deps;
+    let mut count = 0;
+    // Волнами: зависимости одного уровня — разом (по PARALLEL), их зависимости — следующей
+    // волной. Уже стоящее в сборке по id проекта — без запроса к Modrinth: раньше на каждую
+    // зависимость каждого мода (Fabric API у пятидесяти модов) шёл свой запрос, по очереди.
+    while !level.is_empty() && count <= MAX_NODES {
+        let wave: Vec<RawDep> = std::mem::take(&mut level)
+            .into_iter()
+            .filter(|d| d.relation == "required" && !installed.ids.contains(&d.project_id) && seen.insert(d.project_id.clone()))
+            .collect();
+        count += wave.len();
+        // Будущие — заранее списком, а не замыканием в map: иначе rustc не докажет Send
+        // для запуска игры, где это тоже вызывается («Send is not general enough»).
+        let picks: Vec<_> = wave.into_iter().map(|dep| pick_dep(ctx, dep)).collect();
+        let picked: Vec<(RawDep, Result<Pick, String>)> = futures::stream::iter(picks).buffer_unordered(PARALLEL).collect().await;
+        let mut to_install: Vec<Pick> = vec![];
+        for (dep, p) in picked {
+            match p {
+                Ok(p) => {
+                    if installed.has(&p.node.project_id, &p.node.title) || !seen_pick.insert(p.node.project_id.clone()) {
+                        continue;
+                    }
+                    to_install.push(p);
+                }
+                Err(_) => {
+                    let title = fetch_project_meta(&dep.project_id).await.1;
+                    if installed.has(&dep.project_id, &title) {
+                        continue;
+                    }
+                    missed.push(if title.is_empty() { dep.project_id.clone() } else { title });
+                }
+            }
+        }
+        let installs: Vec<_> = to_install.into_iter().map(|p| install_one(ctx, p)).collect();
+        let done: Vec<(Pick, Result<String, String>)> = futures::stream::iter(installs).buffer_unordered(PARALLEL).collect().await;
+        for (p, r) in done {
+            match r {
+                Ok(_) => {
+                    installed.ids.insert(p.node.project_id.clone());
+                    installed.titles.insert(norm_title(&p.node.title));
+                    level.extend(p.deps);
+                }
+                Err(e) => missed.push(format!("{} ({})", p.node.title, e)),
+            }
+        }
+    }
+    missed
+}
+
+/// Installs a hand-picked set: the optional dependencies the user ticked in the
+/// plan, or the fixes an audit offered. Each one still drags in its own hard
+/// dependencies.
+pub async fn install_dep_items(
+    app: AppHandle,
+    profile: String,
+    kind: String,
+    items: Vec<PlanItem>,
+) -> Result<DepReport, String> {
+    let job = Job::start(job_key_content("mr", &profile, &kind, "millida:deps"), "Зависимости")?;
+    let res = install_dep_items_job(&app, &job, profile, kind, items).await;
+    job.finish(&app, res)
+}
+
+async fn install_dep_items_job(
+    app: &AppHandle,
+    job: &Job,
+    profile: String,
+    kind: String,
+    items: Vec<PlanItem>,
+) -> Result<DepReport, String> {
+    let ctx = ctx_of(&profile, &kind);
+    let mut report = DepReport::default();
+    let total = items.len().max(1);
+    job.check()?;
+    job.emit(app, 5.0, &format!("Ставим 0/{}…", total));
+    // Выбранное — по PARALLEL разом (было строго по одному: 50 модов — полминуты ожидания,
+    // владелец 10.10.2026). Зависимости всех — одним проходом после, без повторов.
+    let ready = std::sync::atomic::AtomicUsize::new(0);
+    let jobs: Vec<_> = items.iter().map(|it| install_item(app, job, &ctx, it, &ready, total)).collect();
+    let results: Vec<Result<(String, Vec<RawDep>), String>> = futures::stream::iter(jobs).buffer_unordered(PARALLEL).collect().await;
+    job.check()?;
+    let mut deps: Vec<RawDep> = vec![];
+    for r in results {
+        match r {
+            Ok((file, d)) => {
+                report.installed.push(file);
+                deps.extend(d);
+            }
+            Err(e) => report.failed.push(e),
+        }
+    }
+    if !deps.is_empty() {
+        job.emit(app, 88.0, "Зависимости…");
+        report.failed.extend(install_required(&ctx, deps).await);
+    }
+    job.emit(app, 100.0, "Готово");
+    Ok(report)
+}
+
+/// Version ids only of the mods that came from Modrinth. A Millida catalogue
+/// file id in the batch makes Modrinth refuse all fifty with 400, and the audit
+/// then saw no Modrinth dependency of the whole build.
+fn modrinth_version_ids(manifest: &[ContentEntry]) -> Vec<String> {
+    manifest
+        .iter()
+        .filter(|e| !e.version_id.is_empty() && !e.project_id.starts_with("cf:") && !super::versions::is_catalog_project(&e.project_id))
+        .map(|e| e.version_id.clone())
+        .collect()
+}
+
+/// `/v2/versions?ids=` answers for a whole build at once, which is what makes
+/// auditing an installed set cheap enough to run on a button press.
+async fn bulk_versions(ids: &[String]) -> HashMap<String, Value> {
+    let mut out = HashMap::new();
+    for chunk in ids.chunks(50) {
+        let list = serde_json::to_string(&chunk.to_vec()).unwrap_or_else(|_| "[]".into());
+        let url = format!("https://api.modrinth.com/v2/versions?ids={}", urlencode(&list));
+        let Ok(arr) = get_json(&url).await else { continue };
+        for v in arr.as_array().cloned().unwrap_or_default() {
+            let Some(id) = v["id"].as_str().map(String::from) else { continue };
+            out.insert(id, v);
+        }
+    }
+    out
+}
+
+/// A jar declares the game versions it targets in free form: an exact list
+/// ("1.21, 1.21.1"), a range (">=1.21.11") or nothing. Only an exact list can be
+/// judged, so a range is never reported as a mismatch.
+pub(crate) fn declared_mismatch(declared: &str, build: &str) -> bool {
+    if declared.trim().is_empty() || build.trim().is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = declared
+        .split([',', ';', '/'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return false;
+    }
+    let ranged = |p: &str| p.chars().any(|c| "<>~^*=[](),".contains(c)) || p.contains('-') || p.ends_with(".x") || p == "x";
+    if parts.iter().any(|p| ranged(p)) {
+        return false;
+    }
+    !parts.iter().any(|p| *p == build.trim())
+}
+
+/// Quilt loads Fabric mods; nothing else crosses over.
+pub(crate) fn loader_mismatch(declared: &str, build_loader: &str) -> bool {
+    if declared.is_empty() || build_loader.is_empty() || build_loader == "vanilla" {
+        return false;
+    }
+    if declared == build_loader {
+        return false;
+    }
+    !(build_loader == "quilt" && declared == "fabric")
+}
+
+/// A file is wrong for the build only when NONE of the loaders it declares fits.
+///
+/// Multi-loader releases (Collective, Balm) ship one jar answering for Fabric,
+/// Forge and NeoForge, and often no per-loader build exists at all. Judging by
+/// the first loader alone marked such a file as foreign on a build its author
+/// supports, and the mod was dropped as broken.
+/// `runs` lists every loader the build can actually load: its own, plus what a
+/// bridge mod adds. A Fabric jar next to Connector on Forge is the mix the
+/// bridge is installed for, and calling it foreign sent people deleting mods
+/// that worked.
+pub(crate) fn loaders_mismatch(declared: &[String], runs: &[String]) -> bool {
+    if declared.is_empty() || runs.is_empty() {
+        return false;
+    }
+    declared.iter().all(|d| runs.iter().all(|build| loader_mismatch(d, build)))
+}
+
+fn loader_title(id: &str) -> &str {
+    match id {
+        "fabric" => "Fabric",
+        "forge" => "Forge",
+        "neoforge" => "NeoForge",
+        "quilt" => "Quilt",
+        other => other,
+    }
+}
+
+pub(crate) fn wrong_loader_text(declared: &[String], build: &str) -> String {
+    let made_for = declared.iter().map(|l| loader_title(l)).collect::<Vec<_>>().join("/");
+    let build = loader_title(build);
+    format!("мод для {}, а сборка на {} — поставь версию для {}", made_for, build, build)
+}
+
+/// The relations that apply to this jar on this build, or None when the build
+/// cannot load the jar at all.
+///
+/// A multi-loader jar is read through the manifest of the loader that runs it:
+/// Explorify asks for Fabric API only in its fabric.mod.json, and judging a
+/// NeoForge build by that file told players their pack needs Fabric API. A jar
+/// no loader of the build reads gets a loader verdict and nothing else — its
+/// dependencies describe another game, so demanding them is noise.
+pub(crate) fn relations_on<'a>(m: &'a LocalMeta, runs: &[String]) -> Option<(&'a [String], &'a [BreakRule])> {
+    let declared: &[String] = if m.loaders.is_empty() { std::slice::from_ref(&m.loader) } else { &m.loaders };
+    if loaders_mismatch(declared, runs) {
+        return None;
+    }
+    let pick = runs.iter().find_map(|build| {
+        m.relations
+            .iter()
+            .find(|r| &r.loader == build)
+            .or_else(|| m.relations.iter().find(|r| !loader_mismatch(&r.loader, build)))
+    });
+    Some(match pick {
+        Some(r) => (&r.requires, &r.breaks),
+        None => (&m.requires, &m.breaks),
+    })
+}
+
+/// The loader a build is pinned to. An unpinned build gets the newest stable
+/// loader at launch, so no jar can ask for more than it will have.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LoaderPin {
+    pub loader_id: String,
+    pub version: String,
+}
+
+pub(crate) fn pin_of(loader_id: &str, loader_version: Option<&str>, game_version: &str) -> Option<LoaderPin> {
+    if !matches!(loader_id, "fabric" | "forge" | "neoforge") {
+        return None;
+    }
+    let raw = loader_version?.trim();
+    let version = raw.strip_prefix(&format!("{}-", game_version)).unwrap_or(raw).trim();
+    (!version.is_empty()).then(|| LoaderPin { loader_id: loader_id.to_string(), version: version.to_string() })
+}
+
+pub(crate) fn loader_pin(profile: &str) -> Option<LoaderPin> {
+    let p = load_profiles().into_iter().find(|p| p.name == profile)?;
+    pin_of(&p.loader_id(), p.loader_version.as_deref(), &p.version)
+}
+
+/// The loader range a jar demands and the pinned loader does not meet. Modrinth
+/// and CurseForge pick files by game version and loader name only, so a file
+/// that needs NeoForge 21.1.252 installs into a build pinned to 21.1.248 and the
+/// loader refuses it on the next start. Only the manifest of the build's own
+/// loader is read: a Fabric jar under Connector asks Fabric Loader, not NeoForge.
+pub(crate) fn loader_shortfall(m: &LocalMeta, pin: &LoaderPin) -> Option<String> {
+    let range = m.relations.iter().find(|r| r.loader == pin.loader_id)?.loader_range.trim();
+    if range.is_empty() {
+        return None;
+    }
+    let predicate = if range.starts_with(['[', '(']) { maven_range(range) } else { range.to_string() };
+    (!version_satisfies(&pin.version, &predicate)).then(|| range.to_string())
+}
+
+pub(crate) fn file_loader_shortfall(path: &std::path::Path, file_name: &str, pin: &LoaderPin) -> Option<String> {
+    loader_shortfall(&read_file_meta(path, "mod", file_name), pin)
+}
+
+pub(crate) fn loader_too_old_text(title: &str, pin: &LoaderPin, range: &str) -> String {
+    format!(
+        "«{}» требует загрузчик {} {} — в сборке {}. Обнови загрузчик в настройках сборки или поставь другую версию мода",
+        title, pin.loader_id, range, pin.version
+    )
+}
+
+/// Checks a build as it stands: hard dependencies nobody satisfies, mods that
+/// declare each other incompatible, and files built for another version or
+/// loader. Everything that can be fixed comes back with the fix attached.
+pub async fn audit_deps(profile: String) -> Result<DepAudit, String> {
+    let ctx = ctx_of(&profile, "mod");
+    let loader_version = load_profiles().into_iter().find(|p| p.name == profile).and_then(|p| p.loader_version);
+    let prof = profile.clone();
+    let locals = tauri::async_runtime::spawn_blocking(move || scan_local_meta(&prof, "mod", false))
+        .await
+        .map_err(|e| e.to_string())?;
+    if is_catalog_pack(&profile) {
+        return Ok(shipped_pack_audit(locals.len()));
+    }
+    let manifest: Vec<ContentEntry> = load_content_manifest(&profile).into_iter().filter(|e| e.kind == "mod").collect();
+    let installed = installed_index(&profile);
+    let runs: Vec<String> = std::iter::once(ctx.loader_id.clone()).chain(ctx.bridge.iter().cloned()).collect();
+    let mut audit = DepAudit { checked: locals.len() as u32, issues: vec![] };
+    let mut wanted: HashMap<String, String> = HashMap::new();
+    // The installed version of whatever a `breaks` rule points at — needed to
+    // tell a real conflict from a minimum-version guard the build already clears.
+    let version_of: HashMap<&str, &str> = locals
+        .iter()
+        .flat_map(|m| {
+            let mut ids: Vec<&str> = vec![];
+            if !m.mod_id.is_empty() {
+                ids.push(&m.mod_id);
+            }
+            ids.extend(m.provides.iter().map(String::as_str));
+            ids.into_iter().map(move |id| (id, m.version.as_str()))
+        })
+        .collect();
+
+    for m in &locals {
+        if declared_mismatch(&m.mc, &ctx.game_version) {
+            audit.issues.push(AuditIssue {
+                kind: "version".into(),
+                title: m.title.clone(),
+                detail: format!("файл собран под MC {}, а сборка на {}", m.mc, ctx.game_version),
+                file_name: m.file_name.clone(),
+                fix: None,
+                dep: String::new(),
+            });
+        }
+        let Some((requires, breaks)) = relations_on(m, &runs) else {
+            let declared: &[String] =
+                if m.loaders.is_empty() { std::slice::from_ref(&m.loader) } else { &m.loaders };
+            audit.issues.push(AuditIssue {
+                kind: "loader".into(),
+                title: m.title.clone(),
+                detail: wrong_loader_text(declared, &ctx.loader_id),
+                file_name: m.file_name.clone(),
+                fix: None,
+                dep: String::new(),
+            });
+            continue;
+        };
+        for b in breaks {
+            if installed.mod_ids.contains(&b.id) {
+                let other_version = version_of.get(b.id.as_str()).copied().unwrap_or("");
+                if !version_satisfies(other_version, &b.range) {
+                    continue;
+                }
+                let other = locals
+                    .iter()
+                    .find(|o| o.mod_id == b.id || o.provides.contains(&b.id))
+                    .map(|o| o.title.clone())
+                    .unwrap_or_else(|| b.id.clone());
+                audit.issues.push(AuditIssue {
+                    kind: "conflict".into(),
+                    title: m.title.clone(),
+                    detail: format!("объявляет несовместимость с «{}»", other),
+                    file_name: m.file_name.clone(),
+                    fix: None,
+                    dep: String::new(),
+                });
+            }
+        }
+        for r in requires {
+            if installed.mod_ids.contains(r) || loader_provides(&ctx.loader_id, loader_version.as_deref(), r) {
+                continue;
+            }
+            wanted.entry(r.clone()).or_insert_with(|| m.title.clone());
+        }
+    }
+
+    let version_ids = modrinth_version_ids(&manifest);
+    let versions = bulk_versions(&version_ids).await;
+    for e in &manifest {
+        let Some(v) = versions.get(&e.version_id) else { continue };
+        for dep in mr_deps(v) {
+            if dep.relation == "incompatible" {
+                let title = fetch_project_meta(&dep.project_id).await.1;
+                if installed.has(&dep.project_id, &title) {
+                    audit.issues.push(AuditIssue {
+                        kind: "conflict".into(),
+                        title: e.title.clone(),
+                        detail: format!("несовместим с «{}»", if title.is_empty() { dep.project_id.clone() } else { title }),
+                        file_name: e.file_name.clone(),
+                        fix: None,
+                        dep: String::new(),
+                    });
+                }
+                continue;
+            }
+            if dep.relation != "required" {
+                continue;
+            }
+            let title = fetch_project_meta(&dep.project_id).await.1;
+            if installed.has(&dep.project_id, &title) {
+                continue;
+            }
+            let picked = pick_modrinth(&ctx, &dep.project_id, &dep.version_id).await.map(|p| p.node);
+            if other_loader_dep(v, &ctx.loaders, &ctx.bridge, &picked) {
+                continue;
+            }
+            let retry = retry_dep(&picked, &dep.project_id);
+            let named = if title.is_empty() { dep.project_id.clone() } else { title };
+            push_missing(&mut audit, e.title.clone(), named, picked.ok(), retry);
+        }
+    }
+
+    for (id, needed_by) in wanted {
+        if audit.issues.iter().any(|i| i.kind == "missing" && i.detail.contains(&id)) {
+            continue;
+        }
+        let slug = catalog_slug(&id);
+        let picked = pick_modrinth(&ctx, slug, "").await.map(|p| p.node);
+        let retry = retry_dep(&picked, slug);
+        let fix = picked.ok();
+        if fix.as_ref().is_some_and(|f| installed.has(&f.project_id, &f.title)) {
+            continue;
+        }
+        let named = fix.as_ref().map(|f| f.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| id.clone());
+        audit.issues.push(AuditIssue {
+            kind: "missing".into(),
+            title: needed_by.clone(),
+            detail: format!("нужен мод «{}», в сборке его нет", named),
+            file_name: String::new(),
+            fix,
+            dep: retry,
+        });
+    }
+    Ok(audit)
+}
+
+/// One Modrinth version built for several loaders lists the dependencies of all
+/// of them: LambDynamicLights for NeoForge asks for Fabric API. A dependency that
+/// ships nothing for this build belongs to another loader's side of the jar.
+fn other_loader_dep(version: &Value, loaders: &[String], bridge: &[String], picked: &Result<DepNode, String>) -> bool {
+    if loaders.is_empty() {
+        return false;
+    }
+    let ships_elsewhere = version["loaders"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.as_str())
+        .any(|l| !loaders.iter().chain(bridge).any(|own| own == l));
+    ships_elsewhere && matches!(picked, Err(e) if lookup_settled(e))
+}
+
+/// The project a click on an unresolved missing dependency looks up again. A
+/// mod id from a jar is only a guess at a Modrinth slug, and once Modrinth has
+/// answered that it has nothing for this build the button would only repeat
+/// that answer, so the issue stays a notice.
+fn retry_dep(picked: &Result<DepNode, String>, project: &str) -> String {
+    match picked {
+        Err(e) if lookup_settled(e) => String::new(),
+        _ => project.to_string(),
+    }
+}
+
+/// Mod ids the enabled mods of a build require and nothing enabled answers for, with the title
+/// of the first mod that asks for each. Read from the jars alone: no catalogue, no network.
+pub(crate) fn launch_missing(locals: &[LocalMeta], runs: &[String], loader_id: &str, loader_version: Option<&str>) -> Vec<(String, String)> {
+    let have: HashSet<&str> = locals
+        .iter()
+        .flat_map(|m| std::iter::once(m.mod_id.as_str()).chain(m.provides.iter().map(String::as_str)))
+        .filter(|id| !id.is_empty())
+        .collect();
+    let mut out: Vec<(String, String)> = vec![];
+    for m in locals {
+        let Some((requires, _)) = relations_on(m, runs) else { continue };
+        for id in requires {
+            if have.contains(id.as_str()) || is_env_mod_id(id) || loader_provides(loader_id, loader_version, id) || out.iter().any(|(o, _)| o == id) {
+                continue;
+            }
+            out.push((id.clone(), if m.title.is_empty() { m.file_name.clone() } else { m.title.clone() }));
+        }
+    }
+    out
+}
+
+/// Fewest-first cap on what one launch looks for: a build that misses more than this is broken in
+/// a way a launch should not try to repair on its own.
+const LAUNCH_DEPS_MAX: usize = 6;
+/// A dependency nothing could be found for is not asked about again for this long, as long as the
+/// mods of the build stay the same.
+const LAUNCH_DEPS_MISS_TTL: u64 = 24 * 3600;
+const LAUNCH_DEPS_MISS_FILE: &str = "millida-deps-miss.json";
+
+/// What the launch did about missing dependencies.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct LaunchDeps {
+    /// Titles of the mods it put in.
+    pub installed: Vec<String>,
+    /// Mod ids it put nothing in for: no file for this build, or the mod is in the build in a form
+    /// the jars do not show (another name, switched off).
+    pub unresolved: Vec<String>,
+}
+
+/// The enabled mods of the build: their files without `.disabled`.
+fn enabled_mod_files(profile: &str) -> HashSet<String> {
+    let dir = profile_dir(profile).join(content_dir("mod"));
+    std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| !n.to_ascii_lowercase().ends_with(".disabled")).collect())
+        .unwrap_or_default()
+}
+
+/// What the build's mods folder looks like (names, sizes, times) and which game it is for, as a key:
+/// a build found complete is not read again until this changes, and a dependency that could not be
+/// found is not looked for again.
+fn folder_key(profile: &str) -> String {
+    let dir = profile_dir(profile).join(content_dir("mod"));
+    let mut parts: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let m = e.metadata().ok()?;
+                    let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+                    Some(format!("{}:{}:{}", e.file_name().to_string_lossy(), m.len(), t))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    parts.sort();
+    if let Some(p) = load_profiles().into_iter().find(|p| p.name == profile) {
+        parts.push(format!("{}|{}|{}", p.version, p.loader_id(), p.loader_version.unwrap_or_default()));
+    }
+    sha256_hex(parts.join("\n").as_bytes())
+}
+
+/// Builds whose enabled mods were found complete (or missing only what was looked for in vain), by
+/// their folder key then: a launch with the same folder reads no jar descriptions at all.
+fn complete_builds() -> &'static std::sync::Mutex<HashMap<String, String>> {
+    static DONE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    DONE.get_or_init(Default::default)
+}
+
+fn known_complete(profile: &str, key: &str) -> bool {
+    complete_builds().lock().map(|m| m.get(profile).is_some_and(|k| k == key)).unwrap_or(false)
+}
+
+fn mark_complete(profile: &str, key: String) {
+    if let Ok(mut m) = complete_builds().lock() {
+        m.insert(profile.to_string(), key);
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Ids looked for in vain for these same mods within the last day.
+pub(crate) fn known_misses(record: &Value, key: &str, now: u64) -> HashSet<String> {
+    if record["key"].as_str() != Some(key) || now.saturating_sub(record["at"].as_u64().unwrap_or(0)) > LAUNCH_DEPS_MISS_TTL {
+        return HashSet::new();
+    }
+    record["ids"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
+}
+
+/// The build's enabled mods and what they require that nothing answers for. None for a build that
+/// is not ours to complete (a catalogue build) or loads no mods.
+async fn launch_requirements(profile: &str) -> Option<(Ctx, Vec<(String, String)>)> {
+    if is_catalog_pack(profile) {
+        return None;
+    }
+    let ctx = ctx_of(profile, "mod");
+    if !matches!(ctx.loader_id.as_str(), "fabric" | "quilt" | "forge" | "neoforge") {
+        return None;
+    }
+    let loader_version = load_profiles().into_iter().find(|p| p.name == profile).and_then(|p| p.loader_version);
+    let runs: Vec<String> = std::iter::once(ctx.loader_id.clone()).chain(ctx.bridge.iter().cloned()).collect();
+    let enabled = enabled_mod_files(profile);
+    let locals: Vec<LocalMeta> = scan_mods(profile).await.into_iter().filter(|m| enabled.contains(&m.file_name)).collect();
+    let missing = launch_missing(&locals, &runs, &ctx.loader_id, loader_version.as_deref());
+    Some((ctx, missing))
+}
+
+/// How many requirements of the build's mods are missing, from the jars alone (no network): the
+/// lobby reads them ahead of Play, which also brings the cache of the jars' descriptions up to date.
+pub(crate) async fn missing_launch_deps(profile: &str) -> u32 {
+    let key = folder_key(profile);
+    if known_complete(profile, &key) {
+        return 0;
+    }
+    let missing = launch_requirements(profile).await.map(|(_, m)| m.len() as u32).unwrap_or(0);
+    if missing == 0 {
+        mark_complete(profile, key);
+    }
+    missing
+}
+
+/// Missing dependencies of the build's mods, put in before the game starts: a mod requiring one the
+/// build does not have stops the loader before the window, and that is 17.5 % of all crashes. Only
+/// when something is missing does this go to Modrinth; a catalogue build is its author's and is
+/// left as shipped.
+pub(crate) async fn settle_launch_deps(app: &AppHandle, profile: &str) -> LaunchDeps {
+    let mut out = LaunchDeps::default();
+    let key = folder_key(profile);
+    if known_complete(profile, &key) {
+        return out;
+    }
+    let Some((ctx, missing)) = launch_requirements(profile).await else { return out };
+    if missing.is_empty() {
+        mark_complete(profile, key);
+        return out;
+    }
+    let miss_path = profile_dir(profile).join(LAUNCH_DEPS_MISS_FILE);
+    let record: Value = std::fs::read(&miss_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    let known = known_misses(&record, &key, now_secs());
+    let todo: Vec<(String, String)> = missing.into_iter().filter(|(id, _)| !known.contains(id)).take(LAUNCH_DEPS_MAX).collect();
+    if todo.is_empty() {
+        // Everything missing was looked for in vain lately: nothing to do for this folder.
+        mark_complete(profile, key);
+        return out;
+    }
+    // Written before the network is asked, as if nothing will be found: a launch that runs out of
+    // its time while Modrinth hangs must not make the next one wait the same again.
+    let record_misses = |ids: &mut Vec<String>| {
+        ids.sort();
+        ids.dedup();
+        let _ = write_json_atomic(&miss_path, &serde_json::json!({ "key": folder_key(profile), "at": now_secs(), "ids": ids }));
+    };
+    let mut pessimistic: Vec<String> = known.iter().cloned().chain(todo.iter().map(|(id, _)| id.clone())).collect();
+    record_misses(&mut pessimistic);
+    let installed = installed_index(profile);
+    let picks: Vec<_> = todo.iter().map(|(id, _)| pick_modrinth(&ctx, catalog_slug(id), "")).collect();
+    let picked: Vec<Result<Pick, String>> = futures::stream::iter(picks).buffered(PARALLEL).collect().await;
+    for ((id, _needed_by), pick) in todo.iter().zip(picked) {
+        let Ok(p) = pick else {
+            out.unresolved.push(id.clone());
+            continue;
+        };
+        // Already in the build under another name, or switched off by the player: theirs to decide,
+        // and not looked for again while the mods stay the same.
+        if installed.has(&p.node.project_id, &p.node.title) {
+            out.unresolved.push(id.clone());
+            continue;
+        }
+        emit(app, "mod", 50.0, &format!("Ставим {}…", p.node.title));
+        if install_pick(&ctx, &p).await.is_ok() {
+            out.installed.push(p.node.title.clone());
+            install_required(&ctx, p.deps).await;
+        } else {
+            out.unresolved.push(id.clone());
+        }
+    }
+    if out.unresolved.is_empty() && known.is_empty() {
+        let _ = std::fs::remove_file(&miss_path);
+    } else {
+        // Keyed by the folder as this launch leaves it: what was put in is part of it.
+        let mut ids: Vec<String> = known.into_iter().chain(out.unresolved.iter().cloned()).collect();
+        record_misses(&mut ids);
+    }
+    out
+}
+
+/// A catalogue pack is judged by its author, not by the files in `mods/`: a
+/// protected pack loads most of its mods from `libraries` (Arcania keeps 308
+/// there, Prism among them) and carries Forge jars its loader skips, so the
+/// folder alone reported 120 problems for a pack that runs as shipped. It must
+/// not be offered fixes either: the page installs every offered fix by itself.
+fn shipped_pack_audit(checked: usize) -> DepAudit {
+    DepAudit { checked: checked as u32, issues: vec![] }
+}
+
+/// Fabric Loader bundles MixinExtras since 0.15 and answers for its id itself:
+/// Lithium asking for «mixinextras» was reported missing on every such build.
+const FABRIC_BUNDLES_MIXINEXTRAS: &str = "0.15.0";
+
+fn loader_provides(loader_id: &str, loader_version: Option<&str>, mod_id: &str) -> bool {
+    mod_id == "mixinextras"
+        && loader_id == "fabric"
+        && !loader_version.is_some_and(|v| cmp_version(v, FABRIC_BUNDLES_MIXINEXTRAS) == Ordering::Less)
+}
+
+fn push_missing(audit: &mut DepAudit, needed_by: String, missing: String, fix: Option<DepNode>, dep: String) {
+    if audit.issues.iter().any(|i| i.kind == "missing" && i.detail.contains(&missing)) {
+        return;
+    }
+    audit.issues.push(AuditIssue {
+        kind: "missing".into(),
+        title: needed_by,
+        detail: format!("нужен мод «{}», в сборке его нет", missing),
+        file_name: String::new(),
+        fix,
+        dep,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{jar_blockers, known_misses, launch_missing, modrinth_version_ids, other_loader_dep, retry_dep, BreakRule, DepNode, LocalMeta};
+
+    /// Required dependency of a Modrinth version -> whether the audit drops it as another loader's.
+    #[test]
+    fn a_multi_loader_version_does_not_ask_for_the_other_loaders_libraries() {
+        let multi = serde_json::json!({ "loaders": ["fabric", "neoforge", "quilt"] });
+        let single = serde_json::json!({ "loaders": ["neoforge"] });
+        let none_here = || -> Result<DepNode, String> { Err("нет версии под 1.21.1 · neoforge (есть под 1.21.1)".into()) };
+        let offline = || -> Result<DepNode, String> { Err("нет связи (timeout) — https://api.modrinth.com/v2/project/P7dR8mSH/version".into()) };
+        let found = || -> Result<DepNode, String> { Ok(DepNode { project_id: "P7dR8mSH".into(), ..Default::default() }) };
+        let both = serde_json::json!({ "loaders": ["fabric", "neoforge"] });
+        let neo = ["neoforge".to_string()];
+        let connector = ["fabric".to_string()];
+        type Case<'a> = (&'a serde_json::Value, &'a [String], Result<DepNode, String>, bool, &'a str);
+        let cases: [Case; 6] = [
+            (&multi, &[], none_here(), true, "31.10: LambDynamicLights on NeoForge offered Fabric API"),
+            (&single, &[], none_here(), false, "a NeoForge-only jar really lacks what it asks for"),
+            (&multi, &[], offline(), false, "the catalogue did not answer, the dependency may still be real"),
+            (&multi, &[], found(), false, "the dependency ships for this build, so it is needed here"),
+            (&multi, &connector, none_here(), true, "under Connector quilt is still foreign to the build"),
+            (&both, &connector, none_here(), false, "every loader of the jar runs here"),
+        ];
+        for (version, bridge, picked, want, why) in cases {
+            assert_eq!(other_loader_dep(version, &neo, bridge, &picked), want, "{}", why);
+        }
+    }
+
+    /// Lookup of a missing dependency -> what «Поставить» retries, if anything.
+    #[test]
+    fn a_retry_is_offered_only_while_the_catalogue_may_still_answer() {
+        let found: Result<DepNode, String> = Ok(DepNode { project_id: "baubles".into(), ..Default::default() });
+        let cases: [(Result<DepNode, String>, &str, &str); 4] = [
+            (
+                Err("404 Not Found от https://api.millida.net/v2/launcher/mr/v2/project/Thaumcraft/version".into()),
+                "",
+                "30.10: Thaumcraft is no Modrinth project, the button ended in this 404",
+            ),
+            (Err("нет версии под 1.7.10 · forge (есть под 1.20.1)".into()), "", "the project ships nothing for this build"),
+            (Err("нет связи (timeout) — https://api.modrinth.com/v2/project/baubles/version".into()), "Baubles", "the catalogue was unreachable, a later click may work"),
+            (found, "Baubles", "a resolved fix keeps its project"),
+        ];
+        for (picked, want, why) in cases {
+            assert_eq!(retry_dep(&picked, "Baubles"), want, "{}", why);
+        }
+    }
+
+    #[test]
+    fn the_modrinth_batch_carries_only_modrinth_versions() {
+        let entry = |project: &str, version: &str| crate::engine::ContentEntry {
+            kind: "mod".into(),
+            project_id: project.into(),
+            version_id: version.into(),
+            ..Default::default()
+        };
+        let manifest = vec![
+            entry("AANobbMI", "uXe0pIaz"),
+            entry("millida:sodium", "kk9nyy8do41454zngiz8u1vm"),
+            entry("cf:238222", "4712866"),
+            entry("P7dR8mSH", ""),
+        ];
+        assert_eq!(
+            modrinth_version_ids(&manifest),
+            vec!["uXe0pIaz".to_string()],
+            "a catalogue file id or a CurseForge file id in the batch makes Modrinth refuse all fifty ids with 400, and the audit loses every Modrinth dependency of the build"
+        );
+    }
+
+    fn declared_jar(file: &str, id: &str, version: &str, requires: &[&str], breaks: &[(&str, &str)]) -> LocalMeta {
+        LocalMeta {
+            kind: "mod".into(),
+            file_name: file.into(),
+            title: id.into(),
+            version: version.into(),
+            loader: "fabric".into(),
+            mod_id: id.into(),
+            requires: requires.iter().map(|s| s.to_string()).collect(),
+            breaks: breaks.iter().map(|(id, range)| BreakRule { id: id.to_string(), range: range.to_string() }).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// (incoming jar, the rest of the build) -> (missing ids, clash count). The
+    /// FPS mode puts a jar into a build by itself; a blocker it misses is a build
+    /// Fabric refuses on the very first start.
+    #[test]
+    fn a_jar_is_judged_by_what_it_declares() {
+        let culling_1201 = declared_jar("moreculling-1.20.1-0.24.6.jar", "moreculling", "1.20.1-0.24.6", &["cloth-config"], &[]);
+        let culling_1211 = declared_jar("moreculling-fabric-1.21.1-1.0.10.jar", "moreculling", "1.0.10", &["cloth-config"], &[("sodium", "<=0.6.13")]);
+        let sodium_06 = declared_jar("sodium-fabric-0.6.13+mc1.21.1.jar", "sodium", "0.6.13+mc1.21.1", &[], &[]);
+        let sodium_07 = declared_jar("sodium-fabric-0.7.0+mc1.21.1.jar", "sodium", "0.7.0+mc1.21.1", &[], &[]);
+        let cloth = declared_jar("cloth-config-15.0.140-fabric.jar", "cloth-config", "15.0.140", &[], &[]);
+        let mut cloth_by_provides = declared_jar("cloth-config2.jar", "cloth-config2", "11.1.136", &[], &[]);
+        cloth_by_provides.provides = vec!["cloth-config".into()];
+        let old_guard = declared_jar("oldmod.jar", "oldmod", "1.0", &[], &[("moreculling", "<1.0.0")]);
+        let hostile = declared_jar("hostile.jar", "hostile", "1.0", &[], &[("moreculling", "*")]);
+        let runs = vec!["fabric".to_string()];
+        type Case<'a> = (&'a LocalMeta, Vec<LocalMeta>, Vec<&'a str>, usize, &'a str);
+        let cases: Vec<Case> = vec![
+            (&culling_1201, vec![], vec!["cloth-config"], 0, "Modrinth lists no dependency for 0.24.6, the jar still needs Cloth Config"),
+            (&culling_1201, vec![cloth.clone()], vec![], 0, "the library is in the build: nothing blocks"),
+            (&culling_1201, vec![cloth_by_provides], vec![], 0, "a jar that provides the id answers for it"),
+            (&culling_1211, vec![cloth.clone(), sodium_06], vec![], 1, "1.0.10 breaks Sodium 0.6.13, the newest Sodium for 1.21.1"),
+            (&culling_1211, vec![cloth.clone(), sodium_07], vec![], 0, "a Sodium past the guard is fine: breaks is a version range, not a ban"),
+            (&culling_1201, vec![cloth.clone(), old_guard], vec![], 0, "a rule against older versions of the incoming jar does not apply"),
+            (&culling_1201, vec![cloth, hostile], vec![], 1, "a mod already in the build that breaks the incoming one blocks it too"),
+        ];
+        for (incoming, others, missing, clashes, why) in cases {
+            let got = jar_blockers(incoming, &others, &runs, "fabric", Some("0.16.10"));
+            assert_eq!(got.missing, missing, "{}: missing requirements. Why pinned: {why}", incoming.file_name);
+            assert_eq!(got.clashes.len(), clashes, "{}: clashes {:?}. Why pinned: {why}", incoming.file_name, got.clashes);
+        }
+    }
+
+    /// The launch looks for exactly what the enabled mods require and nothing in the build answers
+    /// for: a library bundled inside another jar, the loader itself and Fabric Loader's own
+    /// MixinExtras are not missing, and a requirement asked for twice is looked for once.
+    #[test]
+    fn a_launch_looks_only_for_what_nothing_in_the_build_answers_for() {
+        let runs = vec!["fabric".to_string()];
+        let culling = declared_jar("moreculling.jar", "moreculling", "1.0", &["cloth-config", "fabric-api", "minecraft", "mixinextras"], &[]);
+        let lithium = declared_jar("lithium.jar", "lithium", "0.15", &["fabric-api", "mixinextras"], &[]);
+        let mut api = declared_jar("fabric-api.jar", "fabric-api", "0.92", &[], &[]);
+        api.provides = vec!["fabric-rendering-v1".into()];
+        let needs_module = declared_jar("x.jar", "x", "1", &["fabric-rendering-v1"], &[]);
+        let missing = |locals: &[LocalMeta], lv: Option<&str>| -> Vec<String> {
+            launch_missing(locals, &runs, "fabric", lv).into_iter().map(|(id, _)| id).collect()
+        };
+        assert_eq!(missing(&[culling.clone(), lithium.clone()], Some("0.16.10")), vec!["cloth-config", "fabric-api"], "each id once, the game and the loader left out");
+        assert_eq!(missing(&[culling.clone(), lithium.clone()], Some("0.14.21")), vec!["cloth-config", "fabric-api", "mixinextras"], "Fabric Loader older than 0.15 does not bundle MixinExtras");
+        assert_eq!(missing(&[culling.clone(), lithium, api.clone(), needs_module], Some("0.16.10")), vec!["cloth-config"], "a module inside Fabric API answers for itself");
+        let (id, by) = launch_missing(&[culling], &runs, "fabric", None).remove(0);
+        assert_eq!((id.as_str(), by.as_str()), ("cloth-config", "moreculling"), "the player hears which mod asked for it");
+        assert!(missing(&[api], None).is_empty(), "a complete build costs no lookup at all");
+    }
+
+    #[test]
+    fn a_dependency_not_found_is_not_looked_for_again_until_the_mods_change() {
+        let record = serde_json::json!({"key": "k1", "at": 1000, "ids": ["ghostlib"]});
+        assert!(known_misses(&record, "k1", 1000 + 3600).contains("ghostlib"), "same mods, within the day: skipped");
+        assert!(known_misses(&record, "k2", 1000 + 3600).is_empty(), "the mods changed: asked again");
+        assert!(known_misses(&record, "k1", 1000 + 25 * 3600).is_empty(), "a day later: asked again");
+        assert!(known_misses(&serde_json::Value::Null, "k1", 0).is_empty());
+    }
+
+    #[test]
+    fn a_jar_for_another_loader_is_a_blocker_by_itself() {
+        let mut forge_only = declared_jar("create-1.20.1-6.0.jar", "create", "6.0", &["flywheel"], &[]);
+        forge_only.loader = "forge".into();
+        let got = jar_blockers(&forge_only, &[], &["fabric".to_string()], "fabric", None);
+        assert!(got.missing.is_empty(), "the requirements of a foreign jar describe another game and must not be installed");
+        assert_eq!(got.clashes.len(), 1, "a Forge jar on Fabric never loads, the mode must not keep it");
+    }
+
+    /// (loader, loader version, mod id) -> satisfied by the loader itself.
+    #[test]
+    fn a_catalogue_pack_is_audited_as_shipped() {
+        let cases: [(serde_json::Value, bool, &str); 4] = [
+            (serde_json::json!({ "catalogPackSlug": "arcania" }), true, "Arcania 27.09: «Проблем: 120» for a pack that starts as shipped, and Check installed the «fixes» into it"),
+            (serde_json::json!({ "catalogPackSlug": "" }), false, "an empty slug is not a catalogue pack"),
+            (serde_json::json!({}), false, "a player's own build keeps the full audit"),
+            (serde_json::json!({ "catalogPackSlug": null }), false, "a cleared slug is not a catalogue pack"),
+        ];
+        for (settings, want, why) in cases {
+            assert_eq!(catalog_pack_settings(&settings), want, "{}", why);
+        }
+        let audit = shipped_pack_audit(291);
+        assert!(audit.issues.is_empty(), "a shipped pack reports nothing the player is asked to fix or install");
+        assert_eq!(audit.checked, 291, "the page still says how many files were looked at");
+    }
+
+    #[test]
+    fn loader_bundled_libraries_are_not_missing() {
+        let cases: [(&str, Option<&str>, &str, bool, &str); 6] = [
+            ("fabric", None, "mixinextras", true, "latest Fabric Loader bundles MixinExtras"),
+            ("fabric", Some("0.19.5"), "mixinextras", true, "the player's loader, Lithium must not ask for it"),
+            ("fabric", Some("0.15.0"), "mixinextras", true, "first loader that bundles it"),
+            ("fabric", Some("0.14.25"), "mixinextras", false, "older loaders really need the mod"),
+            ("forge", None, "mixinextras", false, "not claimed for other loaders"),
+            ("fabric", None, "cloth-config", false, "ordinary dependencies stay dependencies"),
+        ];
+        for (loader, ver, id, want, why) in cases {
+            assert_eq!(super::loader_provides(loader, ver, id), want, "{} {:?} {}: {}", loader, ver, id, why);
+        }
+    }
+
+    use super::*;
+    use serde_json::json;
+
+    /// Real `breaks` entries pulled from Simple Voice Chat and More Culling: both
+    /// only guard against an OLD Fabric API, so installing the current one (well
+    /// above either floor) must not be reported as a conflict.
+    #[test]
+    fn breaks_range_only_flags_the_version_it_actually_covers() {
+        assert!(
+            !version_satisfies("0.155.2+26.1.2", "<0.144.3+26.1"),
+            "Simple Voice Chat's guard: a newer Fabric API clears it, no conflict"
+        );
+        assert!(
+            !version_satisfies("0.155.2+26.1.2", "<=0.145.2"),
+            "More Culling's guard: same story"
+        );
+        assert!(
+            version_satisfies("0.140.0+26.1", "<0.144.3+26.1"),
+            "an actually old Fabric API still trips the same guard"
+        );
+        assert!(version_satisfies("1.0.0", "*"), "no range means always incompatible");
+        assert!(version_satisfies("1.0.0", ""), "an empty range reads the same as *");
+        assert!(version_satisfies("2.0.0", ">=1.5.0"));
+        assert!(!version_satisfies("1.0.0", ">=1.5.0"));
+        assert!(version_satisfies("1.5.0", ">=1.0.0 <2.0.0"), "space-separated clauses AND together");
+        assert!(!version_satisfies("2.0.0", ">=1.0.0 <2.0.0"));
+        assert!(version_satisfies("1.2.3", "^1.0.0"), "an unparsed operator is treated as still matching");
+    }
+
+    /// Installed version, NeoForge `incompatible` range -> whether the guard trips.
+    #[test]
+    fn maven_incompatibility_ranges_flag_only_the_versions_inside() {
+        let cases: [(&str, &str, bool, &str); 9] = [
+            ("2.2.0+1.21.1+neoforge", "[,2.1.0)", false, "31.10: Inventory Particles only bars Inventory Interactions before 2.1.0"),
+            ("1.3.4", "[0,1.3.0)", false, "31.10: Supplementaries only bars Farmer's Delight before 1.3.0"),
+            ("1.13.11", "(,1.13.3]", false, "30.10: Cristel Lib only bars old Towns and Towers, 1.13.11 was refused at install"),
+            ("1.13.3", "(,1.13.3]", true, "the upper bound is inclusive"),
+            ("0.8.13", "[, 0.8.0)", false, "30.10: More Culling only bars Sodium before 0.8, the space in the range must not matter"),
+            ("0.7.9", "[, 0.8.0)", true, "an old Sodium still trips the guard"),
+            ("2.5", "[1.0,2.0),[3.0,)", false, "between two barred ranges"),
+            ("3.1", "[1.0,2.0),[3.0,)", true, "the second alternative counts too"),
+            ("1.0", "[0,)", true, "an open range bars every version"),
+        ];
+        for (version, range, trips, why) in cases {
+            assert_eq!(version_satisfies(version, range), trips, "{} in {}: {}", version, range, why);
+        }
+    }
+
+    /// вход -> вердикт. A mod id read out of a jar has to reach the right catalog
+    /// project, or the audit reports "нужен мод «fabric»" with no button to press
+    /// — which is what "лаунчер предлагает докачать, но ничего не докачивает"
+    /// looked like from the player's side.
+    #[test]
+    fn declared_mod_ids_reach_their_catalog_project() {
+        let cases: [(&str, &str, &str); 5] = [
+            ("fabric", "fabric-api", "самая частая зависимость вообще: на Modrinth нет проекта «fabric»"),
+            ("architectury", "architectury-api", "то же самое у второй по частоте библиотеки"),
+            ("roughlyenoughitems", "rei", "id и slug разошлись исторически"),
+            ("cloth-config", "cloth-config", "совпадающие id проходят насквозь"),
+            ("sodium", "sodium", "неизвестный id — сам себе slug, иначе таблица стала бы белым списком"),
+        ];
+        for (id, want, why) in cases {
+            assert_eq!(catalog_slug(id), want, "«{id}» обязан вести на «{want}». Зачем случай закреплён: {why}");
+        }
+    }
+
+    /// input -> verdict. Embedded libraries and tools are already inside the jar:
+    /// installing them separately duplicates classes and breaks the game.
+    #[test]
+    fn only_real_relations_become_installs() {
+        assert_eq!(mr_relation("required"), "required");
+        assert_eq!(mr_relation("optional"), "optional");
+        assert_eq!(mr_relation("incompatible"), "incompatible");
+        assert_eq!(mr_relation("embedded"), "skip", "embedded code ships inside the jar");
+        assert_eq!(cf_relation(3), "required");
+        assert_eq!(cf_relation(2), "optional");
+        assert_eq!(cf_relation(5), "incompatible");
+        assert_eq!(cf_relation(1), "skip", "relationType 1 is an embedded library");
+        assert_eq!(cf_relation(4), "skip", "relationType 4 is a tool, not a dependency");
+    }
+
+    #[test]
+    fn reads_dependencies_from_both_catalogs() {
+        let mr = json!({ "dependencies": [
+            { "project_id": "9s6osm5g", "dependency_type": "required", "version_id": "abc" },
+            { "project_id": "x", "dependency_type": "embedded" },
+            { "project_id": "", "dependency_type": "required" },
+        ]});
+        let got = mr_deps(&mr);
+        assert_eq!(got.len(), 1, "only the real required dependency survives");
+        assert_eq!(got[0].project_id, "9s6osm5g");
+        assert_eq!(got[0].version_id, "abc");
+
+        let cf = json!({ "dependencies": [
+            { "modId": 306612, "relationType": 3 },
+            { "modId": 238222, "relationType": 4 },
+        ]});
+        let got = cf_deps(&cf);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].project_id, "cf:306612", "CurseForge ids keep their prefix");
+    }
+
+    /// The same mod under two catalogs must count as installed once, or every
+    /// install would offer its Modrinth twin again.
+    #[test]
+    fn installed_matches_by_id_title_and_mod_id() {
+        let mut idx = Installed::default();
+        idx.ids.insert("cf:306612".into());
+        idx.titles.insert("clothconfigapi".into());
+        idx.mod_ids.insert("fabric-api".into());
+
+        assert!(idx.has("cf:306612", ""));
+        assert!(idx.has("some-modrinth-id", "Cloth Config API"), "same mod from the other catalog");
+        assert!(idx.has("fabric-api", ""), "matched by the id declared inside the jar");
+        assert!(!idx.has("sodium", "Sodium"));
+    }
+
+    /// (dependency as a catalog names it) -> already in the build. UniMixins
+    /// registers gtnhmixins and spongemixins itself; a second provider of the
+    /// same mod id is a FML 1.7.10 refusal to start (OneBlock, 28.09.2026).
+    #[test]
+    fn a_dependency_a_composite_jar_already_registers_is_not_installed_again() {
+        let mut idx = Installed::default();
+        idx.titles.insert("unimixins".into());
+        for id in ["unimixins", "spongemixins", "gtnhmixins", "mixinbooterlegacy"] {
+            idx.mod_ids.insert(id.into());
+        }
+        let cases: [(&str, &str, bool, &str); 5] = [
+            ("cf:1026046", "GTNHMixins", true, "CurseForge GTNHMixins is the module UniMixins already registers"),
+            ("mr-sponge", "SpongeMixins", true, "SpongeMixins is inside UniMixins too"),
+            ("mr-booter", "MixinBooterLegacy", true, "and so is MixinBooterLegacy"),
+            ("mr-hodge", "Hodgepodge", false, "a mod the build does not have is still installed"),
+            ("mr-empty", "", false, "an empty title matches nothing"),
+        ];
+        for (pid, title, want, why) in cases {
+            assert_eq!(idx.has(pid, title), want, "{pid} «{title}»: {why}");
+        }
+    }
+
+    /// A jar that targets another game version is the top cause of a build that
+    /// will not start, but a declared range says nothing and must stay silent.
+    #[test]
+    fn version_mismatch_only_for_exact_lists() {
+        assert!(declared_mismatch("1.21.1", "1.20.1"));
+        assert!(!declared_mismatch("1.21, 1.21.1", "1.21.1"));
+        assert!(!declared_mismatch(">=1.21.11", "1.20.1"), "a range is not a verdict");
+        assert!(!declared_mismatch("1.20.x", "1.20.1"));
+        assert!(!declared_mismatch("", "1.20.1"));
+        assert!(!declared_mismatch("1.21.1", ""));
+    }
+
+    #[test]
+    fn loader_mismatch_lets_quilt_load_fabric() {
+        assert!(loader_mismatch("forge", "fabric"));
+        assert!(!loader_mismatch("fabric", "quilt"), "Quilt loads Fabric mods");
+        assert!(!loader_mismatch("fabric", "fabric"));
+        assert!(!loader_mismatch("fabric", "vanilla"), "a vanilla build judges nothing");
+        assert!(!loader_mismatch("", "forge"));
+    }
+
+    /// Support ticket 28.08.2026: Collective ships ONE jar for Fabric, Forge and
+    /// NeoForge, no NeoForge-only build of it exists, and the launcher labelled
+    /// it `fabric` and refused it on a NeoForge build.
+    #[test]
+    fn multi_loader_file_fits_every_loader_it_declares() {
+        let all = ["fabric".to_string(), "forge".to_string(), "neoforge".to_string()];
+        let neoforge = ["neoforge".to_string()];
+        let fabric = ["fabric".to_string()];
+        assert!(!loaders_mismatch(&all, &neoforge), "author supports NeoForge in the same file");
+        assert!(!loaders_mismatch(&all, &fabric));
+        assert!(loaders_mismatch(&fabric, &neoforge), "a Fabric-only file is still foreign");
+        assert!(!loaders_mismatch(&[], &neoforge), "a file we could not read judges nothing");
+    }
+
+    fn jar(loaders: &[&str], relations: &[(&str, &[&str])]) -> LocalMeta {
+        let owned = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        LocalMeta {
+            loader: loaders.first().copied().unwrap_or("").into(),
+            loaders: owned(loaders),
+            requires: relations.first().map(|(_, r)| owned(r)).unwrap_or_default(),
+            relations: relations
+                .iter()
+                .map(|(l, r)| LoaderRelations { loader: l.to_string(), requires: owned(r), breaks: vec![], ..Default::default() })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// input -> verdict: (jar, loaders the build runs) -> the dependencies to
+    /// demand, or None for a wrong-loader file that gets no demands at all.
+    /// Report 03.10.2026: a NeoForge 1.21.1 build was told Explorify needs
+    /// «fabric-api», though its jar carries a neoforge.mods.toml with none.
+    #[test]
+    fn dependencies_are_read_from_the_manifest_of_the_loader_that_runs_the_jar() {
+        let explorify = jar(
+            &["fabric", "neoforge", "forge"],
+            &[("fabric", &["fabric-api"]), ("neoforge", &[]), ("forge", &[])],
+        );
+        let fabric_only = jar(&["fabric"], &[("fabric", &["fabric-api"])]);
+        let fabric_and_quilt = jar(&["fabric", "quilt"], &[("fabric", &["fabric-api"]), ("quilt", &["qsl"])]);
+        let old_cache = LocalMeta { loader: "neoforge".into(), requires: vec!["curios".into()], ..Default::default() };
+        let neo = ["neoforge".to_string()];
+        let fab = ["fabric".to_string()];
+        let quilt = ["quilt".to_string()];
+        let bridged = ["neoforge".to_string(), "fabric".to_string()];
+        let none: &[&str] = &[];
+        type Case<'a> = (&'a LocalMeta, &'a [String], Option<&'a [&'a str]>, &'a str);
+        let cases: [Case; 8] = [
+            (&explorify, &neo, Some(none), "сама жалоба: NeoForge читает neoforge.mods.toml, Fabric API ему не нужен"),
+            (&explorify, &fab, Some(&["fabric-api"]), "тот же jar на Fabric по-прежнему требует Fabric API"),
+            (&explorify, &bridged, Some(none), "с Connector свой загрузчик сборки важнее моста"),
+            (&fabric_only, &neo, None, "Fabric-сборка мода на NeoForge: вердикт «другой загрузчик», а не «нужен fabric-api»"),
+            (&fabric_only, &bridged, Some(&["fabric-api"]), "через Connector Fabric-мод грузится, и его зависимости настоящие"),
+            (&fabric_only, &quilt, Some(&["fabric-api"]), "Quilt грузит Fabric-моды"),
+            (&fabric_and_quilt, &quilt, Some(&["qsl"]), "на Quilt свой quilt.mod.json важнее fabric.mod.json"),
+            (&old_cache, &neo, Some(&["curios"]), "кэш без разбора по загрузчикам судится как раньше"),
+        ];
+        for (m, runs, want, why) in cases {
+            let got = relations_on(m, runs).map(|(r, _)| r.to_vec());
+            let want = want.map(|w| w.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+            assert_eq!(got, want, "{:?} на {:?}: {}", m.loaders, runs, why);
+        }
+    }
+
+    /// The loader verdict has to say what to do, in the loaders' own spelling.
+    #[test]
+    fn wrong_loader_verdict_names_the_build_to_fetch() {
+        let cases: [(&[&str], &str, &str, &str); 3] = [
+            (&["fabric"], "neoforge", "мод для Fabric, а сборка на NeoForge — поставь версию для NeoForge", "сама жалоба"),
+            (&["fabric", "quilt"], "forge", "мод для Fabric/Quilt, а сборка на Forge — поставь версию для Forge", "все объявленные загрузчики названы"),
+            (&["forge"], "fabric", "мод для Forge, а сборка на Fabric — поставь версию для Fabric", "обратное направление"),
+        ];
+        for (declared, build, want, why) in cases {
+            let declared: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+            assert_eq!(wrong_loader_text(&declared, build), want, "{}", why);
+        }
+    }
+
+    /// Report 30.08.2026: a Forge build with Sinytra Connector and Fabric mods
+    /// in it. The bridge is installed precisely to run that mix, so the Fabric
+    /// jars are not foreign files — and without the bridge they still are.
+    #[test]
+    fn bridged_build_accepts_fabric_files() {
+        let fabric = ["fabric".to_string()];
+        let forge_only = ["forge".to_string()];
+        let bridged = ["forge".to_string(), "fabric".to_string()];
+        assert!(loaders_mismatch(&fabric, &forge_only), "no bridge — a Fabric jar is still foreign on Forge");
+        assert!(!loaders_mismatch(&fabric, &bridged), "Connector is what makes the mix work");
+        assert!(loaders_mismatch(&["quilt".to_string()], &bridged), "Connector bridges Fabric, not Quilt");
+        assert!(!loaders_mismatch(&fabric, &[]), "an unknown build judges nothing");
+    }
+
+    /// A bridged Fabric mod asks for Fabric API, and its Fabric build does not
+    /// load on Forge at all: the dependency has to become Connector's port.
+    #[test]
+    fn fabric_api_becomes_forgified_when_bridged() {
+        let ctx = |bridge: Vec<String>| Ctx {
+            profile: "p".into(),
+            kind: "mod".into(),
+            game_version: "1.20.1".into(),
+            loader_id: "forge".into(),
+            loaders: vec!["forge".to_string()],
+            bridge,
+        };
+        let on = ctx(vec!["fabric".to_string()]);
+        let off = ctx(vec![]);
+        assert_eq!(bridged_project(&on, FABRIC_API), FORGIFIED_FABRIC_API);
+        assert_eq!(bridged_project(&on, "fabric-api"), FORGIFIED_FABRIC_API);
+        assert_eq!(bridged_project(&on, "sodium"), "sodium", "only Fabric API is ported");
+        assert_eq!(bridged_project(&off, FABRIC_API), FABRIC_API, "no bridge — install what was asked for");
+    }
+
+    /// Both spellings of Fabric API — the stock project and Connector's Forge port
+    /// — count as the same jar, so no update path (batch, single or bulk) can swap
+    /// one in for the other and none can be missed.
+    #[test]
+    fn fabric_api_family_covers_both_spellings() {
+        assert!(is_fabric_api_family(FABRIC_API), "stock Fabric API");
+        assert!(is_fabric_api_family(FORGIFIED_FABRIC_API), "Connector's Forge port of it");
+        assert!(is_fabric_api_family("fabric-api"), "the jar-declared id spelled out");
+        assert!(!is_fabric_api_family("sodium"), "an ordinary mod updates freely");
+        assert!(!is_fabric_api_family(""), "an empty id is not the family");
+    }
+
+    /// Celestia 3.0 upgraded its shipped Fabric API 0.92.7 to the Modrinth latest
+    /// 0.92.12; the newer tag mixins then collided with Kilt and the world hung on
+    /// creation. The pin has to hold on a bridged build (Connector's port) and,
+    /// with no bridge at all, whenever the build came from the catalogue — and it
+    /// must never touch an ordinary mod. The catalogue branch reads profile
+    /// settings from disk; a name with no profile behind it stands in for a
+    /// hand-built Fabric instance, where Fabric API updates as usual.
+    #[test]
+    fn loader_shortfall_is_judged_against_the_pinned_loader() {
+        let jar = |loader: &str, range: &str| LocalMeta {
+            relations: vec![LoaderRelations { loader: loader.into(), loader_range: range.into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pin = |loader: &str, v: &str| pin_of(loader, Some(v), "1.21.1").unwrap_or(LoaderPin { loader_id: String::new(), version: String::new() });
+        let multi = LocalMeta {
+            relations: vec![
+                LoaderRelations { loader: "fabric".into(), loader_range: ">=0.16.0".into(), ..Default::default() },
+                LoaderRelations { loader: "neoforge".into(), loader_range: "[21.1.252,)".into(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let cases: [(LocalMeta, LoaderPin, Option<&str>, &str); 8] = [
+            (multi, pin("neoforge", "21.1.248"), Some("[21.1.252,)"), "a multi-loader jar is judged by the manifest of the build's loader"),
+            (jar("neoforge", "[21.1.252,)"), pin("neoforge", "21.1.248"), Some("[21.1.252,)"), "Quark 487 on All of Aeronautics"),
+            (jar("neoforge", "[21.1.252,)"), pin("neoforge", "21.1.262"), None, "a newer loader takes it"),
+            (jar("neoforge", "[21.1,22)"), pin("neoforge", "21.1.248"), None, "an open range up to the next line"),
+            (jar("forge", "[47.2,)"), pin("forge", "1.21.1-47.1.3"), Some("[47.2,)"), "a pin written with the game version in front"),
+            (jar("fabric", ">=0.16.0"), pin("fabric", "0.15.11"), Some(">=0.16.0"), "Fabric predicate syntax"),
+            (jar("fabric", ">=0.16.0"), pin("neoforge", "21.1.248"), None, "a bridged Fabric jar asks Fabric Loader, not NeoForge"),
+            (jar("neoforge", ""), pin("neoforge", "21.1.248"), None, "no requirement"),
+        ];
+        for (m, p, want, why) in cases {
+            assert_eq!(loader_shortfall(&m, &p).as_deref(), want, "{why}");
+        }
+        assert_eq!(pin_of("neoforge", None, "1.21.1"), None, "unpinned: the launch takes the newest stable loader");
+        assert_eq!(pin_of("vanilla", Some("x"), "1.21.1"), None, "vanilla has no loader to outgrow");
+    }
+
+    #[test]
+    fn fabric_api_is_pinned_on_bridged_and_catalogue_builds() {
+        let bridged = ["fabric".to_string()];
+        let no_bridge: [String; 0] = [];
+        assert!(fabric_api_pinned("no-such-profile", &bridged, FABRIC_API), "bridged build pins it regardless of origin");
+        assert!(fabric_api_pinned("no-such-profile", &bridged, FORGIFIED_FABRIC_API), "the Forge port is the same pin");
+        assert!(!fabric_api_pinned("no-such-profile", &bridged, "sodium"), "only Fabric API is pinned, not the whole build");
+        assert!(!fabric_api_pinned("no-such-profile", &no_bridge, FABRIC_API), "a hand-built Fabric instance updates Fabric API freely");
+    }
+}

@@ -1,0 +1,295 @@
+import { beforeEach, describe, expect, mock, test } from 'bun:test'
+
+// Очередь телеметрии: гонка отправок, дубли после init, штамп времени и
+// версии, один app_exit на страницу, trackFailure (bughunt 25.09.2026).
+const store = new Map<string, string>()
+Object.defineProperty(globalThis, 'localStorage', {
+  value: {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => void store.set(k, String(v)),
+    removeItem: (k: string) => void store.delete(k),
+  },
+  configurable: true,
+})
+const listeners: Record<string, Array<() => void>> = {}
+Object.defineProperty(globalThis, 'window', {
+  value: {
+    addEventListener: (t: string, fn: () => void) => void (listeners[t] ||= []).push(fn),
+    setInterval: () => 1,
+    screen: { width: 1920, height: 1080 },
+  },
+  configurable: true,
+})
+Object.defineProperty(globalThis, 'document', {
+  value: { addEventListener: (t: string, fn: () => void) => void (listeners['doc:' + t] ||= []).push(fn), hidden: false },
+  configurable: true,
+})
+Object.defineProperty(globalThis, 'location', { value: { hash: '' }, configurable: true, writable: true })
+
+type Batch = { events: Array<{ type: string; at?: number; appVersion?: string; data?: Record<string, unknown> }> }
+const sent: Batch[] = []
+let release: Array<(ok: boolean) => void> = []
+let manual = false
+/// What the core says about the disk; null means the core does not answer (the usual case in these tests).
+let disk: string | null = null
+/// Что ушло в файл настроек ядра (долговечные ключи).
+const prefWrites: Array<[string, string]> = []
+/// Содержимое файла настроек ядра, как его отдаёт uiPrefs.
+let diskPrefs: Record<string, string> = {}
+const remembered: Array<[string, unknown]> = []
+
+mock.module('../ipc/tauri', () => ({ hasTauri: () => true }))
+mock.module('../ipc/commands', () => ({
+  appVersion: async () => '2.0.1',
+  setGameTelemetry: async () => {},
+  uiPrefs: async () => diskPrefs,
+  setUiPref: async (k: string, v: string) => void prefWrites.push([k, v]),
+  rememberInstallId: async () => {},
+  rememberBeat: async (path: string, body: unknown) => void remembered.push([path, body]),
+  deviceSpecs: async () => ({ os: 'windows', os_version: '11', arch: 'x86_64' }),
+  diskKind: async () => {
+    if (disk === null) throw new Error('no core')
+    return disk
+  },
+  millidaApi: (path: string, _m: string, body: Batch) => {
+    if (path !== '/launcher/telemetry') return Promise.resolve({})
+    sent.push(JSON.parse(JSON.stringify(body)))
+    if (!manual) return Promise.resolve({})
+    return new Promise((res, rej) => release.push((ok) => (ok ? res({}) : rej(new Error('offline')))))
+  },
+}))
+mock.module('./api', () => ({ LAUNCHER_API: 'http://x', apiHeaders: () => ({}) }))
+mock.module('./gpu', () => ({ detectGpu: () => 'gpu' }))
+
+const T = await import('./telemetry')
+const tick = () => new Promise((r) => setTimeout(r, 0))
+const types = (b: Batch) => b.events.map((e) => e.type)
+
+describe('очередь телеметрии', () => {
+  beforeEach(() => {
+    T.__resetTelemetryForTests()
+    store.clear()
+    sent.length = 0
+    release = []
+    manual = false
+    disk = null
+    for (const k of Object.keys(listeners)) delete listeners[k]
+    ;(globalThis as { location: { hash: string } }).location.hash = ''
+  })
+
+  test('параллельные flush не шлют пачку дважды и не теряют события', async () => {
+    manual = true
+    T.track('ui_click', { a: 1 })
+    T.track('ui_click', { a: 2 })
+    const first = T.flushTelemetry()
+    T.track('ui_click', { a: 3 })
+    const second = T.flushTelemetry()
+    await tick()
+    expect(sent.length).toBe(1)
+    expect(sent[0].events.length).toBe(2)
+    release.shift()!(true)
+    await tick()
+    await tick()
+    // Второй вызов попросил ещё круг — уходит только третье событие.
+    expect(sent.length).toBe(2)
+    expect(sent[1].events.map((e) => e.data?.a)).toEqual([3])
+    release.shift()!(true)
+    await Promise.all([first, second])
+    expect(store.get('m-telemetry-queue')).toBeUndefined()
+  })
+
+  test('события до init не дублируются и сохранённая очередь не затирается', async () => {
+    store.set('m-telemetry-queue', JSON.stringify([{ type: 'app_exit', at: 1 }]))
+    T.track('screen_view', { screen: 'home' })
+    await T.initTelemetry(100)
+    await tick()
+    const all = sent.flatMap(types)
+    expect(all.filter((t) => t === 'screen_view').length).toBe(1)
+    expect(all.filter((t) => t === 'app_exit').length).toBe(1)
+    expect(all.filter((t) => t === 'app_start').length).toBe(1)
+  })
+
+  // Окно пересобирается из трея и после игры: это не запуск лаунчера, а его дашборды
+  // и время холодного старта не должны смешиваться с открытием прогретого окна.
+  test('пересобранное окно не считается запуском лаунчера', async () => {
+    await T.initTelemetry(250, true)
+    await tick()
+    const ev = sent.flatMap((b) => b.events)
+    expect(ev.some((e) => e.type === 'app_start')).toBe(false)
+    expect(ev.find((e) => e.type === 'perf' && e.data?.what === 'window_reopen')).toBeDefined()
+  })
+
+  test('каждое событие со временем и версией, которая его записала', async () => {
+    const before = Date.now()
+    T.track('ui_click', {})
+    await T.initTelemetry(1)
+    await tick()
+    const ev = sent.flatMap((b) => b.events)
+    expect(ev.every((e) => typeof e.at === 'number' && e.at! >= before)).toBe(true)
+    expect(ev.every((e) => e.appVersion === '2.0.1')).toBe(true)
+    // Событие прошлой версии из сохранённой очереди свою версию не теряет.
+    T.__resetTelemetryForTests()
+    sent.length = 0
+    store.set('m-telemetry-queue', JSON.stringify([{ type: 'game_exit', at: 5, appVersion: '1.0.115' }]))
+    await T.initTelemetry(1)
+    await tick()
+    expect(sent.flatMap((b) => b.events).find((e) => e.type === 'game_exit')?.appVersion).toBe('1.0.115')
+  })
+
+  test('app_exit — один на страницу, повторный init слушателей не добавляет', async () => {
+    await T.initTelemetry(1)
+    await T.initTelemetry(1)
+    expect(listeners.pagehide.length).toBe(1)
+    listeners.beforeunload[0]()
+    listeners.pagehide[0]()
+    listeners.pagehide[0]()
+    T.trackAppExit()
+    await tick()
+    expect(sent.flatMap(types).filter((t) => t === 'app_exit').length).toBe(1)
+  })
+
+  test('отменённый выход забирает свой app_exit назад', async () => {
+    manual = true
+    await T.initTelemetry(1)
+    listeners.beforeunload[0]()
+    T.cancelAppExit()
+    release.forEach((r) => r(true))
+    await tick()
+    manual = false
+    await T.flushTelemetry()
+    expect(sent.flatMap(types)).not.toContain('app_exit')
+    // И может случиться позже по-настоящему.
+    T.trackAppExit()
+    await tick()
+    expect(sent.flatMap(types)).toContain('app_exit')
+  })
+
+  test('окно оверлея ничего не пишет в общую очередь', () => {
+    ;(globalThis as { location: { hash: string } }).location.hash = '#overlay'
+    T.track('ui_click', {})
+    expect(store.get('m-telemetry-queue')).toBeUndefined()
+  })
+
+  test('trackFailure: класс, чистый текст, без повторов и без отмен', async () => {
+    expect(T.trackFailure('launch', 'Запуск отменён')).toBe(null)
+    expect(T.trackFailure('login', 'unauthorized')).toBe(null)
+    const kind = T.trackFailure('updater', new Error('нет связи (operation timed out) C:/Users/Вася/x Bearer abc.def'), { step: 'boot' })
+    expect(kind).toBe('network_timeout')
+    T.trackFailure('updater', new Error('нет связи (operation timed out) C:/Users/Вася/x Bearer abc.def'), { step: 'boot' })
+    await T.flushTelemetry()
+    const errs = sent.flatMap((b) => b.events).filter((e) => e.type === 'error')
+    expect(errs.length).toBe(1)
+    expect(errs[0].data).toMatchObject({ where: 'updater', kind: 'network_timeout', step: 'boot' })
+    const code = String(errs[0].data?.code)
+    expect(code).not.toContain('Вася')
+    expect(code).not.toContain('abc.def')
+  })
+
+  // Вошедший лаунчер шлёт стук телеметрии внутри стука присутствия: тело то же,
+  // частоту и отказ от телеметрии соблюдает тот же liveBeatPayload.
+  test('тело стука лаунчера собирается с устройством, повтор раньше срока — пусто', async () => {
+    const first = await T.liveBeatPayload('playing', { build: 'b', mc: '1.21.1', server: 'mc.example' }, true)
+    expect(first?.installId).toBeTruthy()
+    expect(first).toMatchObject({ status: 'playing', os: 'windows', mc: '1.21.1', server: 'mc.example' })
+    expect(await T.liveBeatPayload('playing', {})).toBeNull()
+  })
+
+  test('выключенная телеметрия не уезжает и внутри стука присутствия', async () => {
+    T.setTelemetryEnabled(false)
+    expect(await T.liveBeatPayload('idle', {}, true)).toBeNull()
+    T.setTelemetryEnabled(true)
+  })
+
+  test('ядро получает стук онлайна и после недавнего стука, иначе вошедший лаунчер без окна пропадёт из счётчика', async () => {
+    remembered.length = 0
+    await T.liveBeatPayload('playing', {}, true)
+    await T.rememberLiveBeat('playing', { build: 'b', mc: '1.21.1', server: 'mc.example' })
+    expect(remembered).toHaveLength(1)
+    expect(remembered[0]![0]).toBe('/launcher/heartbeat')
+    expect(remembered[0]![1]).toMatchObject({ status: 'playing', build: 'b', mc: '1.21.1', server: 'mc.example' })
+    expect((remembered[0]![1] as { installId?: string }).installId).toBeTruthy()
+  })
+
+  test('выключенная телеметрия не передаёт ядру стук онлайна', async () => {
+    remembered.length = 0
+    T.setTelemetryEnabled(false)
+    await T.rememberLiveBeat('idle', {})
+    expect(remembered).toHaveLength(0)
+    T.setTelemetryEnabled(true)
+  })
+
+  test('отказ от телеметрии чистит сохранённую очередь', () => {
+    T.track('ui_click', {})
+    expect(store.get('m-telemetry-queue')).toBeDefined()
+    T.setTelemetryEnabled(false)
+    expect(store.get('m-telemetry-queue')).toBeUndefined()
+    T.track('ui_click', {})
+    expect(store.get('m-telemetry-queue')).toBeUndefined()
+    T.setTelemetryEnabled(true)
+  })
+
+  // Переустановка и выход из трея обнуляют localStorage, а отказ от статистики
+  // обязан пережить это: его зеркало лежит в файле ядра, и с диска оно главнее.
+  test('отказ от телеметрии записывается и в файл настроек ядра', async () => {
+    const { flushPrefs } = await import('./prefs')
+    prefWrites.length = 0
+    T.setTelemetryEnabled(false)
+    await flushPrefs()
+    expect(prefWrites).toContainEqual(['m-telemetry-off', '1'])
+    T.setTelemetryEnabled(true)
+    await flushPrefs()
+    expect(prefWrites).toContainEqual(['m-telemetry-off', '0'])
+  })
+
+  test('после переустановки отказ от телеметрии возвращается из файла ядра', async () => {
+    const { hydratePrefs } = await import('./prefs')
+    store.delete('m-telemetry-off')
+    diskPrefs = { 'm-telemetry-off': '1' }
+    await hydratePrefs()
+    diskPrefs = {}
+    expect(T.telemetryEnabled()).toBe(false)
+    T.setTelemetryEnabled(true)
+  })
+
+  test('тип диска уходит одним словом и один раз на версию', async () => {
+    disk = 'hdd'
+    await T.initTelemetry(1)
+    await tick()
+    await tick()
+    await T.flushTelemetry()
+    const perf = () => sent.flatMap((b) => b.events).filter((e) => e.type === 'perf' && e.data?.what === 'disk')
+    expect(perf().map((e) => e.data?.kind), 'один замер диска с ответом ядра').toEqual(['hdd'])
+    expect(store.get('m-disk-kind')).toBe('2.0.1:hdd')
+    // Второй запуск той же версии диск уже не спрашивает и не шлёт.
+    T.__resetTelemetryForTests()
+    sent.length = 0
+    disk = 'ssd'
+    await T.initTelemetry(1)
+    await tick()
+    await tick()
+    await T.flushTelemetry()
+    expect(perf().length, 'на той же версии повтора нет').toBe(0)
+    // Новая версия лаунчера — новый замер (диск могли сменить).
+    store.set('m-disk-kind', '2.0.0:hdd')
+    T.__resetTelemetryForTests()
+    await T.initTelemetry(1)
+    await tick()
+    await tick()
+    await T.flushTelemetry()
+    expect(perf().map((e) => e.data?.kind)).toEqual(['ssd'])
+  })
+
+  test('без ответа ядра и при выключенной статистике замера диска нет', async () => {
+    await T.initTelemetry(1)
+    await tick()
+    await tick()
+    await T.flushTelemetry()
+    expect(sent.flatMap((b) => b.events).some((e) => e.data?.what === 'disk')).toBe(false)
+    expect(store.get('m-disk-kind')).toBeUndefined()
+    T.__resetTelemetryForTests()
+    store.set('m-telemetry-off', '1')
+    disk = 'ssd'
+    await T.reportDiskKind()
+    expect(store.get('m-disk-kind'), 'статистика выключена — ядро даже не спрашивают').toBeUndefined()
+  })
+})

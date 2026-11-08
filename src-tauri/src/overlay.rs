@@ -1,0 +1,676 @@
+// Overlay: a small window on top of the game with notifications and a hotkey.
+// It is a separate launcher window. Nothing is injected into Minecraft and we do not touch the game process. No network of its own.
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+
+/// A separate always-on-top window, not a Minecraft mod: the launcher blocks
+/// `-javaagent` on purpose (launch.rs), and one window works for every loader
+/// and every game version instead of a client mod per pair.
+pub const LABEL: &str = "overlay";
+
+const PREF_ENABLED: &str = "overlay-enabled";
+const PREF_HOTKEY: &str = "overlay-hotkey";
+const PREF_TOASTS: &str = "overlay-toasts";
+const PREF_CARD_MS: &str = "overlay-card-ms";
+pub const DEFAULT_HOTKEY: &str = "Alt+M";
+
+/// How long a passive card stays on screen. The frontend runs the clock; the
+/// core needs the same number for its watchdog, and both read it from here.
+pub const DEFAULT_CARD_MS: u64 = 9_000;
+pub const MIN_CARD_MS: u64 = 3_000;
+pub const MAX_CARD_MS: u64 = 30_000;
+
+/// Cards the webview could not receive yet: a window that has just been created
+/// has no listener, and an event emitted into that gap is lost for good - the
+/// overlay would then stay on screen full-size with nothing to show.
+static PENDING: Mutex<Vec<serde_json::Value>> = Mutex::new(Vec::new());
+static BOUND_HOTKEY: Mutex<Option<String>> = Mutex::new(None);
+static INTERACTIVE: AtomicBool = AtomicBool::new(false);
+static NOTIFY_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Card rectangles in CSS pixels relative to the window, reported by the
+/// webview. A passive overlay is click-through as a whole, so the only way a
+/// card can be clicked at all is to drop that flag exactly while the pointer is
+/// over one of these.
+static HIT: Mutex<Vec<[f64; 4]>> = Mutex::new(Vec::new());
+static HOVER: AtomicBool = AtomicBool::new(false);
+static HIT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+const HIT_POLL_MS: u64 = 25;
+
+/// Extra time the watchdog gives the webview past the card's own deadline: the
+/// frontend hides the window on its own, this only catches one that never
+/// answered. Yanking the window at exactly the card deadline would cut the
+/// closing animation of a card that is working fine.
+const PASSIVE_GRACE_MS: u64 = 6_000;
+
+/// A hovered card stops its own clock, so a pointer resting in the corner where
+/// cards appear used to pin an always-on-top card on screen for good.
+const HOLD_MAX_MS: u64 = 45_000;
+
+/// A hidden overlay is a whole second webview process. It is closed after a
+/// quiet spell and rebuilt by the next card; it only stays through a game when
+/// the chat hotkey is on, so that the hotkey opens without a cold start.
+const IDLE_CLOSE_MS: u64 = 120_000;
+static IDLE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn stays_warm(game_running: bool, hotkey_on: bool) -> bool {
+    game_running && hotkey_on
+}
+
+/// Whether the current webview has its listeners up. A window shown before that
+/// is a full-screen layer with no page in it yet, and it flashes black over the
+/// game; it is only revealed once the page says it is ready.
+static READY: AtomicBool = AtomicBool::new(false);
+/// The mode a not-yet-ready window is to be revealed in, once it is ready.
+static REVEAL: Mutex<Option<bool>> = Mutex::new(None);
+
+/// A hidden window keeps its last frame, and the next `show` puts that frame on
+/// screen before the webview repaints: the dimmed chat backdrop flashed over the
+/// game for every card that followed a chat. So the webview first clears itself
+/// to a transparent frame, and only then is the window hidden.
+const CLEAR_WAIT_MS: u64 = 250;
+static HIDE_SEQ: AtomicU64 = AtomicU64::new(0);
+static CLEAR_WAIT: Mutex<Option<(u64, tokio::sync::oneshot::Sender<()>)>> = Mutex::new(None);
+
+fn close_when_idle(app: &AppHandle) {
+    let seq = IDLE_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(IDLE_CLOSE_MS)).await;
+            if IDLE_SEQ.load(Ordering::SeqCst) != seq || crate::exiting() {
+                return;
+            }
+            // With the main window unloaded for the game the overlay does not stay
+            // warm either: the goal is no WebView2 at all under a running game,
+            // and the hotkey then opens it cold in about a second.
+            let game = !crate::engine::running_games().is_empty() && !crate::background::unloaded();
+            if !stays_warm(game, enabled()) {
+                break;
+            }
+        }
+        let Some(win) = handle.get_webview_window(LABEL) else { return };
+        if win.is_visible().unwrap_or(true) || IDLE_SEQ.load(Ordering::SeqCst) != seq {
+            return;
+        }
+        READY.store(false, Ordering::SeqCst);
+        let _ = win.destroy();
+    });
+}
+
+pub fn set_hit_areas(rects: Vec<[f64; 4]>) {
+    *HIT.lock().unwrap_or_else(|e| e.into_inner()) = rects;
+}
+
+/// Whether clicks fall through to whatever is under the overlay.
+fn passthrough(interactive: bool, hover: bool) -> bool {
+    !interactive && !hover
+}
+
+/// A window kept hidden for the rest of a game still holds a full page; out of
+/// sight the webview gives that memory back, and `reveal` asks for it again.
+fn park(app: &AppHandle, win: &tauri::WebviewWindow) {
+    let _ = win.hide();
+    crate::webview_health::set_low_memory(win, true);
+    close_when_idle(app);
+}
+
+/// The only writer of the hover state. The core flag, the window flag and the
+/// webview drifted apart while each was set on its own, and every drift ended
+/// the same way: a card that looks hoverable, swallows no click and, with its
+/// clock stopped by that same flag, never expires either.
+fn set_hover(app: &AppHandle, hover: bool) {
+    HOVER.store(hover, Ordering::SeqCst);
+    if crate::exiting() {
+        return;
+    }
+    if let Some(win) = app.get_webview_window(LABEL) {
+        set_passthrough(&win, passthrough(INTERACTIVE.load(Ordering::SeqCst), hover));
+    }
+    let _ = app.emit_to(LABEL, "overlay-hover", hover);
+}
+
+/// Click-through для окна. На Linux tao берёт GdkWindow через `unwrap()`, а у
+/// окна, которое ещё ни разу не показывали, его нет: оверлей, созданный скрытым,
+/// ронял лаунчер паникой в event_loop.rs:457 (54 отчёта). Там флаг ставится
+/// только видимому окну, а `show` повторяет его сразу после показа.
+fn set_passthrough(win: &tauri::WebviewWindow, on: bool) {
+    #[cfg(target_os = "linux")]
+    if !win.is_visible().unwrap_or(false) {
+        return;
+    }
+    let _ = win.set_ignore_cursor_events(on);
+}
+
+fn hits(rects: &[[f64; 4]], x: f64, y: f64) -> bool {
+    rects.iter().any(|r| x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3])
+}
+
+fn inside_card(x: f64, y: f64) -> bool {
+    hits(&HIT.lock().unwrap_or_else(|e| e.into_inner()), x, y)
+}
+
+fn stop_hit_watch(app: &AppHandle) {
+    HIT_SEQ.fetch_add(1, Ordering::SeqCst);
+    set_hover(app, false);
+    HIT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Passive cards must be clickable without stealing the clicks the game needs,
+/// and a click-through window receives no pointer events to hit-test with - so
+/// the core follows the cursor itself and lifts the flag only over a card.
+fn arm_hit_watch(app: &AppHandle) {
+    let seq = HIT_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Nothing is carried over from the previous watcher: showing the window
+        // for a new card re-arms click-through by itself, so the first tick has
+        // to state the truth even when the answer did not change.
+        let mut over: Option<bool> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(HIT_POLL_MS)).await;
+            // Каждый тик — три запроса в главный поток; после выхода они уходят в
+            // разрушенный цикл событий.
+            if HIT_SEQ.load(Ordering::SeqCst) != seq || INTERACTIVE.load(Ordering::SeqCst) || crate::exiting() {
+                break;
+            }
+            let Some(win) = handle.get_webview_window(LABEL) else { break };
+            if !win.is_visible().unwrap_or(false) {
+                break;
+            }
+            // Takes the mouse position on screen, to let clicks pass through the transparent parts of the overlay. The position is not saved or sent anywhere.
+            let now = match (handle.cursor_position(), win.outer_position(), win.scale_factor()) {
+                (Ok(cur), Ok(pos), Ok(scale)) if scale > 0.0 => {
+                    inside_card((cur.x - pos.x as f64) / scale, (cur.y - pos.y as f64) / scale)
+                }
+                _ => false,
+            };
+            if over == Some(now) {
+                continue;
+            }
+            over = Some(now);
+            // The webview only learns about a pointer it was deaf to a moment
+            // ago on the next mouse move, so the core states it outright.
+            set_hover(&handle, now);
+        }
+        if over == Some(true) && HIT_SEQ.load(Ordering::SeqCst) == seq {
+            set_hover(&handle, false);
+        }
+    });
+}
+
+pub fn enabled() -> bool {
+    crate::engine::ui_pref(PREF_ENABLED).as_deref() == Some("1")
+}
+
+/// Desktop toasts are on unless the user turned them off: they are the only way
+/// a friend event reaches someone whose launcher sits in the tray.
+pub fn toasts_enabled() -> bool {
+    crate::engine::ui_pref(PREF_TOASTS).as_deref() != Some("0")
+}
+
+pub fn clamp_card_ms(ms: u64) -> u64 {
+    ms.clamp(MIN_CARD_MS, MAX_CARD_MS)
+}
+
+pub fn card_ms() -> u64 {
+    crate::engine::ui_pref(PREF_CARD_MS)
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(clamp_card_ms)
+        .unwrap_or(DEFAULT_CARD_MS)
+}
+
+pub fn set_card_ms(ms: u64) -> Result<(), String> {
+    crate::engine::set_ui_pref(PREF_CARD_MS.into(), clamp_card_ms(ms).to_string())
+}
+
+pub fn hotkey() -> String {
+    crate::engine::ui_pref(PREF_HOTKEY)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_HOTKEY.to_string())
+}
+
+fn build(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    // Окно, создаваемое на выходе, роняет tao на Windows (subclass_result).
+    if crate::exiting() {
+        return Err("Лаунчер закрывается".into());
+    }
+    if let Some(w) = app.get_webview_window(LABEL) {
+        return Ok(w);
+    }
+    READY.store(false, Ordering::SeqCst);
+    let win = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html#overlay".into()))
+        .title("Millida Overlay")
+        .decorations(false)
+        .transparent(true)
+        // The overlay window is always on top, otherwise it is not visible over the game.
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .shadow(false)
+        .resizable(false)
+        .focused(false)
+        .visible(false)
+        .build()
+        .map_err(|e| e.to_string())?;
+    if let Ok(Some(mon)) = win.primary_monitor() {
+        let _ = win.set_position(mon.position().to_owned());
+        let _ = win.set_size(mon.size().to_owned());
+    }
+    // Passive by default: the overlay must not eat clicks meant for the game.
+    set_passthrough(&win, true);
+    let handle = app.clone();
+    win.on_window_event(move |e| {
+        // Closing the overlay must never take the launcher down with it.
+        if let WindowEvent::CloseRequested { api, .. } = e {
+            api.prevent_close();
+            if let Some(w) = handle.get_webview_window(LABEL) {
+                let _ = w.hide();
+            }
+        }
+    });
+    Ok(win)
+}
+
+/// `interactive` decides whether the window takes the pointer and the keyboard.
+/// Notifications arrive passive; the hotkey is what makes it a chat.
+/// The bool says whether the webview is listening: events sent before that are lost.
+pub fn show(app: &AppHandle, interactive: bool) -> Result<bool, String> {
+    IDLE_SEQ.fetch_add(1, Ordering::SeqCst);
+    HIDE_SEQ.fetch_add(1, Ordering::SeqCst);
+    let win = build(app)?;
+    INTERACTIVE.store(interactive, Ordering::SeqCst);
+    if interactive {
+        stop_hit_watch(app);
+    }
+    if !READY.load(Ordering::SeqCst) {
+        *REVEAL.lock().unwrap_or_else(|e| e.into_inner()) = Some(interactive);
+        return Ok(false);
+    }
+    reveal(app, &win, interactive)?;
+    Ok(true)
+}
+
+/// The webview learns its mode before the window appears, so the first frame on
+/// screen is already the right one.
+fn reveal(app: &AppHandle, win: &tauri::WebviewWindow, interactive: bool) -> Result<(), String> {
+    let hover = !interactive && HOVER.load(Ordering::SeqCst);
+    set_passthrough(win, passthrough(interactive, hover));
+    let _ = app.emit_to(LABEL, "overlay-mode", interactive);
+    // A webview kept across hide and show remembers the last hover it was told
+    // about, and a stale `true` there freezes the clock of every card to come.
+    if !interactive {
+        let _ = app.emit_to(LABEL, "overlay-hover", hover);
+    }
+    crate::webview_health::set_low_memory(win, false);
+    win.show().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    set_passthrough(win, passthrough(interactive, hover));
+    let _ = win.set_always_on_top(true);
+    if interactive {
+        let _ = win.set_focus();
+    } else {
+        arm_hit_watch(app);
+    }
+    Ok(())
+}
+
+pub fn hide(app: &AppHandle) {
+    INTERACTIVE.store(false, Ordering::SeqCst);
+    if crate::exiting() {
+        return;
+    }
+    stop_hit_watch(app);
+    PENDING.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    REVEAL.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let seq = HIDE_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    let Some(win) = app.get_webview_window(LABEL) else { return };
+    if !READY.load(Ordering::SeqCst) || !win.is_visible().unwrap_or(false) {
+        park(app, &win);
+        return;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *CLEAR_WAIT.lock().unwrap_or_else(|e| e.into_inner()) = Some((seq, tx));
+    let _ = app.emit_to(LABEL, "overlay-clear", seq);
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // A dead webview never answers; the window goes down anyway.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(CLEAR_WAIT_MS), rx).await;
+        if HIDE_SEQ.load(Ordering::SeqCst) != seq || crate::exiting() {
+            return;
+        }
+        if let Some(w) = handle.get_webview_window(LABEL) {
+            park(&handle, &w);
+        }
+    });
+}
+
+/// The webview has put a transparent frame on screen for hide number `seq`.
+pub fn cleared(seq: u64) {
+    let mut wait = CLEAR_WAIT.lock().unwrap_or_else(|e| e.into_inner());
+    if wait.as_ref().is_some_and(|(s, _)| *s == seq) {
+        if let Some((_, tx)) = wait.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// The webview reports itself ready, and everything queued while it was booting
+/// is delivered in order.
+pub fn drain_pending(app: &AppHandle) {
+    READY.store(true, Ordering::SeqCst);
+    let queued: Vec<serde_json::Value> =
+        std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()));
+    for payload in queued {
+        let _ = app.emit_to(LABEL, "overlay-message", payload);
+    }
+    let Some(interactive) = REVEAL.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    if let Some(win) = app.get_webview_window(LABEL) {
+        let _ = reveal(app, &win, interactive);
+    }
+}
+
+/// A passive overlay outliving its cards is a full-screen always-on-top layer
+/// the user cannot close, so the core takes it down even if the webview is dead.
+fn arm_watchdog(app: &AppHandle) {
+    let seq = NOTIFY_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(card_ms() + PASSIVE_GRACE_MS)).await;
+        // A card the user is reading (or about to click) must not be yanked out
+        // from under the cursor by the watchdog - but a pointer that merely
+        // rests there is not a reader, so the reprieve is finite.
+        let mut held = 0u64;
+        while HOVER.load(Ordering::SeqCst) && held < HOLD_MAX_MS {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            held += 500;
+        }
+        if NOTIFY_SEQ.load(Ordering::SeqCst) != seq || INTERACTIVE.load(Ordering::SeqCst) {
+            return;
+        }
+        hide(&handle);
+    });
+}
+
+pub async fn notify(app: &AppHandle, payload: serde_json::Value) -> Result<(), String> {
+    let listening = show(app, false)?;
+    arm_watchdog(app);
+    if !listening {
+        PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(payload);
+        return Ok(());
+    }
+    app.emit_to(LABEL, "overlay-message", payload).map_err(|e| e.to_string())
+}
+
+/// Rebinding drops the previous accelerator first: a changed hotkey that left
+/// the old one registered would fire the overlay from two keys forever.
+pub fn rebind_hotkey(app: &AppHandle) {
+    // Registers the global overlay hotkey. Other key presses are not tracked.
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let gs = app.global_shortcut();
+    // Only our own combination: the clip hotkey shares the plugin.
+    let mut bound = BOUND_HOTKEY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = bound.take() {
+        let _ = gs.unregister(old.as_str());
+    }
+    if !enabled() {
+        return;
+    }
+    let combo = hotkey();
+    let handle = app.clone();
+    if gs
+        .on_shortcut(combo.as_str(), move |_, _, event| {
+            if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                toggle(&handle);
+            }
+        })
+        .is_ok()
+    {
+        *bound = Some(combo);
+        return;
+    }
+    // A combination another program already owns must not silently disable
+    // the feature: fall back to the default one.
+    if gs
+        .on_shortcut(DEFAULT_HOTKEY, move |app, _, event| {
+            if event.state() == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                toggle(app);
+            }
+        })
+        .is_ok()
+    {
+        *bound = Some(DEFAULT_HOTKEY.to_string());
+    }
+}
+
+/// A card click either opens the conversation in the overlay itself - a running
+/// game must not be thrown to the background just to answer - or brings the
+/// launcher up when there is no game to protect.
+pub fn open_card(app: &AppHandle, payload: serde_json::Value, to_launcher: bool) -> Result<(), String> {
+    let is_call = payload.get("open").and_then(|v| v.as_str()) == Some("call");
+    if to_launcher || is_call || crate::engine::running_games().is_empty() {
+        hide(app);
+        crate::tray::show_main(app);
+        // An unloaded launcher is rebuilt by show_main; the card waits for its page.
+        crate::background::emit_main(app, "overlay-open", payload);
+        return Ok(());
+    }
+    show(app, true)?;
+    app.emit_to(LABEL, "overlay-open", payload).map_err(|e| e.to_string())
+}
+
+/// The main window was unloaded: a hidden overlay starts its idle clock now
+/// instead of staying warm for the game.
+pub fn main_unloaded(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window(LABEL) {
+        if !win.is_visible().unwrap_or(true) {
+            close_when_idle(app);
+        }
+    }
+}
+
+/// Hotkey semantics: summon and focus, or dismiss if it already has the user.
+pub fn toggle(app: &AppHandle) {
+    if !enabled() || crate::exiting() {
+        return;
+    }
+    let interactive_now = app
+        .get_webview_window(LABEL)
+        .map(|w| w.is_visible().unwrap_or(false) && w.is_focused().unwrap_or(false))
+        .unwrap_or(false);
+    if interactive_now {
+        hide(app);
+    } else {
+        let _ = show(app, true);
+    }
+}
+
+
+/// Socket publications the main window passes to the overlay, so the overlay
+/// does not hold a second realtime connection for the same account.
+pub const RELAY_EVENT: &str = "realtime-relay";
+const RELAY_MAX_BYTES: usize = 32 * 1024;
+static RELAY_ON: AtomicBool = AtomicBool::new(false);
+static RELAY_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Only friend publications and the socket state may cross windows: call
+/// envelopes and account data stay in the main window.
+fn relay_payload_ok(payload: &serde_json::Value) -> bool {
+    let shape = match payload.get("kind").and_then(|k| k.as_str()) {
+        Some("live") => payload.get("live").is_some_and(|v| v.is_boolean()),
+        Some("catchup") => true,
+        Some("pub") => {
+            matches!(payload.get("topic").and_then(|t| t.as_str()), Some("friends" | "presence"))
+                && payload.get("data").is_some_and(|d| d.is_object())
+        }
+        _ => false,
+    };
+    shape && serde_json::to_vec(payload).is_ok_and(|b| b.len() <= RELAY_MAX_BYTES)
+}
+
+pub fn relay_realtime(app: &AppHandle, payload: serde_json::Value) {
+    if !relay_payload_ok(&payload) {
+        return;
+    }
+    RELAY_ON.store(true, Ordering::SeqCst);
+    if let Some(live) = payload.get("live").and_then(|v| v.as_bool()) {
+        RELAY_LIVE.store(live, Ordering::SeqCst);
+    }
+    if app.get_webview_window(LABEL).is_some() {
+        // A closed overlay has nobody to tell; it asks for the state when it comes back.
+        let _ = app.emit_to(LABEL, RELAY_EVENT, payload);
+    }
+}
+
+/// (the main window relays, its socket is live)
+pub fn relay_state(app: &AppHandle) -> (bool, bool) {
+    let relay = RELAY_ON.load(Ordering::SeqCst) && app.get_webview_window("main").is_some();
+    (relay, RELAY_LIVE.load(Ordering::SeqCst))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passthrough_follows_hover_in_passive_mode() {
+        let cases = [
+            ((false, false), true, "passive card, pointer elsewhere: the game keeps its clicks"),
+            ((false, true), false, "pointer on a card: the close button must receive the click"),
+            ((true, false), false, "the chat panel owns the pointer"),
+            ((true, true), false, "interactive wins over a stale hover flag"),
+        ];
+        for ((interactive, hover), want, why) in cases {
+            assert_eq!(
+                passthrough(interactive, hover),
+                want,
+                "passthrough({interactive}, {hover}) must be {want}: {why}"
+            );
+        }
+    }
+
+    /// The hidden window is a second webview process held next to the game.
+    /// Only the chat hotkey justifies it: nothing else can summon the window
+    /// faster than the next card rebuilds it.
+    #[test]
+    fn hidden_window_outlives_the_quiet_spell_only_for_the_hotkey() {
+        let cases = [
+            ((true, true), true, "the hotkey must open the chat over the game without a cold start"),
+            ((true, false), false, "toasts alone: the window sat in memory until the game closed, with no way to open it"),
+            ((false, true), false, "between games the next card or hotkey press rebuilds it"),
+            ((false, false), false, "nothing is running and nothing can summon it"),
+        ];
+        for ((game_running, hotkey_on), want, why) in cases {
+            assert_eq!(
+                stays_warm(game_running, hotkey_on),
+                want,
+                "stays_warm({game_running}, {hotkey_on}) must be {want}: {why}"
+            );
+        }
+    }
+
+    /// An answer to an older hide must not take the window down under a newer
+    /// one: the frame it vouches for may already have been replaced by a card.
+    #[test]
+    fn clear_answer_releases_only_its_own_hide() {
+        let cases = [
+            (7, 6, false, "an answer to the previous hide is stale"),
+            (7, 8, false, "a sequence the core never issued is ignored"),
+            (7, 7, true, "the answer to this hide lets the window go down"),
+        ];
+        for (waiting, answered, want, why) in cases {
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            *CLEAR_WAIT.lock().unwrap_or_else(|e| e.into_inner()) = Some((waiting, tx));
+            cleared(answered);
+            assert_eq!(rx.try_recv().is_ok(), want, "cleared({answered}) while waiting for {waiting}: {why}");
+        }
+        CLEAR_WAIT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    #[test]
+    fn hit_test_covers_the_card_and_nothing_else() {
+        let rects = [[100.0, 200.0, 330.0, 60.0]];
+        let cases = [
+            ((110.0, 210.0), true, "inside the card"),
+            ((424.0, 205.0), true, "the close button sits at the right edge"),
+            ((100.0, 200.0), true, "the top-left corner belongs to the card"),
+            ((99.0, 210.0), false, "one pixel left of the card is the game"),
+            ((110.0, 199.0), false, "one pixel above the card is the game"),
+            ((431.0, 210.0), false, "past the right edge is the game"),
+            ((110.0, 261.0), false, "below the card is the game"),
+        ];
+        for ((x, y), want, why) in cases {
+            assert_eq!(hits(&rects, x, y), want, "hits({x}, {y}) must be {want}: {why}");
+        }
+    }
+
+    /// A card whose clock is paused by hover is only bounded by this, and an
+    /// unbounded reprieve is how an always-on-top card became furniture.
+    #[test]
+    fn hover_reprieve_is_finite_and_outlives_the_passive_window() {
+        const {
+            assert!(
+                HOLD_MAX_MS > MAX_CARD_MS + PASSIVE_GRACE_MS,
+                "a reader must get more time than the plain timeout, even at the longest card"
+            );
+            assert!(HOLD_MAX_MS <= 120_000, "a parked pointer must not keep a card for minutes");
+        }
+    }
+
+    /// A duration typed into the pref file by hand (or left by an older build)
+    /// must not produce a card that blinks out or never leaves the screen.
+    #[test]
+    fn card_duration_is_clamped_to_a_usable_range() {
+        let cases = [
+            (0, MIN_CARD_MS, "zero would hide the card before it is read"),
+            (1_000, MIN_CARD_MS, "below the floor is raised to it"),
+            (9_000, 9_000, "a value inside the range is kept as is"),
+            (30_000, MAX_CARD_MS, "the ceiling itself is allowed"),
+            (600_000, MAX_CARD_MS, "ten minutes on top of the game is not a notification"),
+        ];
+        for (given, want, why) in cases {
+            assert_eq!(clamp_card_ms(given), want, "clamp_card_ms({given}) must be {want}: {why}");
+        }
+    }
+
+    #[test]
+    fn only_friend_publications_and_socket_state_cross_to_the_overlay() {
+        let big = "x".repeat(RELAY_MAX_BYTES);
+        let cases = [
+            (serde_json::json!({"kind": "live", "live": true}), true, "socket state drives the overlay timers"),
+            (serde_json::json!({"kind": "live", "live": "yes"}), false, "a non-boolean state would be read as live"),
+            (serde_json::json!({"kind": "catchup"}), true, "a reconnect catch-up refreshes the overlay lists once"),
+            (
+                serde_json::json!({"kind": "pub", "topic": "presence", "data": {"t": "presence"}}),
+                true,
+                "friend status is what the overlay rail shows",
+            ),
+            (
+                serde_json::json!({"kind": "pub", "topic": "friends", "data": {"t": "friends"}}),
+                true,
+                "messages and typing refresh the open thread",
+            ),
+            (
+                serde_json::json!({"kind": "pub", "topic": "calls", "data": {"t": "calls"}}),
+                false,
+                "call envelopes carry SDP and must stay in the main window",
+            ),
+            (
+                serde_json::json!({"kind": "pub", "topic": "account", "data": {"t": "account"}}),
+                false,
+                "account pokes have no consumer in the overlay",
+            ),
+            (serde_json::json!({"kind": "pub", "topic": "friends", "data": "x"}), false, "data must be an object"),
+            (
+                serde_json::json!({"kind": "pub", "topic": "friends", "data": {"pad": big}}),
+                false,
+                "an oversized payload is dropped instead of flooding the overlay webview",
+            ),
+            (serde_json::json!({"kind": "eval"}), false, "unknown kinds are refused"),
+            (serde_json::json!("live"), false, "a bare string is not a message"),
+        ];
+        for (payload, want, why) in cases {
+            assert_eq!(relay_payload_ok(&payload), want, "relay_payload_ok({payload}) must be {want}: {why}");
+        }
+    }
+}

@@ -1,0 +1,133 @@
+import { loadProfileSettings, packAutoUpdate, syncCatalogPack, updateCatalogPack } from '../ipc/commands'
+import type { Profile } from '../ipc/commands'
+import { hasTauri } from '../ipc/tauri'
+import { forgetPackView, loadPackView } from '../components/premium/packView'
+import { installTask, runInstall, taskCancelled, useInstalls } from '../state/installs'
+import type { InstallTask } from '../state/installs'
+import { useProfiles } from '../state/profiles'
+import { showToast } from '../state/ui'
+import { keyCatalogPack } from './installKeys'
+import { catalogPackSlug, packLaunchStep, packNeedsCheck, packUpdateFor } from './packUpdate'
+import type { PackCard, PackLaunchStep, PackUpdate, PackUpdateOutcome } from './packUpdate'
+import { t } from '../i18n'
+
+const CARD_SYNC_GAP_MS = 10 * 60 * 1000
+const cardSynced = new Map<string, number>()
+
+/**
+ * The card's icon and content protection onto an installed build. The lobby
+ * asks on every window focus, so a build is synced at most once in ten minutes;
+ * a failed sync only leaves the build as it was and is tried at the next check.
+ */
+function syncPackCard(profile: string): void {
+  const now = Date.now()
+  const last = cardSynced.get(profile)
+  if (last !== undefined && now - last < CARD_SYNC_GAP_MS) return
+  cardSynced.set(profile, now)
+  syncCatalogPack(profile)
+    .then((changed) => {
+      if (changed) void useProfiles.getState().refresh()
+    })
+    .catch(() => cardSynced.delete(profile))
+}
+
+export async function findPackUpdate(profile: string): Promise<PackUpdate | null> {
+  const settings = await loadProfileSettings(profile)
+  const slug = catalogPackSlug(settings)
+  if (!slug) return null
+  syncPackCard(profile)
+  return packUpdateFor(settings, await loadPackView(slug))
+}
+
+/**
+ * Whether an update may replace the build without the player pressing «Обновить».
+ * An unreadable answer counts as no: the update brings the author's mods folder whole.
+ */
+export const packAutoUpdateOn = (profile: string): Promise<boolean> =>
+  packAutoUpdate(profile).then(
+    (s) => s.catalog && s.on,
+    () => false,
+  )
+
+/** What Play does with a catalogue build before the game starts. */
+export async function packStepForLaunch(profile: string): Promise<PackLaunchStep> {
+  if (!hasTauri() || !profile) return { kind: 'launch' }
+  // Unreadable settings leave nothing to compare; the launch itself reports what is wrong with the build.
+  const settings = await loadProfileSettings(profile).catch(() => null)
+  const slug = catalogPackSlug(settings)
+  if (!slug || !packNeedsCheck(settings)) return { kind: 'launch' }
+  // The card is the slow part (a network round trip): it is asked for while the local switch is read.
+  const cardAsked: Promise<PackCard> = loadPackView(slug).then(
+    (view) => ({ view }),
+    (error: unknown) => ({ error }),
+  )
+  if (!(await packAutoUpdateOn(profile))) return { kind: 'launch' }
+  return packLaunchStep(settings, await cardAsked)
+}
+
+/**
+ * The job the build page and Play both run. The cached card can be older than
+ * the version just installed, and compared with it the build would be offered
+ * that older version as an update, so it is dropped before the job reports done.
+ */
+export const packUpdateJob = (profile: string, slug: string): Promise<Profile> =>
+  updateCatalogPack(profile).then((p) => {
+    forgetPackView(slug)
+    return p
+  })
+
+function outcomeOf(task: InstallTask | undefined): PackUpdateOutcome | null {
+  if (task && task.state === 'run') return null
+  if (!task || task.state === 'done') return task ? { kind: 'done' } : { kind: 'failed', error: t('обновление остановилось без ответа') }
+  return taskCancelled(task) ? { kind: 'cancelled' } : { kind: 'failed', error: task.msg }
+}
+
+function watchUpdate(key: string, onProgress: (pct: number) => void): Promise<PackUpdateOutcome> {
+  return new Promise((resolve) => {
+    let settled = false
+    const settle = (t: InstallTask | undefined) => {
+      if (settled) return
+      const out = outcomeOf(t)
+      if (!out) {
+        onProgress(t ? t.pct : 0)
+        return
+      }
+      settled = true
+      stop()
+      resolve(out)
+    }
+    const stop = useInstalls.subscribe((s) => settle(s.tasks[key]))
+    settle(useInstalls.getState().tasks[key])
+  })
+}
+
+export interface PackUpdateRun {
+  key: string
+  own: boolean
+  outcome: Promise<PackUpdateOutcome>
+}
+
+/**
+ * Starts the update, or follows one the build page already started: two jobs
+ * for one pack would share its temp files. Its toasts are Play's to show, so
+ * the job itself stays quiet on failure and cancel.
+ */
+export function runPackUpdateForLaunch(profile: string, u: PackUpdate, onProgress: (pct: number) => void): PackUpdateRun {
+  const key = keyCatalogPack(u.slug)
+  const running = installTask(key)
+  const own =
+    !(running && running.state === 'run') &&
+    runInstall({
+      key,
+      title: profile,
+      running: t('Обновляем…'),
+      run: () => packUpdateJob(profile, u.slug),
+      onDone: () => {
+        void useProfiles.getState().refresh()
+        showToast(t('Сборка «{name}» обновлена до версии {version}', { name: profile, version: u.to }), 'ok', 'achievement')
+      },
+      onError: () => {},
+      onCancel: () => {},
+    })
+  return { key, own, outcome: watchUpdate(key, onProgress) }
+}

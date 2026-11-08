@@ -1,0 +1,975 @@
+import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { noteInstallKind } from '../../lib/recsSignals'
+import type { ReactNode } from 'react'
+import { Icon } from '../Icon'
+import { MODRINTH_API, api, mirrorAsset, openExt } from '../../lib/api'
+import { sitePath } from '../../lib/remoteUiRules'
+import { diskGet, diskSet } from '../../lib/diskCache'
+import { fmtN } from '../../lib/format'
+import { renderMarkdown } from '../../lib/markdown'
+import { installedPack } from '../../lib/lobbyPlay'
+import { hasPlanChoice, liveSubscription, loadPremium, loadPremiumPack, untilText, viaCatalog } from '../../lib/premium'
+import type { PremiumPackDetail, PremiumPlan, PremiumSubscription } from '../../lib/premium'
+import { BuyButton, CancelLine, PayNote, PlanButtons, PriceLine, hasAccess } from '../premium/PremiumBuy'
+import { installModpack } from '../../ipc/commands'
+import { hasTauri } from '../../ipc/tauri'
+import { useProfiles } from '../../state/profiles'
+import { runInstall, useInstalls } from '../../state/installs'
+import { showToast } from '../../state/ui'
+import { track } from '../../lib/telemetry'
+import { actionSource } from '../../lib/uiTrack'
+import { keyCatalogPack, keyMrModpack } from '../../lib/installKeys'
+import type { SnapshotServer } from '../../lib/snapshot'
+import { PackKeyField } from '../PackKeyModal'
+import { ONEBLOCK_ART } from './modeIcon'
+import { ONEBLOCK_PACK } from '../../lib/ownServer'
+import { Hours } from './Hours'
+import { PackHealthLine } from './PackHealthLine'
+import { blockIcon, usePackArt } from './packArt'
+import { HostInstall } from './HostInstall'
+import { PackContents } from '../catalog/PackContents'
+import type { HostTarget } from './HostInstall'
+import { hostingPackFor, loadHostingPacks } from './data'
+import type { HubPack } from './data'
+import { LOADER, gb, modsFromText } from '../premium/packView'
+import type { DescBlock, PackView } from '../premium/packView'
+import { PackInstallButton } from '../premium/PackInstall'
+import { MediaStrip } from '../catalog/MediaStrip'
+import { Back, Compat, Gallery, Hero, Tabs } from '../catalog/ItemPage'
+import type { Tab } from '../catalog/ItemPage'
+import { fmtNum, loadOwnPacks, ownPackCard, plural, relativeTime, sectionBySlug } from '../catalog/site'
+import type { MillidaPack } from '../../ipc/commands'
+import { SiteGalleryCard } from '../catalog/SiteRow'
+import { useLobby } from '../../state/lobbyMode'
+import { weave, weaveMarkdown } from '../catalog/weave'
+import type { WeaveKind } from '../catalog/weave'
+import { installReviewCandidate } from '../ModRow'
+import { reviewCandidateFor } from '../../state/mods'
+import { useT } from '../../i18n'
+import { ArcaniaPage } from '../arcania/ArcaniaPage'
+import { leadFirst } from './placement'
+import { ArcaniaLegacy } from '../arcania/ArcaniaLegacy'
+import { HEAD as ARCANIA_HEAD } from '../arcania/content'
+import { arcaniaLead, isArcania2, useArcania2Live } from '../../lib/arcaniaRelease'
+import { arcaniaOffer, heroAction } from '../arcania/offer'
+import { ARCANIA_PARTNER, sellsPartnerPacks } from '../../lib/paidPacks'
+import { useHasMillida } from '../../state/auth'
+import { openAccountAdd } from '../../state/accountAdd'
+
+/**
+ * Страница сборки — одна для всех: премиум, бесплатные нашего каталога и
+ * сборки Modrinth (приказ владельца 23.09.2026, 18:32: «клик по любой сборке —
+ * полная страница, как у Arcania»).
+ *
+ * Порядок — по ресёрчу analysis/2026-09-23_premium-pack-page.md: медиа в
+ * шапке (трейлер или обложка), название и одна строка сути, 3–5 фактов
+ * крупно, ряд «цена + кнопка» (как у Epic), кадры каруселью, описание,
+ * обновления. Чего источник не прислал, того на странице нет.
+ */
+
+/** GET /catalog/items/:slug — карточка сайта: счётчики и история версий. */
+interface CatalogItem {
+  downloads?: number
+  updatedAt?: string
+  files?: { version: string; fileName: string; releasedAt?: string; changelog?: string | null }[]
+}
+
+interface MrProject {
+  body?: string
+  downloads?: number
+  followers?: number
+  game_versions?: string[]
+  loaders?: string[]
+  updated?: string
+  gallery?: { url: string; raw_url?: string; featured?: boolean; ordering?: number }[]
+}
+
+interface MrVersion {
+  version_number: string
+  name?: string
+  date_published: string
+  game_versions?: string[]
+}
+
+interface Update {
+  date: string | null
+  text: string
+}
+
+const cache = new Map<string, Promise<unknown>>()
+
+/** Публичные данные страницы сборки — ещё и на диске: второй заход открывает её сразу. */
+const DISK_KEYS = /^(pv|ci):/
+
+/**
+ * Прогрев страницы сборки, пока игрок смотрит на её карточку (Arcania в «Сборках»):
+ * раньше страница открывалась пустой и через полсекунды «перескакивала» в настоящую
+ * (владелец 10.10.2026: «сначала показывает какую-то другую страницу»).
+ */
+export function prefetchPackPage(slug: string, premiumId?: string | null): void {
+  if (!slug) return
+  void remember('pv:' + slug, once('pv:' + slug, () => api<PackView>('/catalog/packs/' + encodeURIComponent(slug))))
+  void remember('ci:' + slug, once('ci:' + slug, () => api<CatalogItem>('/catalog/items/' + encodeURIComponent(slug))))
+  if (premiumId) void remember('pd:' + premiumId, once('pd:' + premiumId, () => loadPremiumPack(premiumId)))
+}
+
+/** Каркас страницы сборки той же формы, что сама страница: ничего не прыгает, когда она приходит. */
+function PackPageSkeleton({ pack, onBack }: { pack: HubPack; onBack: () => void }) {
+  const t = useT()
+  const icon = pack.coverUrl || null
+  return (
+    <div className="ci" data-section="pack_page" aria-busy="true">
+      <Back label={t('Сборки модов')} onBack={onBack} />
+      <Hero
+        className={null}
+        cover={null}
+        glow={icon}
+        icon={icon ? <img src={icon} alt="" draggable={false} /> : <span className="skel pp-skel-fill" />}
+        title={pack.title}
+        by={<span className="skel skel-line pp-skel-by" />}
+        facts={[<span key="a" className="skel skel-line pp-skel-fact" />, <span key="b" className="skel skel-line pp-skel-fact" />]}
+        cta={<span className="skel pp-skel-cta" />}
+      />
+      <div className="ci-grid">
+        <main className="ci-main">
+          <div className="segs mr-subtypes ci-tabs" aria-hidden="true">
+            <span className="skel skel-line pp-skel-tab" />
+            <span className="skel skel-line pp-skel-tab" />
+          </div>
+          <div className="card pp-skel-media skel" />
+          <div className="card ci-box ci-skel">
+            {[92, 100, 84, 96, 70].map((w, i) => (
+              <span key={i} className="skel skel-line" style={{ width: w + '%' }} />
+            ))}
+          </div>
+        </main>
+        <aside className="ci-aside">
+          <div className="card pp-skel-side">
+            <span className="skel skel-line" style={{ width: '40%' }} />
+            <span className="skel skel-line" style={{ width: '70%' }} />
+            <span className="skel pp-skel-plan" />
+            <span className="skel pp-skel-plan" />
+          </div>
+        </aside>
+      </div>
+    </div>
+  )
+}
+function once<T>(key: string, load: () => Promise<T>): Promise<T | null> {
+  let hit = cache.get(key) as Promise<T | null> | undefined
+  if (!hit) {
+    // Прод иногда отвечает 502 на первый запрос: один повтор через секунду
+    // дешевле, чем пустая страница сборки.
+    hit = load()
+      .catch(() => new Promise<T>((ok, fail) => setTimeout(() => load().then(ok, fail), 1200)))
+      .then((v) => {
+        if (DISK_KEYS.test(key) && v) diskSet('pack:' + key, v)
+        return v
+      })
+      .catch(() => {
+        cache.delete(key)
+        return null
+      })
+    cache.set(key, hit)
+  }
+  return hit
+}
+
+/** Уже пришедший ответ — без ожидания (для первого кадра страницы). */
+const settled = new Map<string, unknown>()
+function onceNow<T>(key: string): T | null {
+  return (settled.get(key) as T | undefined) ?? null
+}
+function remember<T>(key: string, p: Promise<T | null>): Promise<T | null> {
+  return p.then((v) => {
+    if (v) settled.set(key, v)
+    return v
+  })
+}
+
+const getJson = <T,>(url: string) => fetch(url).then((r) => (r.ok ? (r.json() as Promise<T>) : Promise.reject(r.status)))
+
+/** Ролик YouTube по любой форме ссылки: watch?v=, youtu.be/, embed/, shorts/. */
+export function youtubeId(url: string | null | undefined): string | null {
+  if (!url) return null
+  const m = /(?:youtu\.be\/|[?&]v=|\/embed\/|\/shorts\/)([\w-]{11})/.exec(url)
+  return m ? m[1]! : null
+}
+
+function Desc({ blocks, markdown, shots }: { blocks?: DescBlock[] | null; markdown?: string; shots: string[] }) {
+  let body: ReactNode = null
+  if (blocks && blocks.length)
+    body = weave<DescBlock>(blocks, shots, descKind, (src) => ({ type: 'image', src })).map((b, i) =>
+      b.type === 'heading' ? (
+        <h3 key={i}>{b.text}</h3>
+      ) : b.type === 'list' ? (
+        <ul key={i}>
+          {(b.items || []).map((x) => (
+            <li key={x}>
+              <Icon id="i-check" />
+              {x}
+            </li>
+          ))}
+        </ul>
+      ) : b.type === 'image' ? (
+        b.src ? (
+          <figure key={i} className="pk-desc-fig" data-align={b.align}>
+            <img className="pk-desc-img" src={mirrorAsset(b.src)} alt={b.alt || ''} loading="lazy" draggable={false} />
+            {b.caption ? <figcaption>{b.caption}</figcaption> : null}
+          </figure>
+        ) : null
+      ) : b.type === 'paragraph' ? (
+        <p key={i}>{b.text}</p>
+      ) : null,
+    )
+  else if (markdown) body = <div className="md">{renderMarkdown(weaveMarkdown(markdown, shots))}</div>
+  if (!body) return null
+  return (
+    <article className="card ci-box ci-desc">
+      <div className="pp-desc full">{body}</div>
+    </article>
+  )
+}
+
+const descKind = (b: DescBlock): WeaveKind => (b.type === 'image' ? 'media' : b.type === 'heading' ? 'head' : 'text')
+
+/** Шапка: превью ролика до клика, по клику — плеер. Без ролика — обложка. */
+function Media({ video, cover, ob }: { video: string | null; cover: string | null; ob?: boolean }) {
+  const t = useT()
+  const [playing, setPlaying] = useState(false)
+  useEffect(() => setPlaying(false), [video])
+  // Встраивание YouTube в webview без клика ненадёжно (плеер отвечает ошибкой
+  // конфигурации), а чёрный прямоугольник хуже обложки: до клика — картинка.
+  if (video && playing)
+    return (
+      <iframe
+        className="pp-video"
+        src={'https://www.youtube-nocookie.com/embed/' + video + '?autoplay=1&playsinline=1&rel=0&loop=1&playlist=' + video}
+        title={t('Трейлер')}
+        allow="autoplay; encrypted-media; picture-in-picture; fullscreen"
+        allowFullScreen
+      />
+    )
+  // Наш OneBlock: осенний арт баннера «Режимов» вместо старой обложки.
+  if (ob)
+    return (
+      <>
+        <img className="pp-cover pp-ob-bg" src={ONEBLOCK_ART.bg} alt="" draggable={false} />
+        <img className="pp-ob-logo" src={ONEBLOCK_ART.logo} alt="" draggable={false} />
+      </>
+    )
+  const poster = cover || (video ? 'https://i.ytimg.com/vi/' + video + '/hqdefault.jpg' : null)
+  return (
+    <>
+      {poster ? <img className="pp-cover" src={poster} alt="" draggable={false} /> : null}
+      {video ? (
+        <button className="pp-play" aria-label={t('Трейлер')} data-sound="open" data-track="trailer" onClick={() => setPlaying(true)}>
+          <Icon id="i-play" />
+        </button>
+      ) : null}
+    </>
+  )
+}
+
+/** Установка сборки Modrinth — тем же путём, что строка каталога (ModRow). */
+function MrInstallButton({ pack }: { pack: HubPack }) {
+  const t = useT()
+  const slug = pack.slug || ''
+  const task = useInstalls((s) => s.tasks[keyMrModpack(slug)])
+  const running = !!task && task.state === 'run'
+  const start = () => {
+    if (!hasTauri()) {
+      showToast(t('Установка сборок — в приложении'), 'error')
+      return
+    }
+    runInstall({
+      key: keyMrModpack(slug),
+      title: pack.title,
+      running: t('Скачивание…'),
+      run: () => installModpack(slug),
+      onDone: (p) => {
+        track('catalog_install', { kind: 'modpack', id: slug, source: actionSource('pack_page').source, section: 'pack_page' })
+        noteInstallKind('modpack')
+        useProfiles.getState().setSelected(p.name)
+        void useProfiles.getState().refresh()
+        showToast(t('Сборка «{name}» готова к запуску', { name: p.name }), 'ok', 'achievement')
+      },
+    })
+  }
+  return (
+    <button className="btn lg primary pp-cta" data-track="install" data-src="pack_page" disabled={running} onClick={start}>
+      <Icon id="i-download" />{' '}
+      {running ? (task.pct > 0 ? task.label + ' ' + Math.round(task.pct) + '%' : task.label) : t('Установить')}
+    </button>
+  )
+}
+
+interface Fact {
+  value: string
+  label: string
+}
+
+export function PackPage({
+  pack,
+  server,
+  onBack,
+  onPlay,
+  onPlayBuild,
+  onServer,
+}: {
+  pack: HubPack
+  server: SnapshotServer | null
+  onBack: () => void
+  /** Запуск: имя установленной сборки на компьютере. */
+  onPlay: (build: string) => void
+  /** Starts exactly this local build, not the pack the page shows: Arcania 1.4.3 from the 2.0 page. */
+  onPlayBuild: (build: string) => void
+  onServer: (s: SnapshotServer) => void
+}) {
+  const t = useT()
+  const arc2Live = useArcania2Live()
+  const profiles = useProfiles((s) => s.profiles)
+  const mr = pack.origin === 'modrinth'
+  const slug = pack.slug || ''
+  const [view, setView] = useState<PackView | null>(() => onceNow<PackView>('pv:' + slug))
+  const [item, setItem] = useState<CatalogItem | null>(() => onceNow<CatalogItem>('ci:' + slug))
+  const [detail, setDetail] = useState<PremiumPackDetail | null>(() => onceNow<PremiumPackDetail>('pd:' + pack.id))
+  const [detailFailed, setDetailFailed] = useState(false)
+  const signedIn = useHasMillida()
+  const seenSignedIn = useRef(signedIn)
+  // Пока главного нет (описание, а у премиума ещё и доступ) — каркас страницы, а не
+  // половина страницы, которая потом перестраивается. Не дольше 2,5 с.
+  const [waited, setWaited] = useState(false)
+  const [project, setProject] = useState<MrProject | null>(null)
+  const [versions, setVersions] = useState<MrVersion[]>([])
+  const [plans, setPlans] = useState<PremiumPlan[]>([])
+  const [sub, setSub] = useState<PremiumSubscription | null>(null)
+  const [installed, setInstalled] = useState<string | null>(null)
+  const [hostTarget, setHostTarget] = useState<HostTarget | null>(null)
+  const [hostOpen, setHostOpen] = useState(false)
+  const [tab, setTab] = useState<Tab>('desc')
+  const [candidate, setCandidate] = useState<string | null>(null)
+  // Низ шапки: ушёл за верх окна — появляется липкая полоса с кнопкой.
+  const heroEnd = useRef<HTMLDivElement>(null)
+  const doneKey = mr ? keyMrModpack(slug) : keyCatalogPack(slug)
+  const justInstalled = useInstalls((s) => !!slug && !!s.done[doneKey])
+  const packTask = useInstalls((s) => (mr ? undefined : s.tasks[keyCatalogPack(slug)]))
+  const packRunning = !!packTask && packTask.state === 'run'
+
+  useEffect(() => {
+    let alive = true
+    setCandidate(null)
+    if (!mr && slug) void reviewCandidateFor(slug).then((c) => alive && setCandidate(c ? c.version : null))
+    return () => {
+      alive = false
+    }
+  }, [pack.id])
+
+  useEffect(() => {
+    let alive = true
+    setView(onceNow<PackView>('pv:' + slug))
+    setItem(onceNow<CatalogItem>('ci:' + slug))
+    setDetail(onceNow<PremiumPackDetail>('pd:' + pack.id))
+    setDetailFailed(false)
+    setProject(null)
+    setVersions([])
+    setHostTarget(null)
+    setTab('desc')
+    setWaited(false)
+    const waitTimer = window.setTimeout(() => alive && setWaited(true), 2500)
+    // С диска — прошлый ответ, пока свежий в пути.
+    if (!mr && slug)
+      for (const [k, put] of [
+        ['pv:', (v: unknown) => setView((old) => old ?? (v as PackView))],
+        ['ci:', (v: unknown) => setItem((old) => old ?? (v as CatalogItem))],
+      ] as const)
+        void diskGet('pack:' + k + slug).then((r) => alive && r && put(r.value))
+    if (mr) {
+      const base = MODRINTH_API + '/v2/project/' + encodeURIComponent(slug)
+      void once('mr:' + slug, () => getJson<MrProject>(base)).then((p) => alive && setProject(p))
+      void once('mrv:' + slug, () => getJson<MrVersion[]>(base + '/version')).then(
+        (l) => alive && setVersions(Array.isArray(l) ? l : []),
+      )
+      if (pack.serverOk !== false) setHostTarget({ kind: 'modrinth', projectId: slug, title: pack.title })
+    } else if (slug) {
+      void remember('pv:' + slug, once('pv:' + slug, () => api<PackView>('/catalog/packs/' + encodeURIComponent(slug)))).then(
+        (d) => alive && d && setView(d),
+      )
+      void remember('ci:' + slug, once('ci:' + slug, () => api<CatalogItem>('/catalog/items/' + encodeURIComponent(slug)))).then(
+        (d) => alive && d && setItem(d),
+      )
+      void loadHostingPacks().then((list) => {
+        const hp = hostingPackFor(pack, list)
+        if (alive && hp) setHostTarget({ kind: 'partner', pack: hp, title: pack.title })
+      })
+    }
+    if (pack.premium) {
+      // Arcania 2.0 sells and takes keys on its own page even when it was opened from the catalog card.
+      if (pack.source === 'premium' || isArcania2(slug, arc2Live))
+        void remember('pd:' + pack.id, once('pd:' + pack.id, () => loadPremiumPack(pack.id))).then((d) => {
+          if (!alive) return
+          if (d) setDetail(d)
+          else setDetailFailed(true)
+        })
+      void loadPremium()
+        .then((s) => {
+          if (!alive) return
+          setPlans(s.plans || [])
+          setSub(s.subscription || null)
+        })
+        .catch(() => {})
+    }
+    return () => {
+      alive = false
+      window.clearTimeout(waitTimer)
+    }
+  }, [pack.id])
+
+  useEffect(() => {
+    let alive = true
+    void installedPack(slug || null, profiles).then((n) => alive && setInstalled(n))
+    return () => {
+      alive = false
+    }
+  }, [slug, profiles, justInstalled])
+
+  const full: PremiumPackDetail = detail ? { ...pack, ...detail } : { ...pack }
+
+  // Кадры: премиум-адрес → карточка сборки каталога → Modrinth (полный размер).
+  const mrShots = (project?.gallery || [])
+    .slice()
+    .sort((a, b) => Number(!!b.featured) - Number(!!a.featured) || (a.ordering || 0) - (b.ordering || 0))
+    .map((g) => mirrorAsset(g.raw_url || g.url) || g.url)
+  // У Modrinth обложка карточки — уменьшенная копия первого кадра галереи:
+  // в шапку идёт этот кадр в полном размере, а в карусели его уже нет.
+  const mrHead = mr && mrShots.length ? mrShots[0]! : null
+  const shots = (
+    full.screenshots && full.screenshots.length ? full.screenshots : view?.gallery || (mrHead ? mrShots.slice(1) : mrShots)
+  ).filter((s) => s && s !== full.coverUrl)
+  const video = youtubeId(full.videoUrl || view?.video)
+  const cover = view?.banner || mrHead || full.coverUrl || shots[0] || null
+  const ownIcon = view?.icon || view?.cover || full.coverUrl || mrHead || cover || null
+  const borrowed = usePackArt(view && !ownIcon && !mr ? slug : null, full.title, null)
+
+  const mcVersion = full.mcVersion || view?.game || null
+  const loader = full.loader || (view?.loader ? LOADER[view.loader] || view.loader : null)
+  const loaderIds = view?.loader ? [view.loader] : project?.loaders?.length ? project.loaders : full.loader ? [full.loader.toLowerCase()] : []
+  const gameVersions = mcVersion ? [mcVersion] : project?.game_versions || []
+  const updated = relativeTime(item?.updatedAt || project?.updated || null)
+  const mods = typeof full.modsCount === 'number' && full.modsCount > 0 ? full.modsCount : modsFromText(view?.description)
+  // Счётчик сайта (/catalog/items) у сборок с лаунчера сильно меньше настоящего: у Arcania 1 395
+  // против 13 920 на карточке. Берём наибольший из источников — тот же, что видно в каталоге.
+  const downloads = Math.max(project?.downloads ?? 0, item?.downloads ?? 0, full.downloads ?? 0, pack.downloads ?? 0) || null
+  const client = (view?.files || []).find((f) => f.side === 'client')
+
+  const facts: Fact[] = []
+  if (mods) facts.push({ value: fmtN(mods), label: t('модов') })
+  if (mcVersion) facts.push({ value: mcVersion, label: loader || t('версия') })
+  if (typeof full.online === 'number' && full.online > 0) facts.push({ value: fmtN(full.online), label: t('играют сейчас') })
+  else if (server && server.isOnline) facts.push({ value: fmtN(server.online), label: t('онлайн сервера') })
+  if (downloads) facts.push({ value: fmtN(downloads), label: t('скачиваний') })
+  if (project?.followers) facts.push({ value: fmtN(project.followers), label: t('подписчиков') })
+  if (client && client.size > 0) facts.push({ value: gb(client.size), label: t('скачать') })
+
+  // Обновления: премиум-патчи → версии нашего каталога → версии Modrinth.
+  const updates: Update[] = []
+  if (full.patches && full.patches.length) for (const x of full.patches) updates.push({ date: x.date || null, text: x.text })
+  else if (item?.files && item.files.length) {
+    const seen = new Set<string>()
+    for (const f of item.files) {
+      if (seen.has(f.version)) continue
+      seen.add(f.version)
+      updates.push({ date: f.releasedAt || null, text: t('Версия {version}', { version: f.version }) + (f.changelog ? ' — ' + f.changelog : '') })
+    }
+  } else
+    for (const v of versions)
+      updates.push({
+        date: v.date_published,
+        text: (v.name || v.version_number) + (v.game_versions && v.game_versions.length ? ' · ' + v.game_versions[v.game_versions.length - 1] : ''),
+      })
+
+  const includes = full.includes && full.includes.length ? full.includes : []
+  const plan = (full.plans && full.plans[0]) || plans.find((x) => x.id === (sub && sub.planId)) || plans[0] || null
+  const author = full.author || view?.author || null
+
+  const reloadDetail = () => {
+    void loadPremiumPack(pack.id)
+      .then((d) => {
+        settled.set('pd:' + pack.id, d)
+        cache.set('pd:' + pack.id, Promise.resolve(d))
+        setDetail(d)
+      })
+      .catch(() => {})
+  }
+  const retryDetail = () => {
+    setDetailFailed(false)
+    void remember('pd:' + pack.id, once('pd:' + pack.id, () => loadPremiumPack(pack.id))).then((d) => (d ? setDetail(d) : setDetailFailed(true)))
+  }
+  // The detail answered for a guest knows nothing of the account: after sign-in access and plans are asked again.
+  useEffect(() => {
+    if (seenSignedIn.current === signedIn) return
+    seenSignedIn.current = signedIn
+    if (signedIn && isArcania2(slug, arc2Live)) reloadDetail()
+  }, [signedIn])
+  const ready = mr ? !!project : !!view && (!pack.premium || pack.source !== 'premium' || !!detail)
+  if (!ready && !waited) return <PackPageSkeleton pack={pack} onBack={onBack} />
+  const keyEntry = !installed && !!slug && !!detail && hasPlanChoice(detail) && !!full.acceptsKeys && !hasAccess(full, sub)
+
+  let cta: ReactNode
+  if (installed)
+    cta = (
+      <button className="btn lg primary pp-cta" data-sound="open" data-track="play" data-src="pack_page" onClick={() => onPlay(installed)}>
+        <Icon id="i-play" /> {t('Играть')}
+      </button>
+    )
+  else if (mr) cta = <MrInstallButton pack={pack} />
+  else if (detail && hasPlanChoice(detail) && !hasAccess(full, sub))
+    cta = (
+      <PlanButtons
+        pack={full}
+        plans={detail.plans || []}
+        wrap="pp-cta-wrap"
+        onOwned={reloadDetail}
+      />
+    )
+  // Сборка каталога или доступ уже есть — та же большая «Установить», что у всех сборок
+  // (у платной раньше шли крупное «Доступ открыт» и маленькая кнопка, владелец 12.10.2026).
+  else if ((viaCatalog(full) || hasAccess(full, sub)) && full.slug)
+    cta = (
+      <span className="pp-cta-wrap">
+        <PackInstallButton pack={full} />
+      </span>
+    )
+  else
+    cta = (
+      <>
+        <PriceLine pack={full} plan={plan} sub={sub} />
+        <span className="pp-cta-wrap">
+          <BuyButton pack={full} plan={plan} sub={sub} onOwned={reloadDetail} />
+        </span>
+      </>
+    )
+
+  // Одна страница для всех сборок, платных тоже: без золота и своей «премиум»-подачи
+  // (владелец 12.10.2026: «поставь дефолтную страницу, как на любой другой сборке»).
+  const inline: ReactNode[] = []
+  if (mods) inline.push(<><b>{fmtNum(mods)}</b> {plural(mods, t('мод'), t('мода'), t('модов'))}</>)
+  if (downloads)
+    inline.push(
+      <>
+        <Icon id="i-download" />
+        <b>{fmtNum(downloads)}</b> {plural(downloads, t('скачивание'), t('скачивания'), t('скачиваний'))}
+      </>,
+    )
+  // Память СЕРВЕРА под сборку (из каталога хостинга), а не требования к компьютеру игрока:
+  // в «Системных требованиях» стоит второе, и тариф по нему не выбрать (QA 24.10.2026).
+  if (hostTarget?.kind === 'partner' && hostTarget.pack.minRamMb > 0)
+    inline.push(<>{t('Серверу от {n} ГБ', { n: Math.ceil(hostTarget.pack.minRamMb / 1024) })}</>)
+  if (updated) inline.push(<>{t('Обновлён {when}', { when: updated })}</>)
+  // Квадратный значок сборки; обложка в квадрат не лезет — буквы баннера обрезались (владелец 12.10.2026).
+  const icon = ownIcon || borrowed.icon || borrowed.cover || (mr ? null : blockIcon(slug || full.title))
+
+  // Главная кнопка — в шапке, рядом с названием; хостинг и сервер — маленькими под ней
+  // (владелец 12.10.2026, улучшение №1: раньше в шапке были только они, а «Установить» — ниже справа).
+  const heroOf = (main: ReactNode) => (
+    <div className="pp-hero-cta">
+      {main}
+      {hostTarget || server ? (
+        <div className="pp-hero-sub">
+          {hostTarget ? (
+            <button className="btn sm secondary" data-sound="open" data-track="host_install" onClick={() => setHostOpen(true)}>
+              <Icon id="i-server-cog" /> {t('На хостинг')}
+            </button>
+          ) : null}
+          {hostTarget && (hostTarget.kind === 'partner' || hostTarget.kind === 'modrinth') ? (
+            <button className="btn sm secondary" data-track="host_with_pack" data-src="pack_page" onClick={() => openHostWithPack(hostTarget)}>
+              <Icon id="i-plus" /> {t('Сервер с этой сборкой')}
+            </button>
+          ) : null}
+          {server ? (
+            <button className="btn sm secondary" data-track="pack_server" data-src="pack_page" onClick={() => onServer(server)}>
+              <Icon id="i-server" /> {t('Сервер сборки')}
+              {server.isOnline ? (
+                <span className="ph-hero-srv-n">
+                  <span className="ph-dot" aria-hidden="true"></span>
+                  {fmtN(server.online)}
+                </span>
+              ) : null}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  )
+  const heroCta = heroOf(cta)
+
+  if (isArcania2(slug, arc2Live)) {
+    const offer = arcaniaOffer({
+      installed: !!installed,
+      signedIn,
+      access: hasAccess(full, sub) || hasAccess(full, liveSubscription(detail)),
+      detail: detail ? 'ready' : detailFailed ? 'failed' : 'loading',
+      sells: sellsPartnerPacks(full.partner?.slug ?? ARCANIA_PARTNER),
+    })
+    let arcMain: ReactNode = null
+    if (offer === 'play') arcMain = cta
+    else if (offer === 'install')
+      arcMain = (
+        <span className="pp-cta-wrap" data-hero-install>
+          <PackInstallButton pack={full} />
+        </span>
+      )
+    else if (offer === 'signin')
+      arcMain = (
+        <button className="btn lg primary pp-cta" data-sound="open" data-track="arcania_signin" data-src="pack_page" onClick={() => openAccountAdd('millida')}>
+          <Icon id="i-login" /> {t('Войти')}
+        </button>
+      )
+    else if (offer === 'loading') arcMain = <span className="skel pp-skel-cta" aria-busy="true" />
+    else if (offer === 'error')
+      arcMain = (
+        <button className="btn lg secondary pp-cta" data-track="arcania_retry" data-src="pack_page" onClick={retryDetail}>
+          <Icon id="i-restart" /> {t('Повторить')}
+        </button>
+      )
+    else if (offer === 'buy')
+      arcMain =
+        detail && hasPlanChoice(detail) ? (
+          <PlanButtons pack={full} plans={detail.plans || []} wrap="pp-cta-wrap" onOwned={reloadDetail} />
+        ) : (
+          <>
+            <PriceLine pack={full} plan={plan} sub={sub} />
+            <span className="pp-cta-wrap">
+              <BuyButton pack={full} plan={plan} sub={sub} onOwned={reloadDetail} />
+            </span>
+          </>
+        )
+    return (
+      <div className="ci" data-section="pack_page" data-kind="arcania" data-id={slug || pack.id}>
+        <StickyCta watch={heroEnd} icon={icon} title={'Arcania ' + ARCANIA_HEAD.version}>
+          {arcMain}
+        </StickyCta>
+        <Back label={t('Сборки')} onBack={onBack} />
+        <ArcaniaPage
+          cta={heroOf(arcMain)}
+          extra={
+            <>
+              {pack.premium ? <PayNote packId={full.id} /> : null}
+              {offer === 'signin' ? (
+                <div className="pkb-key">
+                  <div className="pkb-bought">
+                    <b>
+                      <Icon id="i-key" /> {t('Войдите в аккаунт Millida, чтобы купить или ввести ключ')}
+                    </b>
+                  </div>
+                </div>
+              ) : null}
+              {offer === 'error' ? <span className="pkb-err">{t('Цены и подписки не загрузились — проверьте интернет и нажмите «Повторить»')}</span> : null}
+              {offer === 'buy' || offer === 'key' ? (
+                <div className="pkb-key">
+                  <PackKeyField
+                    slug={slug}
+                    title={t('Уже купили на arcania.fun? Введите ключ')}
+                    onUnlocked={() => {
+                      showToast(t('Ключ активирован'))
+                      reloadDetail()
+                    }}
+                  />
+                </div>
+              ) : null}
+            </>
+          }
+          legacy={<ArcaniaLegacy onPlay={onPlayBuild} />}
+          installed={!!installed}
+          hero={heroAction(offer)}
+          onPlay={() => installed && onPlay(installed)}
+          heroEnd={heroEnd}
+        />
+        {hostOpen && hostTarget ? <HostInstall target={hostTarget} onClose={() => setHostOpen(false)} /> : null}
+      </div>
+    )
+  }
+
+  return (
+    <div className="ci" data-section="pack_page" data-kind={pack.premium ? 'premium' : 'pack'} data-id={slug || pack.id}>
+      <StickyCta watch={heroEnd} icon={icon} title={full.title}>
+        {cta}
+      </StickyCta>
+      <Back label={t('Сборки')} onBack={onBack} />
+      <Hero
+        cover={<Media video={video} cover={cover} ob={slug === ONEBLOCK_PACK} />}
+        badge={<span className="ph-card-tag">{pack.premium ? (view?.protectedContent ? t('Эксклюзив') : t('Премиум')) : mr ? 'Modrinth' : t('Бесплатно')}</span>}
+        icon={icon ? <img src={icon} alt="" draggable={false} /> : null}
+        glow={icon}
+        title={full.title}
+        line={full.tagline}
+        by={author ? t('Собрал {author}', { author }) : null}
+        facts={inline}
+        cta={heroCta}
+      />
+      <div ref={heroEnd} className="pp-hero-end" aria-hidden="true" />
+
+      <div className="ci-grid">
+        <main className="ci-main">
+          <Tabs tab={tab} onTab={setTab} gallery={shots.length} versions={updates.length} contents={!!slug} />
+          {tab === 'desc' && (shots.length || video) ? <MediaStrip urls={shots} video={video} onAll={() => setTab('gallery')} /> : null}
+          {tab === 'desc' ? (
+            <>
+              {updates[0] ? <WhatsNew u={updates[0]} more={updates.length > 1} onAll={() => setTab('versions')} /> : null}
+              {includes.length ? (
+                <section className="pp-block">
+                  <h2>{t('Что входит')}</h2>
+                  <ul className="pp-inc">
+                    {includes.map((x) => (
+                      <li key={x}>
+                        <Icon id="i-check" />
+                        {x}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              ) : null}
+              <Desc blocks={view?.description} markdown={project?.body} shots={shots} />
+            </>
+          ) : tab === 'contents' && slug ? (
+            mr ? <PackContents project={slug} /> : <PackContents catalog={slug} />
+          ) : tab === 'gallery' ? (
+            <Gallery urls={shots} />
+          ) : (
+            <section className="card ci-box">
+              <ul className="pp-patches">
+                {updates.map((x, k) => (
+                  <li key={k}>
+                    {x.date && untilText(x.date) ? <span>{untilText(x.date)}</span> : null}
+                    {x.text}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+        </main>
+
+        <aside className="ci-aside">
+          <div className="pp-buy">
+            {/* Оплата открыта в браузере: «Открыть снова» и «Отмена» — без них кнопка
+                «Ждём оплату» держала страницу до перезапуска (ожидание общее на сборку). */}
+            {pack.premium ? <PayNote packId={full.id} /> : null}
+            {candidate ? (
+              <button
+                className="btn md secondary"
+                data-track="review_candidate"
+                data-src="pack_page"
+                disabled={packRunning}
+                onClick={() => installReviewCandidate(slug, full.title, candidate)}
+              >
+                {t('Проверить {version}', { version: candidate })}
+              </button>
+            ) : null}
+            {keyEntry ? (
+              <div className="pkb-key">
+                <PackKeyField
+                  slug={slug}
+                  onUnlocked={() => {
+                    showToast(t('Ключ активирован'))
+                    reloadDetail()
+                  }}
+                />
+              </div>
+            ) : null}
+            {slug ? <PackHealthLine slug={slug} title={full.title} /> : null}
+            <Hours build={installed} />
+            {pack.premium ? <CancelLine sub={liveSubscription(detail) ?? sub} /> : null}
+            <span className="pp-legal">
+              {full.ageRating ? <b>{full.ageRating}</b> : null}
+              {t('Не продукт Mojang')}
+            </span>
+          </div>
+          <Compat versions={gameVersions} loaders={loaderIds} side={null} />
+        </aside>
+      </div>
+
+      {mr ? null : <MorePacks slug={slug} partner={view?.partner ?? detail?.partner ?? null} author={author} />}
+
+      {hostOpen && hostTarget ? <HostInstall target={hostTarget} onClose={() => setHostOpen(false)} /> : null}
+    </div>
+  )
+}
+
+/** Ближайший предок с прокруткой. */
+function scrollerOf(el: HTMLElement | null): HTMLElement | null {
+  let box = el ? el.parentElement : null
+  while (box && !/(auto|scroll)/.test(getComputedStyle(box).overflowY)) box = box.parentElement
+  return box
+}
+
+/**
+ * Улучшение №9 (владелец 12.10.2026): кнопка шапки ушла за верх окна — сверху тонкая полоса
+ * со значком, названием и той же кнопкой.
+ *
+ * Полоса живёт вне прокручиваемой области (портал в её родителя), а не position: sticky
+ * внутри: окно лаунчера (WebKit) прокручивает область отдельно от страницы, и липкая полоса
+ * на границе подлагивала, пропадала и появлялась снова. Показ — с запасом в обе стороны,
+ * чтобы у самой границы не мигала.
+ */
+function StickyCta({ watch, icon, title, children }: { watch: React.RefObject<HTMLDivElement | null>; icon: string | null; title: string; children: ReactNode }) {
+  const [on, setOn] = useState(false)
+  const [host, setHost] = useState<HTMLElement | null>(null)
+  const [box, setBox] = useState<{ top: number; left: number; width: number } | null>(null)
+  const slot = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const mark = watch.current
+    const anchor = slot.current
+    const page = anchor ? anchor.parentElement : null
+    const sc = scrollerOf(anchor)
+    const parent = sc ? sc.parentElement : null
+    if (!mark || !anchor || !page || !sc || !parent) return
+    setHost(parent)
+    let shown = false
+    let frame = 0
+    const place = () => {
+      const a = parent.getBoundingClientRect()
+      const s = sc.getBoundingClientRect()
+      const c = page.getBoundingClientRect()
+      setBox((b) => {
+        const next = { top: Math.round(s.top - a.top), left: Math.round(c.left - a.left), width: Math.round(c.width) }
+        return b && b.top === next.top && b.left === next.left && b.width === next.width ? b : next
+      })
+    }
+    // Полоса нужна, как только сама кнопка шапки ушла за верх, а не вся шапка.
+    const check = () => {
+      frame = 0
+      const cta = page.querySelector<HTMLElement>('.ci-cta')
+      const edge = cta && cta.offsetHeight ? cta.getBoundingClientRect().bottom : mark.getBoundingClientRect().top
+      const top = sc.getBoundingClientRect().top
+      const next = shown ? edge < top + 24 : edge < top
+      if (next !== shown) {
+        shown = next
+        if (next) place()
+        setOn(next)
+      }
+    }
+    const soon = () => {
+      if (!frame) frame = requestAnimationFrame(check)
+    }
+    place()
+    check()
+    sc.addEventListener('scroll', soon, { passive: true })
+    const ro = new ResizeObserver(() => {
+      place()
+      soon()
+    })
+    ro.observe(sc)
+    return () => {
+      cancelAnimationFrame(frame)
+      sc.removeEventListener('scroll', soon)
+      ro.disconnect()
+    }
+  }, [])
+  const bar =
+    host && box ? (
+      <div
+        className={'pp-stick' + (on ? ' on' : '')}
+        style={{ top: box.top, left: box.left, width: box.width }}
+        aria-hidden={!on}
+        inert={!on || undefined}
+      >
+        {icon ? <img src={icon} alt="" draggable={false} /> : null}
+        <b>{title}</b>
+        <span className="pp-stick-sp" />
+        <div className="pp-stick-cta">{children}</div>
+      </div>
+    ) : null
+  return (
+    <div className="pp-stick-slot" ref={slot}>
+      {bar && host ? createPortal(bar, host) : null}
+    </div>
+  )
+}
+
+/** Улучшение №10: последнее обновление — коротко над описанием, все — во вкладке «Версии». */
+function WhatsNew({ u, more, onAll }: { u: Update; more: boolean; onAll: () => void }) {
+  const t = useT()
+  const when = u.date ? untilText(u.date) : ''
+  return (
+    <section className="card ci-box pp-news">
+      <div className="pp-news-h">
+        <b>{t('Что нового')}</b>
+        {when ? <span>{when}</span> : null}
+        {more ? (
+          <button className="pp-news-all" data-track="pack_news_all" onClick={onAll}>
+            {t('Все версии')} <Icon id="i-chev-r" />
+          </button>
+        ) : null}
+      </div>
+      <p>{u.text}</p>
+    </section>
+  )
+}
+
+/**
+ * Улучшение №10: внизу не тупик — ещё сборки той же студии (или автора) карточками, как в
+ * каталоге; своих мало — популярные наши. Клик — их страница здесь же.
+ */
+/// The website's order wizard with the pack chosen: a partner pack by its key
+/// (the author's share rides on it), a Modrinth pack by its project.
+function openHostWithPack(target: HostTarget) {
+  const query =
+    target.kind === 'partner'
+      ? 'pack=' + encodeURIComponent(target.pack.key)
+      : target.kind === 'modrinth'
+        ? 'install=' + encodeURIComponent('modrinth:' + target.projectId)
+        : ''
+  const url = query ? sitePath('/hosting/new?' + query + '&utm_source=launcher&utm_medium=pack_page') : null
+  if (url) openExt(url)
+}
+
+function MorePacks({ slug, partner, author }: { slug: string; partner: { slug: string; name: string } | null; author: string | null }) {
+  const t = useT()
+  const [list, setList] = useState<MillidaPack[] | null>(null)
+  const row = useRef<HTMLDivElement>(null)
+  const lead = arcaniaLead(useArcania2Live())
+  useEffect(() => {
+    let alive = true
+    loadOwnPacks()
+      .then((l) => alive && setList(l))
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
+  if (!list) return null
+  const others = list.filter((p) => p.slug !== slug && !p.preview)
+  const byDl = (a: MillidaPack, b: MillidaPack) => Number(!!b.protectedContent) - Number(!!a.protectedContent) || (b.downloads || 0) - (a.downloads || 0)
+  const same = leadFirst((partner ? others.filter((p) => p.partner?.slug === partner.slug) : author ? others.filter((p) => p.author === author) : []).sort(byDl), lead)
+  const cards = (same.length >= 2 ? same : others.slice().sort(byDl)).slice(0, 10)
+  if (!cards.length) return null
+  const title = same.length >= 2 ? t('Ещё от {author}', { author: partner?.name || author || '' }) : t('Похожие сборки')
+  const sec = sectionBySlug('modpacks')
+  // Страница новой сборки откроется сверху: прокрутку при смене страницы ведёт хаб (PlayHub).
+  const open = (s: string) => {
+    useLobby.setState({ hubTarget: { pack: s, stay: true } })
+    return true
+  }
+  const step = (dir: 1 | -1) => row.current?.scrollBy({ left: dir * row.current.clientWidth * 0.9, behavior: 'smooth' })
+  return (
+    <section className="pp-more" aria-label={title}>
+      <header className="mr-ru-head">
+        <h2>{title}</h2>
+        <span className="mr-ru-nav">
+          <button className="mr-ru-arrow" aria-label={t('Назад')} data-track="pack_more_prev" onClick={() => step(-1)}>
+            <Icon id="i-chev-l" />
+          </button>
+          <button className="mr-ru-arrow" aria-label={t('Дальше')} data-track="pack_more_next" onClick={() => step(1)}>
+            <Icon id="i-chev-r" />
+          </button>
+        </span>
+      </header>
+      <div className="mr-ru-row" ref={row}>
+        {cards.map((p, i) => (
+          <SiteGalleryCard key={p.slug} card={ownPackCard(p)} sec={sec} list="pack_more" pos={i} onOpenPack={open} />
+        ))}
+      </div>
+    </section>
+  )
+}

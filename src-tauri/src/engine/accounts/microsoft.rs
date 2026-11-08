@@ -1,0 +1,312 @@
+// Microsoft login by code (device code): the user types the password on the Microsoft page, not in the launcher.
+// Then the chain Xbox Live, XSTS, Minecraft Services. All these hosts belong to Microsoft/Mojang. No Millida servers here.
+use crate::engine::*;
+use serde_json::Value;
+
+/// Azure application client_id, baked in at compile time. Own builds should set
+/// MILLIDA_MS_CLIENT_ID to their own registration.
+// Public Azure application id, not a secret. Custom builds set their own through MILLIDA_MS_CLIENT_ID.
+const MS_CLIENT_ID_FALLBACK: &str = "499c8d36-be2a-4231-9ebd-ef291b7bb64c";
+
+pub(crate) fn ms_client_id() -> &'static str {
+    match option_env!("MILLIDA_MS_CLIENT_ID") {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => MS_CLIENT_ID_FALLBACK,
+    }
+}
+
+pub async fn ms_device_start() -> Result<Value, String> {
+    let client_id = ms_client_id();
+    let r = client()
+        // Step one: ask Microsoft for a login code. client_id and the list of scopes are sent.
+        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode")
+        .form(&[("client_id", client_id), ("scope", "XboxLive.signin offline_access")])
+        .send().await.map_err(|e| net_err(&e))?;
+    let j: Value = r.json().await.map_err(|e| e.to_string())?;
+    if let Some(err) = j["error"].as_str() {
+        return Err(j["error_description"].as_str().unwrap_or(err).to_string());
+    }
+    if j["user_code"].as_str().unwrap_or("").is_empty() || j["device_code"].as_str().unwrap_or("").is_empty() {
+        return Err("Microsoft не выдал код устройства".into());
+    }
+    Ok(j)
+}
+
+#[derive(Clone)]
+struct MsGrant {
+    access: String,
+    refresh: String,
+    at: std::time::Instant,
+}
+
+const GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// Microsoft accepts a device code exactly once and answers a second use with
+/// AADSTS70000. The Xbox chain after it can still fail on the network and the
+/// UI then polls the same code again, so the redeemed grant is kept and reused.
+/// The async lock also keeps two polls of one code from both redeeming it.
+fn grants() -> &'static tokio::sync::Mutex<std::collections::HashMap<String, MsGrant>> {
+    static G: std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashMap<String, MsGrant>>> =
+        std::sync::OnceLock::new();
+    G.get_or_init(Default::default)
+}
+
+async fn device_login<R, RF, C, CF>(device_code: &str, redeem: R, chain: C) -> Result<Value, String>
+where
+    R: FnOnce(String) -> RF,
+    RF: std::future::Future<Output = Result<Option<(String, String)>, String>>,
+    C: FnOnce(String) -> CF,
+    CF: std::future::Future<Output = Result<Value, String>>,
+{
+    let mut map = grants().lock().await;
+    map.retain(|_, g| g.at.elapsed() < GRANT_TTL);
+    let grant = match map.get(device_code) {
+        Some(g) => g.clone(),
+        None => match redeem(device_code.to_string()).await? {
+            None => return Ok(serde_json::json!({"status":"pending"})),
+            Some((access, refresh)) => {
+                let g = MsGrant { access, refresh, at: std::time::Instant::now() };
+                map.insert(device_code.to_string(), g.clone());
+                g
+            }
+        },
+    };
+    let mut out = chain(grant.access).await?;
+    out["refresh_token"] = Value::String(grant.refresh);
+    Ok(out)
+}
+
+/// One polling step: {status:"pending"} or {status:"ok",nick,uuid,token}.
+pub async fn ms_device_poll(device_code: String) -> Result<Value, String> {
+    device_login(&device_code, redeem_device_code, |token| async move { xbox_chain(&token).await }).await
+}
+
+async fn redeem_device_code(device_code: String) -> Result<Option<(String, String)>, String> {
+    let client_id = ms_client_id();
+    let r = client()
+        // Polls Microsoft: has the user signed in on the code page yet.
+        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+        .form(&[
+            ("client_id", client_id),
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", &device_code),
+        ])
+        .send().await.map_err(|e| net_err(&e))?;
+    let j: Value = r.json().await.map_err(|e| e.to_string())?;
+    if let Some(err) = j["error"].as_str() {
+        if err == "authorization_pending" || err == "slow_down" {
+            return Ok(None);
+        }
+        return Err(j["error_description"].as_str().unwrap_or(err).to_string());
+    }
+    let ms_token = j["access_token"].as_str().ok_or("нет токена Microsoft")?.to_string();
+    // refresh_token comes from the offline_access scope and is what allows the
+    // ~24h Minecraft token to be renewed without user interaction
+    let refresh = j["refresh_token"].as_str().unwrap_or("").to_string();
+    Ok(Some((ms_token, refresh)))
+}
+
+/// Xbox Live -> XSTS -> Minecraft services -> profile, as required by the
+/// Microsoft login protocol. Shared by first login and silent refresh.
+pub(crate) async fn xbox_chain(ms_token: &str) -> Result<Value, String> {
+    // Swaps the Microsoft token for Xbox Live and Minecraft tokens. Tokens go only to xboxlive.com and minecraftservices.com.
+    let xbl: Value = client().post("https://user.auth.xboxlive.com/user/authenticate")
+        .json(&serde_json::json!({
+            "Properties": {"AuthMethod":"RPS","SiteName":"user.auth.xboxlive.com","RpsTicket": format!("d={}", ms_token)},
+            "RelyingParty":"http://auth.xboxlive.com","TokenType":"JWT"}))
+        .send().await.map_err(|e| net_err(&e))?.json().await.map_err(|e| e.to_string())?;
+    let xbl_token = xbl["Token"].as_str().ok_or("Xbox Live отказал")?.to_string();
+    let uhs = xbl["DisplayClaims"]["xui"][0]["uhs"].as_str().ok_or("нет uhs")?.to_string();
+
+    let xsts: Value = client().post("https://xsts.auth.xboxlive.com/xsts/authorize")
+        .json(&serde_json::json!({
+            "Properties": {"SandboxId":"RETAIL","UserTokens":[xbl_token]},
+            "RelyingParty":"rp://api.minecraftservices.com/","TokenType":"JWT"}))
+        .send().await.map_err(|e| net_err(&e))?.json().await.map_err(|e| e.to_string())?;
+    let xsts_token = match xsts["Token"].as_str() {
+        Some(t) => t.to_string(),
+        None => return Err(xsts_error_text(xsts["XErr"].as_u64())),
+    };
+    // the game passes XUID as ${auth_xuid}; 1.19+ clients treat a missing one
+    // as an incomplete session
+    let xuid = xsts["DisplayClaims"]["xui"][0]["xid"].as_str().unwrap_or("").to_string();
+
+    let identity = serde_json::json!({"identityToken": format!("XBL3.0 x={};{}", uhs, xsts_token)});
+    let mut mc = Value::Null;
+    let mut mc_status = 0u16;
+    // 429 and 5xx from the Minecraft services are transient: one login attempt
+    // shouldn't die on them
+    for attempt in 0..3u64 {
+        let r = client().post("https://api.minecraftservices.com/authentication/login_with_xbox")
+            .json(&identity).send().await.map_err(|e| net_err(&e))?;
+        mc_status = r.status().as_u16();
+        mc = r.json().await.unwrap_or(Value::Null);
+        if mc["access_token"].as_str().is_some() || !(mc_status == 429 || mc_status >= 500) { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(1500 * (attempt + 1))).await;
+    }
+    let mc_token = match mc["access_token"].as_str() {
+        Some(t) => t.to_string(),
+        None if mc_status == 429 => return Err("Minecraft временно ограничил запросы (HTTP 429) — подожди минуту и повтори".into()),
+        None if mc_status >= 500 => return Err(format!("Серверы Minecraft сейчас недоступны (HTTP {}) — повтори позже", mc_status)),
+        None => return Err(format!("Minecraft отказал во входе (HTTP {})", mc_status)),
+    };
+    // surfaced so callers can tell a live token from an expired one before
+    // launching the game
+    let expires_in = mc["expires_in"].as_i64().unwrap_or(86400);
+
+    let mut prof = Value::Null;
+    let mut prof_status = 0u16;
+    for attempt in 0..3u64 {
+        // Gets the player profile (nickname, uuid, capes) from Minecraft Services using the token.
+        let r = client().get("https://api.minecraftservices.com/minecraft/profile")
+            .bearer_auth(&mc_token).send().await.map_err(|e| net_err(&e))?;
+        prof_status = r.status().as_u16();
+        prof = r.json().await.unwrap_or(Value::Null);
+        if prof["name"].as_str().is_some() || !(prof_status == 429 || prof_status >= 500) { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(1500 * (attempt + 1))).await;
+    }
+    let nick = match prof["name"].as_str() {
+        Some(n) => n.to_string(),
+        None if prof_status == 404 => return Err("Нет лицензии Minecraft Java Edition на этом аккаунте Microsoft. Если она есть (в том числе по Game Pass), войди тем же аккаунтом на minecraft.net и создай профиль игрока".into()),
+        None if prof_status == 429 => return Err("Minecraft временно ограничил запросы (HTTP 429) — подожди минуту и повтори".into()),
+        None if prof_status >= 500 => return Err(format!("Серверы Minecraft сейчас недоступны (HTTP {}) — повтори позже", prof_status)),
+        None => return Err(format!("Профиль Minecraft не получен (HTTP {})", prof_status)),
+    };
+    Ok(serde_json::json!({
+        "status":"ok", "nick": nick,
+        "uuid": prof["id"].as_str().unwrap_or(""),
+        "xuid": xuid,
+        "expires_in": expires_in,
+        "token": mc_token
+    }))
+}
+
+/// The profile endpoint answers 200 only for a valid token, which is the only
+/// way to check accounts stored before expiry tracking existed.
+pub async fn ms_validate(token: String) -> Result<Value, String> {
+    let r = client()
+        .get("https://api.minecraftservices.com/minecraft/profile")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| net_err(&e))?;
+    let status = r.status();
+    let j: Value = r.json().await.unwrap_or(Value::Null);
+    Ok(serde_json::json!({
+        "ok": status.is_success() && !j["name"].as_str().unwrap_or("").is_empty(),
+        "expired": status.as_u16() == 401,
+        "nick": j["name"].as_str().unwrap_or(""),
+        "uuid": j["id"].as_str().unwrap_or(""),
+    }))
+}
+
+/// Microsoft refused to renew. A revoked or expired grant reads as the session having ended (the
+/// caller wipes it and asks to sign in); anything else — a busy or throttled service, a request
+/// loop — keeps Microsoft's own code and description, so the session is kept and tried later.
+/// Every refusal used to read "истекла" and wiped a live session (04.11.2026).
+pub(crate) fn ms_token_refusal(j: &Value) -> String {
+    let code = j["error"].as_str().filter(|c| !c.is_empty()).unwrap_or("no_access_token");
+    let desc: String = j["error_description"].as_str().unwrap_or("").lines().next().unwrap_or("").chars().take(200).collect();
+    if code == "invalid_grant" || code == "interaction_required" || grant_gone(&desc) {
+        "Сессия Microsoft истекла — войди заново".into()
+    } else {
+        format!("microsoft token refresh refused ({}): {}", code, desc)
+    }
+}
+
+/// AADSTS codes that mean the grant itself is gone: expired, revoked by a password change, or the
+/// account needs an interactive sign-in. Throttling, loops and outages (AADSTS50196, 90033, ...)
+/// are not here.
+const GRANT_GONE_AADSTS: [&str; 8] = ["aadsts70000", "aadsts70008", "aadsts700082", "aadsts700084", "aadsts50173", "aadsts50076", "aadsts50079", "aadsts50034"];
+
+pub(crate) fn grant_gone(text: &str) -> bool {
+    let t = text.to_lowercase();
+    // A code is followed by ':' or the end, so AADSTS70000 does not match AADSTS700001.
+    GRANT_GONE_AADSTS.iter().any(|c| t.match_indices(c).any(|(i, m)| !t[i + m.len()..].starts_with(|ch: char| ch.is_ascii_digit())))
+}
+
+/// The Microsoft step of a silent renewal: the stored refresh_token for a Microsoft access token and
+/// the rotated refresh_token (the old one when Microsoft keeps it). The Xbox and Minecraft steps
+/// follow in `ms_session_refresh`, which keeps the rotated token even if they fail.
+pub(crate) async fn ms_refresh_token(refresh_token: &str) -> Result<(String, String), String> {
+    let client_id = ms_client_id();
+    let r = client()
+        .post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token")
+        .form(&[
+            ("client_id", client_id),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("scope", "XboxLive.signin offline_access"),
+        ])
+        .send().await.map_err(|e| net_err(&e))?;
+    let j: Value = r.json().await.map_err(|e| e.to_string())?;
+    let Some(ms_token) = j["access_token"].as_str() else {
+        return Err(ms_token_refusal(&j));
+    };
+    let new_refresh = j["refresh_token"].as_str().filter(|t| !t.is_empty()).unwrap_or(refresh_token).to_string();
+    Ok((ms_token.to_string(), new_refresh))
+}
+
+/// XSTS answers refusals with an XErr code; each has a different fix for the user.
+fn xsts_error_text(code: Option<u64>) -> String {
+    match code {
+        Some(2148916233) => "У этого аккаунта Microsoft нет профиля Xbox. Зайди на minecraft.net этим аккаунтом, создай профиль и повтори".into(),
+        Some(2148916235) => "Xbox недоступен в стране этого аккаунта".into(),
+        Some(2148916236) | Some(2148916237) => "Аккаунту нужна проверка возраста на xbox.com, после неё повтори вход".into(),
+        Some(2148916238) => "Детский аккаунт Microsoft: взрослый должен добавить его в семью на account.microsoft.com/family и разрешить онлайн-игру".into(),
+        Some(c) => format!("XSTS отказал (код {})", c),
+        None => "XSTS отказал (нет Xbox-профиля?)".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn device_code_is_redeemed_once_across_retries() {
+        let redeems = AtomicUsize::new(0);
+        let redeem = |_: String| {
+            redeems.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Some(("ms-access".to_string(), "ms-refresh".to_string()))) }
+        };
+
+        let first = device_login("dc-retry", redeem, |_| async { Err::<Value, _>("нет связи (xboxlive)".to_string()) }).await;
+        assert!(first.is_err(), "a failed Xbox chain must reach the UI as an error");
+
+        let second = device_login("dc-retry", redeem, |token| async move {
+            assert_eq!(token, "ms-access", "the retry must reuse the token Microsoft already issued for this code");
+            Ok(serde_json::json!({"status":"ok","nick":"Steve"}))
+        })
+        .await
+        .expect("the retry after a network failure must finish the login");
+
+        assert_eq!(
+            redeems.load(Ordering::SeqCst),
+            1,
+            "Microsoft refuses a second use of a device code with AADSTS70000, so a retry must not redeem it again",
+        );
+        assert_eq!(second["status"], "ok");
+        assert_eq!(second["refresh_token"], "ms-refresh", "the refresh token must survive the retry");
+    }
+
+    #[tokio::test]
+    async fn pending_code_is_not_remembered() {
+        let pending = device_login("dc-pending", |_| async { Ok(None) }, |_| async { panic!("no chain before sign-in") }).await;
+        assert_eq!(pending.unwrap()["status"], "pending");
+
+        let redeemed = AtomicUsize::new(0);
+        let done = device_login(
+            "dc-pending",
+            |_| {
+                redeemed.fetch_add(1, Ordering::SeqCst);
+                async { Ok(Some(("a".to_string(), String::new()))) }
+            },
+            |_| async { Ok(serde_json::json!({"status":"ok"})) },
+        )
+        .await;
+        assert_eq!(done.unwrap()["status"], "ok");
+        assert_eq!(redeemed.load(Ordering::SeqCst), 1, "a pending answer must not stop the next poll from asking Microsoft");
+    }
+}

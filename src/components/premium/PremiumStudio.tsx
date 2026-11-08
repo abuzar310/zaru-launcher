@@ -1,0 +1,352 @@
+import { useEffect, useMemo, useState } from 'react'
+import { Icon } from '../Icon'
+import { api, LAUNCHER_API, langHeaders, mirrorAsset } from '../../lib/api'
+import { hasTauri } from '../../ipc/tauri'
+import { loadProfileSettings, millidaPacks } from '../../ipc/commands'
+import type { MillidaPack } from '../../ipc/commands'
+import { backdropClose } from '../../lib/dismiss'
+import { RU_LOADER, plural } from '../../lib/format'
+import { useLobby } from '../../state/lobbyMode'
+import { GENRES, downloadsShort, genresOf, shortPitch, shortTitle } from './premiumPackData'
+import { useProfiles } from '../../state/profiles'
+import { intlTag, t, useT } from '../../i18n'
+import { arcania2Live, useArcania2Live, withoutArcaniaLegacy } from '../../lib/arcaniaRelease'
+
+/*
+ * Студия и эксклюзив премиум-сборки (PremiumPackPage):
+ * - StudioModal — все сборки студии из нашего каталога (поле partner), клик
+ *   ведёт на страницу сборки тем же путём, что «Рекомендуем» (hubTarget);
+ * - useStudioCount — сколько премиум-сборок у студии (чип студии в герое).
+ */
+
+/** Ядро молчит дольше — параллельно спрашиваем тот же открытый список напрямую. */
+const HEDGE_MS = 2500
+/** Дольше не ждём: окно покажет «Повторить», а не вечные заглушки. */
+const GIVE_UP_MS = 20_000
+
+/** Открытый список без входа: черновиков для проверяющих в нём нет, студии они и не нужны. */
+function packsFromWeb(): Promise<MillidaPack[]> {
+  return fetch(LAUNCHER_API + '/catalog/packs', { headers: langHeaders() }).then((r) => (r.ok ? r.json() : Promise.reject(new Error('http ' + r.status))))
+}
+
+/**
+ * Запрос через ядро иногда висит десятки секунд (сеть «залипает»), и окно студии
+ * стояло на заглушках, пока лаунчер не перезапустят (владелец 12.10.2026). Берём
+ * первый удачный ответ из двух путей, а через GIVE_UP_MS сдаёмся.
+ */
+function firstPacks(): Promise<MillidaPack[]> {
+  if (!hasTauri()) return api<MillidaPack[]>('/catalog/packs')
+  return new Promise((resolve, reject) => {
+    let pending = 1
+    let web = false
+    const failed = (e: unknown) => {
+      if (--pending === 0 && web) reject(e)
+    }
+    const startWeb = () => {
+      if (web) return
+      web = true
+      pending++
+      packsFromWeb().then(resolve, failed)
+    }
+    const hedge = window.setTimeout(startWeb, HEDGE_MS)
+    window.setTimeout(() => reject(new Error('timeout')), GIVE_UP_MS)
+    millidaPacks().then(resolve, (e) => {
+      window.clearTimeout(hedge)
+      startWeb()
+      failed(e)
+    })
+  })
+}
+
+let listCache: Promise<MillidaPack[]> | null = null
+function catalogPacks(): Promise<MillidaPack[]> {
+  if (!listCache)
+    listCache = firstPacks()
+      .then((l) => (Array.isArray(l) ? l : []))
+      .catch((e) => {
+        listCache = null
+        throw e
+      })
+  return listCache
+}
+
+/** Премиум-сборок у студии в каталоге; нет данных — null. */
+export function useStudioCount(slug: string | null | undefined): number | null {
+  const [n, setN] = useState<number | null>(null)
+  const arc2 = useArcania2Live()
+  useEffect(() => {
+    if (!slug) return
+    let alive = true
+    catalogPacks()
+      .then((l) => alive && setN(withoutArcaniaLegacy(l, arc2).filter((p) => p.partner?.slug === slug && p.accessRequired && !p.preview).length || null))
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [slug, arc2])
+  return n
+}
+
+export { packWord }
+
+/** Прокрутка экрана хаба наверх — новая сборка открывается с героя. */
+function scrollTop() {
+  requestAnimationFrame(() => {
+    let box = document.querySelector('.ppx')?.parentElement || null
+    while (box && !/(auto|scroll)/.test(getComputedStyle(box).overflowY)) box = box.parentElement
+    box?.scrollTo({ top: 0 })
+  })
+}
+
+function packWord(n: number): string {
+  return plural(n, t('сборка'), t('сборки'), t('сборок'))
+}
+
+/** Слаги наших сборок, которые уже стоят на компьютере. */
+function useInstalledSlugs(): Set<string> {
+  const profiles = useProfiles((s) => s.profiles)
+  const [slugs, setSlugs] = useState<Set<string>>(() => new Set())
+  useEffect(() => {
+    if (!hasTauri()) return
+    let alive = true
+    void Promise.all(profiles.map((p) => loadProfileSettings(p.name).catch(() => null))).then((all) => {
+      if (!alive) return
+      const out = new Set<string>()
+      for (const st of all) {
+        if (st?.catalogPackSlug) out.add(st.catalogPackSlug)
+        if (st?.modpackSlug) out.add(st.modpackSlug)
+      }
+      setSlugs(out)
+    })
+    return () => {
+      alive = false
+    }
+  }, [profiles])
+  return slugs
+}
+
+export function StudioModal({
+  studio,
+  current,
+  onClose,
+}: {
+  studio: { slug: string; name: string }
+  current: string
+  onClose: () => void
+}) {
+  const t = useT()
+  const [list, setList] = useState<MillidaPack[] | null>(null)
+  const [failed, setFailed] = useState(false)
+  const [q, setQ] = useState('')
+  const [genre, setGenre] = useState<string | null>(null)
+  const [tick, setTick] = useState(0)
+  const installed = useInstalledSlugs()
+
+  useEffect(() => {
+    let alive = true
+    setFailed(false)
+    catalogPacks()
+      .then((l) => alive && setList(withoutArcaniaLegacy(l, arcania2Live()).filter((p) => p.partner?.slug === studio.slug && !p.preview)))
+      .catch(() => alive && setFailed(true))
+    return () => {
+      alive = false
+    }
+  }, [studio.slug, tick])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  // Настоящие скачивания (без ручной «стартовой» прибавки) и жанры по словам.
+  const rows = useMemo(
+    () =>
+      (list || []).map((p) => ({
+        p,
+        dl: p.downloads || 0,
+        genres: genresOf(p.title, p.summary || ''),
+      })),
+    [list],
+  )
+  // Своя сборка студии (Arcania) — всегда первой, дальше по скачиваниям (владелец 12.10.2026).
+  const order = (a: (typeof rows)[number], b: (typeof rows)[number]) => Number(!!b.p.protectedContent) - Number(!!a.p.protectedContent) || b.dl - a.dl
+  // Место в топе — в том же порядке среди всех сборок студии, не по фильтру.
+  const rank = useMemo(() => {
+    const m = new Map<string, number>()
+    rows
+      .slice()
+      .sort(order)
+      .slice(0, 3)
+      .forEach((r, i) => r.dl > 0 && m.set(r.p.slug, i + 1))
+    return m
+  }, [rows])
+  const genres = useMemo(
+    () =>
+      GENRES.map((g) => ({ ...g, n: rows.filter((r) => r.genres.includes(g.id)).length })).filter((g) => g.n >= 2),
+    [rows],
+  )
+  // Своя сборка студии — «Эксклюзив», остальные — переводы на русский (владелец 12.10.2026).
+  const exclusive = rows.filter((r) => r.p.protectedContent).length
+  const translated = rows.length - exclusive
+  const query = q.trim().toLowerCase()
+  const shown = rows
+    .filter((r) => !genre || r.genres.includes(genre))
+    .filter((r) => !query || (r.p.title + ' ' + r.p.summary).toLowerCase().includes(query))
+    .sort(order)
+
+  const open = (p: MillidaPack) => {
+    onClose()
+    if (p.slug === current) return
+    useLobby.setState({ hubTarget: { pack: p.slug } })
+    scrollTop()
+  }
+
+  return (
+    <div className="modal-bg open vis ppx-studio-bg" {...backdropClose(onClose)}>
+      <div className="modal ppx-studio-modal" role="dialog" aria-label={t('Сборки {studio}', { studio: studio.name })} data-section="studio_packs" data-id={studio.slug}>
+        <header className="ppx-sm-head">
+          <span className="ppx-sm-seal" aria-hidden="true">
+            <Icon id="i-crown" />
+          </span>
+          <div>
+            <span className="ppx-sm-kicker">
+              {t('Проверенная студия')} <Icon id="i-check" />
+            </span>
+            <h3>{studio.name}</h3>
+            <span className="ppx-sm-sub">
+              {list
+                ? list.length +
+                  ' ' +
+                  packWord(list.length) +
+                  (exclusive ? ' · ' + t('{n} эксклюзив', { n: exclusive }) : '') +
+                  (exclusive && translated ? ' · ' + t('{n} на русском', { n: translated }) : '')
+                : t('Сборки студии')}
+            </span>
+          </div>
+          <button className="ppx-sm-x" aria-label={t('Закрыть')} data-track="studio_close" onClick={onClose}>
+            <Icon id="i-x" />
+          </button>
+        </header>
+
+        {list && list.length > 1 ? (
+          <div className="ppx-sm-tools">
+            <div className="ppx-sm-chips-row" role="group" aria-label={t('Жанр')}>
+              <button
+                className={'ppx-sm-chip' + (!genre ? ' on' : '')}
+                aria-pressed={!genre}
+                data-track="studio_genre"
+                data-id="all"
+                onClick={() => setGenre(null)}
+              >
+                <Icon id="i-flame" /> {t('Топ')}
+              </button>
+              {genres.map((g) => (
+                <button
+                  key={g.id}
+                  className={'ppx-sm-chip' + (genre === g.id ? ' on' : '')}
+                  aria-pressed={genre === g.id}
+                  data-track="studio_genre"
+                  data-id={g.id}
+                  onClick={() => setGenre(genre === g.id ? null : g.id)}
+                >
+                  {g.label} <i>{g.n}</i>
+                </button>
+              ))}
+            </div>
+            {list.length > 6 ? (
+              <label className="input ppx-sm-search">
+                <Icon id="i-search" />
+                <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={t('Найти сборку')} aria-label={t('Найти сборку')} />
+              </label>
+            ) : null}
+          </div>
+        ) : null}
+
+        <div className="ppx-sm-scroll">
+          <div className="ppx-sm-grid">
+            {failed ? (
+              <div className="ppx-sm-empty">
+                <span>{t('Список не загрузился')}</span>
+                <button className="btn sm secondary" onClick={() => setTick(tick + 1)}>
+                  <Icon id="i-restart" /> {t('Повторить')}
+                </button>
+              </div>
+            ) : !list ? (
+              Array.from({ length: 8 }, (_, i) => <span key={i} className="skel ppx-sm-skel" />)
+            ) : shown.length ? (
+              shown.map(({ p, dl }) => {
+                const top = rank.get(p.slug)
+                const here = p.slug === current
+                const have = installed.has(p.slug)
+                return (
+                  <button
+                    key={p.slug}
+                    className={'ppx-sm-card' + (here ? ' on' : '') + (p.accessRequired ? ' prem' : '') + (top ? ' top' : '')}
+                    aria-current={here ? 'page' : undefined}
+                    data-track="studio_pack"
+                    data-id={p.slug}
+                    onClick={() => open(p)}
+                  >
+                    <span className="ppx-sm-art">
+                      {p.cover ? <img src={mirrorAsset(p.cover)} alt="" loading="lazy" draggable={false} /> : null}
+                      {here ? (
+                        <span className="ppx-sm-tag here">{t('Вы здесь')}</span>
+                      ) : p.protectedContent ? (
+                        <span className="ppx-sm-tag gold">
+                          <Icon id="i-crown" /> {t('Эксклюзив')}
+                        </span>
+                      ) : p.accessRequired ? (
+                        <span className="ppx-sm-tag gold">
+                          <Icon id="i-crown" /> {t('Премиум')}
+                        </span>
+                      ) : null}
+                      {have ? (
+                        <span className="ppx-sm-tag have">
+                          <Icon id="i-check" /> {t('Установлено')}
+                        </span>
+                      ) : null}
+                      {top ? (
+                        <span className="ppx-sm-rank" aria-label={t('Топ {n}', { n: top })}>
+                          <i>#</i>
+                          {top}
+                        </span>
+                      ) : null}
+                    </span>
+                    <span className="ppx-sm-body">
+                      {p.protectedContent ? (
+                        <span className="ppx-sm-kind ex">
+                          <Icon id="i-crown" /> {t('Эксклюзив · сделана студией')}
+                        </span>
+                      ) : (
+                        <span className="ppx-sm-kind ru">
+                          <i>RU</i> {t('Переведена на русский')}
+                        </span>
+                      )}
+                      <b title={p.title}>{shortTitle(p.title)}</b>
+                      {p.summary ? <span className="ppx-sm-pitch">{shortPitch(p.summary)}</span> : null}
+                      <span className="ppx-sm-meta">
+                        {p.game ? <span>{p.game}</span> : null}
+                        {p.loader ? <span>{RU_LOADER(p.loader)}</span> : null}
+                        {dl > 0 ? (
+                          <em title={t('{n} скачиваний', { n: dl.toLocaleString(intlTag()) })}>
+                            <Icon id="i-download" />
+                            {downloadsShort(dl)}
+                          </em>
+                        ) : null}
+                      </span>
+                    </span>
+                  </button>
+                )
+              })
+            ) : (
+              <div className="ppx-sm-empty">
+                <span>{query ? t('Ничего не нашли по «{q}»', { q }) : t('В этом жанре сборок нет')}</span>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}

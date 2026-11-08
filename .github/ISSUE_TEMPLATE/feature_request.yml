@@ -1,0 +1,45 @@
+name: Suggestion
+description: An idea to make the launcher better
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the task, not a ready solution. When we understand what exactly is hard,
+        we often find a solution that is simpler and better than the first one.
+        Please write in English.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does it solve
+      description: What does not work or takes your time. If you can, give a concrete example from your own use.
+      placeholder: |
+        I keep five instances for different servers and look for the right one by eye each time.
+        The names are similar and the order changes after a launch.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: How you work around it now
+      description: What you do instead, in the launcher, by hand or in other programs. Or "nothing".
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: How it could work
+      description: Optional. If you have an idea for a solution or an example from another launcher, tell us.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else we should know
+      description: Platform, how you use it, screenshots or sketches.
+    validations:
+      required: false

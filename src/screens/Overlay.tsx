@@ -1,0 +1,313 @@
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Icon } from '../components/Icon'
+import { t, useT } from '../i18n'
+import { SvgSprite } from '../components/SvgSprite'
+import { tauri } from '../ipc/tauri'
+import { overlayCleared, overlayHide, overlayHitAreas, overlayOpen, overlayReady, overlayState } from '../ipc/commands'
+import { CARD_TTL_MS, clampCardTtl, freshCards, holdCards } from '../lib/overlayCards'
+import { Head } from '../components/Head'
+import { OverlayChat, type OverlayTarget } from '../components/OverlayChat'
+
+interface OverlayMessage {
+  uid: string
+  nick: string
+  text: string
+  ts: number
+  kind?: 'msg' | 'online' | 'play' | 'streak'
+  nicks?: string[]
+  open?: 'chat' | 'room' | 'friends' | 'call' | 'daily'
+}
+
+interface Card extends OverlayMessage {
+  /// Not a timestamp: hovering a card stops its clock, so the deadline moves.
+  expires: number
+}
+
+const CARDS_SHOWN = 3
+const TTL_SEGMENTS = 16
+
+const KIND_TAG = (): Record<NonNullable<OverlayMessage['kind']>, string> => ({
+  msg: t('Сообщение'),
+  online: t('В сети'),
+  play: t('В игре'),
+  streak: t('Серия'),
+})
+
+const playingPrefix = () => t('Играет · {where}', { where: '' })
+
+/// The server a friend plays on is the part worth reading, so it takes the card's colour.
+function cardText(m: OverlayMessage) {
+  const prefix = playingPrefix()
+  if (m.kind !== 'play' || !m.text.startsWith(prefix)) return m.text
+  return (
+    <>
+      {prefix}
+      <em>{m.text.slice(prefix.length)}</em>
+    </>
+  )
+}
+
+const HISTORY = 24
+/// A window shown for a card that never arrived must not stay: it is
+/// full-screen, always on top and has no close button of its own.
+const EMPTY_TTL_MS = 4_000
+
+/// The overlay owns no polling of its own: two pollers would share one `since`
+/// cursor and eat each other's messages. The main window relays what it got.
+export function Overlay() {
+  const t = useT()
+  const [interactive, setInteractive] = useState(false)
+  const [msgs, setMsgs] = useState<Card[]>([])
+  const [hover, setHover] = useState(false)
+  const [tick, setTick] = useState(0)
+  const [to, setTo] = useState<OverlayMessage | null>(null)
+  /// Set while the core waits to hide the window: a hidden window keeps its last
+  /// frame and shows it again on the next show, so that frame has to be empty.
+  const [clearSeq, setClearSeq] = useState<number | null>(null)
+  const cardsRef = useRef<HTMLDivElement>(null)
+  const heldSince = useRef(0)
+  const sentHit = useRef('')
+  /// How long a card lives is a setting, and the listeners below are registered
+  /// once: they read the current value through the ref, not through a closure
+  /// captured before the core answered.
+  const [ttl, setTtl] = useState(CARD_TTL_MS)
+  const ttlRef = useRef(CARD_TTL_MS)
+  ttlRef.current = ttl
+
+  useEffect(() => {
+    void overlayState()
+      .then((s) => setTtl(clampCardTtl(s.cardMs)))
+      .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    const T = tauri()
+    if (!T) return
+    const offs: Array<() => void> = []
+    void T.event
+      .listen<boolean>('overlay-mode', (e) => {
+        setInteractive(e.payload)
+        setClearSeq(null)
+        // The core drops the hit areas whenever the window goes down, so an
+        // unchanged stack after a re-show would be drawn over dead rectangles.
+        sentHit.current = ''
+      })
+      .then((un) => offs.push(un))
+      .catch(() => {})
+    void T.event
+      .listen<OverlayMessage>('overlay-message', (e) => {
+        const m = { ...e.payload, ts: e.payload.ts || Date.now(), expires: Date.now() + ttlRef.current }
+        setMsgs((prev) => prev.concat([m]).slice(-HISTORY))
+        if (!m.kind || m.kind === 'msg') setTo((cur) => cur || m)
+      })
+      .then((un) => offs.push(un))
+      .catch(() => {})
+    void T.event
+      .listen<number>('overlay-clear', (e) => setClearSeq(e.payload))
+      .then((un) => offs.push(un))
+      .catch(() => {})
+    void T.event
+      .listen<boolean>('overlay-hover', (e) => setHover(e.payload))
+      .then((un) => offs.push(un))
+      .catch(() => {})
+    // The card that was clicked decides who the reply goes to: the chat opens on
+    // that conversation instead of whatever arrived last.
+    void T.event
+      .listen<OverlayMessage>('overlay-open', (e) => {
+        const m = { ...e.payload, ts: e.payload.ts || Date.now(), expires: Date.now() + ttlRef.current }
+        if (!m.kind || m.kind === 'msg') setTo(m)
+      })
+      .then((un) => offs.push(un))
+      .catch(() => {})
+    void overlayReady().catch(() => {})
+    return () => offs.forEach((un) => un())
+  }, [])
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') void overlayHide()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [])
+
+  // Passive mode is a HUD, not a window: only fresh cards are drawn, and the
+  // rest of the screen must stay clickable for the game underneath.
+  const now = Date.now()
+  const fresh = freshCards(msgs, now, CARDS_SHOWN)
+
+  // Reading a card takes longer than showing it: the pointer on the stack holds
+  // the deadlines, which resume where they stopped - up to the card ceiling, so
+  // a cursor left in that corner cannot make a card permanent.
+  useEffect(() => {
+    if (interactive) return
+    if (hover) {
+      heldSince.current = Date.now()
+      return
+    }
+    const held = heldSince.current ? Date.now() - heldSince.current : 0
+    heldSince.current = 0
+    if (held > 0) setMsgs((prev) => holdCards(prev, held))
+  }, [hover, interactive])
+
+  useEffect(() => {
+    if (interactive) return
+    // An always-on-top window with nothing left to show still costs a
+    // compositor layer over the game, so it goes away with its last card.
+    // A freshly created window may have no card yet, but waiting forever is how
+    // an empty overlay ends up covering the whole screen with no way out.
+    if (!fresh.length) {
+      const t = setTimeout(() => void overlayHide().catch(() => {}), msgs.length ? 0 : EMPTY_TTL_MS)
+      return () => clearTimeout(t)
+    }
+    // The tick also runs under the pointer: hovering only postpones a card up
+    // to its ceiling, and someone has to notice when that ceiling is reached.
+    const t = setTimeout(() => setTick((n) => n + 1), 500)
+    return () => clearTimeout(t)
+  }, [msgs, interactive, hover, fresh.length, tick])
+
+  // The window is click-through as a whole and the core lifts that flag only
+  // over the rectangles reported here, so a stale rectangle is a hole the game
+  // loses clicks in: they are re-sent on every change of the stack.
+  useLayoutEffect(() => {
+    const box = cardsRef.current
+    const rects =
+      interactive || !box
+        ? []
+        : Array.from(box.querySelectorAll('.ov-card')).map((el) => {
+            const r = el.getBoundingClientRect()
+            return [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)]
+          })
+    const key = JSON.stringify(rects)
+    if (key === sentHit.current) return
+    sentHit.current = key
+    void overlayHitAreas(rects).catch(() => {})
+  }, [interactive, fresh.length, msgs, tick])
+
+  // The second frame is the first one painted after the empty render reached
+  // the DOM; answering earlier would let the window hide on the old frame.
+  useLayoutEffect(() => {
+    if (clearSeq === null) return
+    let second = 0
+    const first = requestAnimationFrame(() => {
+      second = requestAnimationFrame(() => void overlayCleared(clearSeq).catch(() => {}))
+    })
+    return () => {
+      cancelAnimationFrame(first)
+      cancelAnimationFrame(second)
+    }
+  }, [clearSeq])
+
+  const dismiss = useCallback((card: Card) => {
+    setMsgs((prev) => {
+      const left = prev.filter((m) => !(m.uid === card.uid && m.ts === card.ts))
+      if (!freshCards(left, Date.now(), CARDS_SHOWN).length) void overlayHide().catch(() => {})
+      return left
+    })
+  }, [])
+
+  const payloadOf = (m: OverlayMessage): OverlayMessage => ({
+    uid: m.uid,
+    nick: m.nick,
+    text: m.text,
+    ts: m.ts,
+    kind: m.kind,
+    nicks: m.nicks,
+    open: m.open,
+  })
+
+  const openCard = useCallback((card: Card) => {
+    // Серия и сундук живут в окне лаунчера, а не в чате поверх игры.
+    void overlayOpen(payloadOf(card), card.open === 'daily').catch(() => {})
+  }, [])
+
+  const openInLauncher = useCallback((target: OverlayTarget | null) => {
+    const payload: OverlayMessage = target
+      ? { uid: target.id, nick: target.title, text: '', ts: Date.now(), open: target.room ? 'room' : 'chat' }
+      : { uid: '', nick: '', text: '', ts: Date.now(), open: 'friends' }
+    void overlayOpen(payload, true).catch(() => {})
+  }, [])
+
+  /// The card that brought the overlay up decides which conversation opens; a
+  /// group card carries a room id, not a person, and the two are not addressed
+  /// the same way.
+  const chatTarget: OverlayTarget | null = to
+    ? { id: to.uid, room: to.open === 'room', title: to.nick }
+    : null
+
+  if (clearSeq !== null) return <div className="ov ov-passive" />
+
+  if (!interactive) {
+    return (
+      <div className="ov ov-passive">
+        <SvgSprite />
+        <div className={'ov-cards' + (hover ? ' held' : '')} ref={cardsRef}>
+          {fresh.map((m) => (
+            <div
+              // The kind goes into its own namespace: `ov-` + kind once produced
+              // `ov-msg`, the chat bubble class of the interactive panel, and a
+              // later rule with the same specificity took the card apart.
+              className={'ov-card ov-kind-' + (m.kind || 'msg')}
+              key={m.uid + m.ts}
+              role="button"
+              tabIndex={-1}
+              title={m.open === 'call' || m.open === 'friends' || m.open === 'daily' ? t('Открыть лаунчер') : t('Открыть чат')}
+              onClick={() => openCard(m)}
+            >
+              <div className="ov-card-heads">
+                {m.kind === 'streak' ? (
+                  <span className="ov-card-ic">
+                    <Icon id="i-flame" />
+                  </span>
+                ) : (
+                  <>
+                    {(m.nicks?.length ? m.nicks : [m.nick]).slice(0, 3).map((n, i) => (
+                      <span className="ov-card-hd" key={n + i}>
+                        <Head nick={n} size={40} />
+                      </span>
+                    ))}
+                    <span className="ov-card-dot" />
+                  </>
+                )}
+              </div>
+              <div className="ov-card-body">
+                <b>{m.nick}</b>
+                <span>{cardText(m)}</span>
+              </div>
+              <span className="ov-card-tag">{KIND_TAG()[m.kind || 'msg']}</span>
+              <button
+                className="ov-card-x"
+                title={t('Скрыть')}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  dismiss(m)
+                }}
+              >
+                <Icon id="i-x" />
+              </button>
+              <span className="ov-card-ttl">
+                {Array.from({ length: TTL_SEGMENTS }, (_, k) => (
+                  <i key={k} style={{ animationDelay: Math.round((ttl * (TTL_SEGMENTS - k)) / TTL_SEGMENTS) + 'ms' }} />
+                ))}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="ov ov-active" onMouseDown={(e) => e.target === e.currentTarget && void overlayHide()}>
+      <SvgSprite />
+      <div className="ov-panel" onMouseDown={(e) => e.stopPropagation()}>
+        <OverlayChat
+          target={chatTarget}
+          signal={msgs.length}
+          onClose={() => void overlayHide()}
+          onLauncher={openInLauncher}
+        />
+      </div>
+    </div>
+  )
+}

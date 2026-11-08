@@ -1,0 +1,561 @@
+import { useEffect, useState } from 'react'
+import { Icon } from '../components/Icon'
+import { tx, useMarketOffers, useT } from '../i18n'
+import { BuildIcon } from '../components/playhub/BuildIcon'
+import { Installs } from '../components/Installs'
+import { RunningGames } from '../components/lobby/RunningGames'
+import { LobbyFigure } from '../components/lobby/LobbyFigure'
+import { EmoteBubble } from '../components/lobby/EmoteBubble'
+import { PartyBar } from '../components/lobby/PartyBar'
+import { PartyPanel } from '../components/lobby/PartyPanel'
+import { isLeader, leaveParty, loadParty, partyWithOthers, usePartyStore } from '../state/party'
+import { stopMateSearch, useMateSearch } from '../state/mateSearch'
+import { partyPlayPressed } from '../lib/partyPlay'
+import { Recommend } from '../components/lobby/Recommend'
+import { AnarchyArt } from '../components/playhub/AnarchyTile'
+import { targetsAnarchy } from '../lib/ownServer'
+import { PixelField } from '../components/lobby/PixelField'
+import { LobbyAmbience } from '../components/lobby/LobbyAmbience'
+import { HubTile } from '../components/lobby/HubTile'
+import { useHeroWallpaper } from '../components/HeroWallpaper'
+import { LOADER_NAME, fmtN, fmtPlaytime } from '../lib/format'
+import { VIDEOS } from '../lib/wallpaper'
+import { hasTauri } from '../ipc/tauri'
+import { useProfiles } from '../state/profiles'
+import { useLobby } from '../state/lobbyMode'
+import type { LobbyMode } from '../state/lobbyMode'
+import { playMode } from '../lib/lobbyPlay'
+import { usePackUpdateHint } from '../lib/packUpdateHint'
+import { usePremiumBuild } from '../lib/premiumBuild'
+import { useWallpaper } from '../state/wallpaper'
+import { convertFileSrc, pickWallpaper } from '../ipc/commands'
+import { setScreen, showToast, useUi } from '../state/ui'
+import { cancelPrelaunch, launchInProgress } from '../lib/launch'
+import { scheduleLaunchWarm } from '../lib/launchWarm'
+import { playButtonState } from '../lib/launchView'
+import { playHoursLabel, playTier } from '../lib/playTiers'
+import { isDayZero } from '../lib/retention'
+import { LobbyChips } from '../components/lobby/LobbyChips'
+import { PlayChest } from '../components/lobby/PlayChest'
+import { DailyPassModal } from '../components/daily/DailyPassModal'
+import { useDailyModalHost } from '../components/daily/DailyChest'
+import { useDaily } from '../state/daily'
+import { usePromo } from '../state/promo'
+import { ANARCHY, anarchyMode } from '../lib/ownServer'
+import { useFirstHourChest } from '../lib/firstHourChest'
+import { useModUpdates } from '../state/modUpdates'
+import { usePlayStats } from '../state/playStats'
+import { stopRunningGame, useGame } from '../state/game'
+// Пиксельный слой главного экрана. Пока файл не подключён в main.tsx,
+// импорт стоит здесь — иначе полки стоят без своих правил.
+import '../styles/pixel/play.css'
+import '../styles/pixel/lobby.css'
+import '../styles/pixel/retention.css'
+import '../styles/pixel/party.css'
+import { TIERS_SECTION_PUBLIC } from '../lib/tiersSection'
+import { liveInterval } from '../lib/liveInterval'
+
+/* Разделы на лобби, как в Brawl Stars: у каждого ровно один вход (владелец
+   23.09.2026: «всё дублируется»). Режимы и каталог открывает плашка «Что
+   играем сегодня», гардероб — кнопка под персонажем, друзей — список справа,
+   настройки — шестерёнка в углу. Слева под сундуком — плитки «Магазин» и
+   «Свой сервер» (HubTile). */
+
+/**
+ * Пустая плашка режима: вместо значка-сетки по очереди сменяются обложки —
+ * версии, сборки, режимы, как барабан (правка владельца 23.09.2026, 21:45).
+ */
+const REEL = [
+  '/versions/26.3.webp',
+  '/versions/1.20.1.webp',
+  '/versions/1.21.11.webp',
+  '/versions/26.2.webp',
+  '/versions/1.21.4.webp',
+  '/versions/1.16.5.webp',
+  '/versions/1.12.2.webp',
+]
+function ModeReel() {
+  const [i, setI] = useState(0)
+  useEffect(() => {
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) return
+    // Игра поверх — картинки не листаются: каждая смена декодирует новую.
+    return liveInterval(() => setI((n) => (n + 1) % REEL.length), 2600)
+  }, [])
+  return <img key={i} className="lobby-mode-reel" src={REEL[i]} alt="" />
+}
+
+export function Play({ on }: { on: boolean }) {
+  const t = useT()
+  const profiles = useProfiles((s) => s.profiles)
+  const picked = useLobby((s) => s.picked)
+  const lobbyServers = useLobby((s) => s.servers)
+  const loadLobby = useLobby((s) => s.load)
+  const wp = useWallpaper()
+  // Обои убраны (владелец 23.09.2026): фон — только цветная сцена PixelField.
+  const hero = useHeroWallpaper(false)
+  const updates = useModUpdates()
+  const playStats = usePlayStats((s) => s.stats)
+  const statsLoaded = usePlayStats((s) => s.loaded)
+  const passOpen = useDaily((s) => s.modal)
+  const modalHost = useDailyModalHost()
+  const anarchyLobby = usePromo((s) => s.promo.lobby === ANARCHY.mode)
+  const anarchyPromo = useMarketOffers('partners') && anarchyLobby
+  const running = useGame((s) => s.list)
+  const gameStopping = useGame((s) => s.stopping)
+  // Ход подготовки к запуску — прямо на кнопке: скачиваем → запускаем → в игре.
+  const prelaunch = useUi((s) => s.prelaunch)
+  const party = usePartyStore((s) => s.party)
+  const partyMe = usePartyStore((s) => s.me)
+  const inParty = partyWithOthers(party)
+  const partyMember = inParty && !isLeader(party, partyMe)
+  const partyReady = partyMember && !!party?.members.find((m) => m.userId === partyMe)?.ready
+  const searching = useMateSearch((s) => s.searching)
+  // Лобби в режиме пати (владелец 12.10.2026): идёт поиск или пати собрана —
+  // баннер, плитки и сундук уходят, на их месте состав, голос и чат.
+  const social = inParty || searching || !!party?.room?.open
+  // Пати договорилась о другом, чем стоит у меня: плашка показывает общий выбор.
+  const partyGoes = (inParty || party?.room?.open) && party?.target ? party.target.title : null
+  const hoursOf = (name: string) => playStats.builds.find((b) => b.key === name) || null
+
+  useEffect(() => {
+    if (on && profiles.length && profiles.length !== updates.scannedCount && !updates.scanning)
+      void updates.scan()
+  }, [on, profiles.length])
+
+  useEffect(() => {
+    if (on) void loadLobby()
+  }, [on])
+
+  // Re-sync the party on every return to the lobby: a realtime «party» push can
+  // be missed while another screen is open, and a stale figure left standing
+  // from a party we were already removed from must not linger.
+  useEffect(() => {
+    if (on) void loadParty().catch(() => {})
+  }, [on])
+
+  // Часы на «Играть»: статистику лобби грузит само, не ждёт «Во что играем».
+  useEffect(() => {
+    if (on) void usePlayStats.getState().refresh()
+  }, [on])
+
+
+  useEffect(() => {
+    if (!wp.popOpen) return
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as HTMLElement
+      if (t.closest('#wpPop')) return
+      wp.setPopOpen(false)
+    }
+    document.addEventListener('click', onDoc)
+    return () => document.removeEventListener('click', onDoc)
+  }, [wp.popOpen])
+
+  // «Что играем сегодня» — только то, что человек выбрал сам (в каталоге
+  // режимов или запуском). Ничего не подставляем: «Играть» без выбора ведёт
+  // в каталог, а не молча запускает сборку дня (владелец 23.09.2026).
+  const tier = playTier(playStats.total_seconds)
+  // Первый день (игра ни разу не запускалась): одна сборка и одна «Играть»
+  // вместо каталога — сразу наш сервер или свежая ванилла (ресёрч 06.10.2026:
+  // половина ушедших в день установки так и не запустила игру).
+  const dayZero = isDayZero({ ...playStats, loaded: statsLoaded }, running.length > 0 || prelaunch.open)
+  const chosen: LobbyMode | null =
+    picked && (picked.kind !== 'build' || profiles.some((p) => p.name === picked.name)) ? picked : null
+  const mode: LobbyMode | null =
+    chosen ?? (dayZero ? (anarchyPromo ? anarchyMode() : { kind: 'version', version: '1.21.11' }) : null)
+  useFirstHourChest(on, playStats.total_seconds)
+  const sel = mode && mode.kind === 'build' ? profiles.find((p) => p.name === mode.name) || null : null
+  // Сборку «Сегодня играем» ядро готовит, пока на неё смотрят (2 с без касаний): «Играть» потом
+  // сразу запускает игру (lib/launchWarm.ts).
+  const warmTarget = on && sel ? sel.name : null
+  useEffect(() => scheduleLaunchWarm(warmTarget, launchInProgress), [warmTarget])
+  const packUpdate = usePackUpdateHint(mode, profiles, on)
+  const premiumBuild = usePremiumBuild(sel ? sel.name : null, on)
+  const cardKind = mode ? (premiumBuild ? 'premium' : mode.kind) : null
+  const btn = playButtonState({ modeKind: mode ? mode.kind : null, selected: sel ? sel.name : null, running, prelaunch })
+  const selHours = sel ? hoursOf(sel.name) : null
+  const liveServer = mode && mode.kind === 'server' ? lobbyServers.find((s) => s.slug === mode.slug) || null : null
+
+  // Для аналитики: что стоит в «Сегодня играем» (имя своей сборки — только как id сборки).
+  const modeId =
+    mode?.kind === 'build'
+      ? mode.name
+      : mode?.kind === 'version'
+        ? mode.version
+        : mode?.kind === 'premium'
+          ? mode.slug || mode.id
+          : mode?.kind === 'server'
+            ? mode.slug
+            : undefined
+
+  const modeArt =
+    mode?.kind === 'build' && premiumBuild ? (
+      premiumBuild.cover ? <img src={premiumBuild.cover} alt="" /> : null
+    ) : mode?.kind === 'build' ? (
+      // Иконка сборки крупно по центру — как на карточке «Моих сборок»
+      // (владелец 24.09.2026: мелкий сундук в углу).
+      <span className="lobby-mode-cover lobby-mode-bi">
+        <BuildIcon icon={sel?.icon} name={sel?.name || mode.name} size={104} />
+      </span>
+    ) : mode?.kind === 'version' ? (
+      <img src={'/versions/' + mode.version + '.webp'} alt="" onError={(e) => (e.currentTarget.style.display = 'none')} />
+    ) : mode?.kind === 'premium' ? (
+      mode.cover ? <img src={mode.cover} alt="" /> : null
+    ) : mode?.kind === 'server' ? (
+      targetsAnarchy(mode) ? (
+        <AnarchyArt />
+      ) : mode.banner || mode.logo ? <img src={(mode.banner || mode.logo) as string} alt="" /> : null
+    ) : (
+      <ModeReel />
+    )
+  const modeTitle =
+    mode?.kind === 'build' ? mode.name : mode?.kind === 'version' ? 'Minecraft ' + mode.version : mode?.kind === 'premium' ? mode.title : mode?.kind === 'server' ? mode.name : t('Ещё не выбрано')
+  const partyOther = !!partyGoes && partyGoes !== modeTitle
+  const modeMeta =
+    mode?.kind === 'build' && sel ? (
+      <>
+        {LOADER_NAME(sel) + ' · ' + sel.version}
+        {/* «меньше минуты» не пишем — это пустяк, а не наигранные часы */}
+        {selHours && selHours.seconds >= 3600 ? (
+          <span className="hero-num">
+            <Icon id="i-clock" />
+            <b>{fmtPlaytime(selHours.seconds)}</b>
+          </span>
+        ) : null}
+      </>
+    ) : mode?.kind === 'version' ? (
+      'Fabric'
+    ) : mode?.kind === 'premium' ? (
+      mode.meta
+    ) : mode?.kind === 'server' && liveServer ? (
+      <span className="hero-num">
+        <Icon id="i-users" />
+        <b>{fmtN(liveServer.online)}</b>
+      </span>
+    ) : null
+  const modeTag =
+    mode?.kind === 'premium' || premiumBuild ? (
+      <>
+        <Icon id="i-crown" />
+        {t('Премиум')}
+      </>
+    ) : mode?.kind === 'server' ? (
+      <>
+        <Icon id="i-server" />
+        {t('Сервер')}
+      </>
+    ) : null
+
+  return (
+    <section className={'screen lobby' + (social ? ' lobby-social' : '') + (on ? ' on' : '')} id="s-play">
+      <div className="hero-live-wrap lobby-wrap">
+      <div
+        className="hero-live"
+        id="heroLive"
+        ref={hero.wrapRef}
+        onMouseMove={hero.onMouseMove}
+        onMouseLeave={hero.onMouseLeave}
+      >
+        <PixelField on={on} />
+        <LobbyAmbience on={on} />
+
+      </div>
+      <LobbyFigure />
+      <PartyBar on={on} />
+      <EmoteBubble />
+      {/* Баннер справа виден всем, и новичкам тоже: реклама на самом видном месте (владелец 11.10.2026). */}
+      {social ? <PartyPanel on={on} mode={mode} modeTitle={modeTitle} /> : <Recommend on={on} />}
+      {/* Левый край — как в Brawl Stars: крупный сундук и под ним разделы.
+          Боковой полосы на главной нет (владелец 23.09.2026). */}
+      {/* Ежедневный бонус живёт в магазине (правка владельца 21:43): плитки
+          бонуса нет, у «Магазина» «!», пока бонус не забран. */}
+      {/* Плитки остаются и в пати (владелец 12.10.2026: «не убирай элементы, вместо баннера — виджет пати»). */}
+      <div className="lobby-left">
+        <nav className="lobby-nav" aria-label={t('Разделы')}>
+          <HubTile kind="shop" />
+          {TIERS_SECTION_PUBLIC ? <HubTile kind="pvp" /> : null}
+          <HubTile kind="wardrobe" />
+          <HubTile kind="server" />
+        </nav>
+      </div>
+      {/* Кнопки пати стоят над «Играть» всегда: «Найти пати» на том же месте становится «Отменой». */}
+      <div className="lobby-who">
+        <LobbyChips on={on} />
+      </div>
+
+      <div className={'lobby-side' + (dayZero ? ' day0' : '')}>
+        {/* Downloads sit above the play card: in the window corner they covered
+            the card on narrow screens. */}
+        <Installs inLobby />
+        <RunningGames />
+        {/* Над рядом — подпись и мелкие действия сборки; сам ряд — плашка
+            режима и «Играть» одной высоты, как в Brawl Stars. */}
+        <div className="lobby-side-top">
+          <span />
+          <span className="lobby-tools" />
+        </div>
+        <div className="lobby-row">
+          {/* OneBlock в лобби убран (владелец 24.09.2026, 07:26: «пока убираем»). */}
+          {/* Плашка ведёт в каталог режимов, «Играть» — только запуск. */}
+          <button
+            className="lobby-mode"
+            data-sound="open"
+            data-track="today"
+            data-section="today"
+            data-src="today"
+            data-kind={mode?.kind}
+            data-id={modeId}
+            data-private={mode?.kind === 'build' ? '' : undefined}
+            onClick={() => setScreen('playhub')}
+          >
+            {/* Панель на всю ширину (правка владельца 22:44): крупная обложка
+                меняется раз в пару секунд — «загляни, может найдёшь интереснее». */}
+            <span className={'lobby-mode-card' + (cardKind ? ' kind-' + cardKind : ' empty')}>
+              <span className="lobby-mode-art">
+                {mode && !partyOther ? modeArt : null}
+                <span className={'lobby-mode-reelbox' + (mode && !partyOther ? ' under' : '')}>
+                  <ModeReel />
+                </span>
+                {modeTag && !partyOther ? <span className="mode-tile-tag">{modeTag}</span> : null}
+              </span>
+              <span className="lobby-mode-body">
+                <span className="lobby-mode-lab">{partyGoes ? t('Пати идёт') : dayZero && !chosen ? t('Начни отсюда') : t('Сегодня играем')}</span>
+                <b>{partyGoes || modeTitle}</b>
+                {modeMeta && !partyOther ? <span className="meta">{modeMeta}</span> : null}
+                <span className="lobby-mode-change">
+                  {t('Сменить сборку')}
+                  <Icon id="i-chev-r" />
+                </span>
+                {packUpdate ? (
+                  <span className="meta" id="lobbyPackUpdate">
+                    <span className="hero-num">
+                      <Icon id="i-download" />
+                      {t('Доступно обновление сборки')}
+                    </span>
+                  </span>
+                ) : null}
+              </span>
+            </span>
+          </button>
+          {/* Кнопка запуска стоит на постоянном месте и видна на первом кадре:
+              наведение её не вызывает и не прячет (антипаттерн Modrinth). */}
+          <div className="play-col">
+          {btn.kind === 'stop' ? (
+            <button
+              className="btn lg stop"
+              id="playBtn"
+              data-track="stop_game"
+              data-kind={mode?.kind}
+              data-id={modeId}
+              data-private={mode?.kind === 'build' ? '' : undefined}
+              disabled={gameStopping}
+              onClick={() => stopRunningGame(btn.profile)}
+            >
+              <span className="lbl">
+                <Icon id="i-power" />
+                <span id="playLbl">{gameStopping ? t('Останавливаем…') : t('Остановить')}</span>
+              </span>
+            </button>
+          ) : (
+            <button
+              className={'btn lg primary' + (btn.kind === 'installing' ? ' loading' : '')}
+              id="playBtn"
+              data-track="play"
+              data-src="lobby_play"
+              data-kind={mode?.kind}
+              data-id={modeId}
+              data-private={mode?.kind === 'build' ? '' : undefined}
+              data-sound={mode ? undefined : 'open'}
+              onClick={() => {
+                // Второе нажатие во время подготовки — отмена запуска
+                // (владелец 24.09.2026, 17:26).
+                if (btn.kind === 'installing') {
+                  cancelPrelaunch()
+                  return
+                }
+                if (inParty) {
+                  void partyPlayPressed(mode)
+                  return
+                }
+                if (!mode) {
+                  setScreen('playhub')
+                  return
+                }
+                if (!chosen) useLobby.getState().pick(mode)
+                void playMode(mode, profiles)
+              }}
+            >
+              <span className="fill" style={btn.kind === 'installing' ? { width: btn.pct + '%' } : undefined}></span>
+              <span className="lbl">
+                {btn.kind === 'installing' ? null : <Icon id="i-play" />}
+                <span id="playLbl">
+                  {btn.kind === 'installing' ? (
+                    <>
+                      <span className="play-stage">{tx(btn.stage)}</span>
+                      <span className="play-pct">
+                        <span className="spin" aria-hidden="true"></span>
+                        {btn.pct + '%'}
+                      </span>
+                    </>
+                  ) : inParty ? (
+                    <>
+                      {partyMember ? (partyReady ? t('Не готов') : t('Готов')) : t('Играть')}
+                      {/* В пати кнопка говорит, что запустит (владелец 12.10.2026). */}
+                      <span className="play-what">{party?.target ? party.target.title : mode ? modeTitle : t('Куда идём?')}</span>
+                    </>
+                  ) : (
+                    <>
+                      {t('Играть')}
+                      {/* Наиграно по всем сборкам — всегда, с нуля, со ступенью
+                          (владелец 06.10.2026: часы — повод похвастаться). */}
+                      <span className="play-hours">
+                        {tier.reached > 0 ? (
+                          <span className="play-tier" aria-label={t('Ступень {n}', { n: tier.reached })}>
+                            <Icon id="i-trophy" />
+                            {tier.reached}
+                          </span>
+                        ) : null}
+                        <b>{playHoursLabel(playStats.total_seconds)}</b>
+                        {tier.next ? (
+                          <span className="play-hours-bar" aria-hidden="true">
+                            <span style={{ width: Math.round(tier.progress * 100) + '%' }} />
+                          </span>
+                        ) : null}
+                      </span>
+                    </>
+                  )}
+                </span>
+              </span>
+            </button>
+          )}
+          {/* В пати — выход вместо сундука (владелец 11.10.2026): без него, когда
+              зашли незнакомцы и не жмут «Готов», уйти можно было только из меню на
+              фигурке, которое не находят. Соло — на том же месте сундук. */}
+          {searching && !inParty ? null : inParty ? (
+            <button
+              className="party-leave"
+              data-sound="nav"
+              data-track="party_leave"
+              onClick={() =>
+                void leaveParty().then(() => {
+                  // A running «Найти напарника» would let the next request in and
+                  // rebuild a party around us — leaving ends the search too.
+                  if (!usePartyStore.getState().party && useMateSearch.getState().searching) void stopMateSearch()
+                })
+              }
+            >
+              <Icon id="i-logout" />
+              {t('Выйти из пати')}
+            </button>
+          ) : (
+            <PlayChest on={on} dayZero={dayZero} />
+          )}
+          </div>
+          {btn.kind === 'installing' ? (
+            <button className="play-cancel" aria-label={t('Отменить запуск')} data-track="cancel_launch" onClick={cancelPrelaunch}>
+              <Icon id="i-x" />
+            </button>
+          ) : null}
+        </div>
+      </div>
+        <div className={'wp-pop' + (wp.popOpen ? ' open' : '')} id="wpPop">
+          <div className="cap">{t('Живые обои')}</div>
+          <div className="wp-grid" id="wpGrid">
+            <div
+              className={'wp-item wp-item-pixels' + (wp.wpCur === 'pixels' ? ' on' : '')}
+              data-id="pixels"
+              onClick={() => wp.pick('pixels', t('Сцена'))}
+            >
+              <span className="wp-item-ph" aria-hidden="true">
+                <Icon id="i-grid" />
+              </span>
+              <span>{t('Сцена')}</span>
+            </div>
+            {VIDEOS.map((v) => (
+              <div
+                key={v.id}
+                className={'wp-item' + (v.id === wp.wpCur ? ' on' : '')}
+                data-id={v.id}
+                onClick={() => wp.pick(v.id, v.name)}
+              >
+                <img
+                  src={v.poster}
+                  alt=""
+                  style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }}
+                />
+                <span>{v.name}</span>
+              </div>
+            ))}
+          </div>
+          {wp.gallery.length ? <div className="cap">{t('Мои фоны')}</div> : null}
+          <div className="wp-grid">
+            {wp.gallery.map((c) => (
+              <div
+                key={c.path}
+                className={'wp-item' + (wp.wpCur === 'custom' && wp.custom && wp.custom.path === c.path ? ' on' : '')}
+                onClick={() => wp.setCustom(c)}
+              >
+                {c.kind === 'video' ? (
+                  <span className="wp-item-ph">
+                    <Icon id="i-play" />
+                  </span>
+                ) : (
+                  <img
+                    src={convertFileSrc(c.path)}
+                    alt=""
+                    style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }}
+                  />
+                )}
+                <span>{c.name || t('Свой фон')}</span>
+                <button
+                  className="wp-item-del"
+                  aria-label={t('Удалить фон')}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    wp.removeCustom(c.path)
+                  }}
+                >
+                  <Icon id="i-trash" />
+                </button>
+              </div>
+            ))}
+            <div
+              className="wp-item wp-item-add"
+              onClick={() => {
+                if (!hasTauri()) {
+                  showToast(t('Загрузка своего фона доступна в приложении'), 'error')
+                  return
+                }
+                void pickWallpaper()
+                  .then((w) => {
+                    if (w) wp.addCustom({ kind: w.kind, path: w.path, name: w.name })
+                  })
+                  .catch((e) => {
+                    console.error('[wallpaper]', e)
+                    showToast(t('Не удалось загрузить фон'), 'error')
+                  })
+              }}
+            >
+              <span className="wp-item-ph">
+                <Icon id="i-upload" />
+              </span>
+              <span>{t('Загрузить')}</span>
+            </div>
+          </div>
+          <div className="wp-row">
+            <span className="lab">{t('Анимация')}</span>
+            <span
+              className={'tgl' + (wp.wpAnimOn ? ' on' : '')}
+              id="wpAnim"
+              onClick={(e) => {
+                e.stopPropagation()
+                wp.toggleAnim()
+              }}
+            ></span>
+          </div>
+        </div>
+      </div>
+
+      {modalHost ? <DailyPassModal open={passOpen} onClose={() => useDaily.getState().setModal(false)} /> : null}
+    </section>
+  )
+}

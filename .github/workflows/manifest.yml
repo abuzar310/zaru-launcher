@@ -1,0 +1,56 @@
+# Published to millida/launcher as manifest.yml. The sync deploy key cannot create
+# or change workflow files, so edits here must be pushed to the public
+# repository once by an account that can.
+#
+# После каждого релиза прикладывает к нему список версий latest.json: по нему
+# установщик с сайта ставит лаунчер. Так список версий, файл и его сумма берутся
+# с GitHub, а хранилище Millida остаётся зеркалом. Список кладётся только после
+# сверки с SHA256SUMS релиза — см. scripts/attach-manifest.mjs.
+name: Manifest
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Launcher release, for example v2.0.223 (empty: the latest)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: manifest-${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  attach:
+    name: Attach latest.json to the release
+    # The tag of the run that finished, not "the latest release": a cache build of
+    # main has no list to attach, and a beta never gets one.
+    if: >-
+      github.repository == 'millida/launcher'
+      && (github.event_name == 'workflow_dispatch'
+      || (github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.event == 'push'
+      && startsWith(github.event.workflow_run.head_branch, 'v')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Wait for the signed manifest, check it against the release, attach
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
+        run: |
+          if [ ! -f scripts/attach-manifest.mjs ]; then
+            echo "::notice::scripts/attach-manifest.mjs is not published yet, skipping"
+            exit 0
+          fi
+          node scripts/attach-manifest.mjs $TAG

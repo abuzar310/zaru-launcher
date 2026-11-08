@@ -1,0 +1,146 @@
+import { describe, expect, test } from 'bun:test'
+import { capeById, capeKey, contentFingerprint, dedupeCapes, textureHash } from './capes'
+
+const MOJANG = 'https://textures.minecraft.net/texture/'
+const HASH_A = 'a'.repeat(64)
+const HASH_B = 'b'.repeat(64)
+
+describe('ключ плаща', () => {
+  // (адрес → ключ, зачем кейс закреплён)
+  const cases: [string, string, string][] = [
+    [MOJANG + HASH_A, HASH_A, 'плащи лицензии опознаются по хешу текстуры, а не по адресу'],
+    [MOJANG + HASH_A.toUpperCase(), HASH_A.toUpperCase(), 'регистр в адресе Mojang встречается и остаётся значимым'],
+    ['https://cdn.millida.trade/launcher/capes/x-1.png', '', 'у наших плащей хеша в адресе нет'],
+    ['', '', 'пустой адрес не даёт ключа — такие карточки не схлопываются между собой'],
+  ]
+  for (const [url, expected, why] of cases) {
+    test(why, () => {
+      expect(textureHash(url)).toBe(expected)
+    })
+  }
+})
+
+test('плащ аккаунта и плащ каталога с одним адресом — одна карточка', () => {
+  const url = 'https://cdn.millida.trade/launcher/capes/e0f-2cf.png'
+  const list = dedupeCapes([
+    { url, name: 'Любимец', wardrobeId: 'w1' },
+    { url, name: 'dark_eremite', onAccount: true },
+  ])
+  expect(list.length).toBe(1)
+  expect(list[0].wardrobeId).toBe('w1')
+  // Признак «надет на аккаунте» обязан пережить схлопывание: по нему карточка
+  // помечается как активная.
+  expect(list[0].onAccount).toBe(true)
+})
+
+test('идентификаторы лицензии подмешиваются в выжившую карточку', () => {
+  const list = dedupeCapes([
+    { url: MOJANG + HASH_A, name: 'Migrator', wardrobeId: 'w1' },
+    { url: MOJANG + HASH_A, name: 'Migrator', accId: 'acc1', msId: 'ms1', active: true },
+  ])
+  expect(list.length).toBe(1)
+  expect(list[0].accId).toBe('acc1')
+  expect(list[0].msId).toBe('ms1')
+  expect(list[0].active).toBe(true)
+})
+
+test('разные плащи не схлопываются', () => {
+  const list = dedupeCapes([
+    { url: MOJANG + HASH_A, name: 'Migrator' },
+    { url: MOJANG + HASH_B, name: 'MineCon 2011' },
+    { url: 'https://cdn.millida.trade/launcher/capes/x.png', name: 'Путник' },
+  ])
+  expect(list.length).toBe(3)
+})
+
+test('копии одного плаща в каталоге аккаунта схлопываются по имени', () => {
+  // Прошлые версии перезаливали PNG на каждое «Применить»: адрес новый, имя то же.
+  const list = dedupeCapes([
+    { url: 'https://cdn.millida.trade/launcher/capes/e0f-1.png', name: 'Ветеран', wardrobeId: 'w1' },
+    { url: 'https://cdn.millida.trade/launcher/capes/e0f-2.png', name: ' ветеран ', wardrobeId: 'w2' },
+    { url: 'https://cdn.millida.trade/launcher/capes/e0f-3.png', name: 'Страж', wardrobeId: 'w3' },
+  ])
+  expect(list.map((c) => c.wardrobeId)).toEqual(['w1', 'w3'])
+})
+
+test('плащ за достижение и его двойник «Дизайн Mojang» — одна карточка', () => {
+  // Плащ, выданный каталогом, лежит в аккаунте своей копией на нашем хранилище:
+  // хеша Mojang в её адресе нет, и по адресу пара не схлопывалась.
+  const list = dedupeCapes([
+    { url: 'https://cdn.millida.trade/launcher/capes/mig.png', name: 'Переселенец', wardrobeId: 'w1' },
+    { url: MOJANG + HASH_A, name: 'Переселенец' },
+  ])
+  expect(list.length).toBe(1)
+  expect(list[0].wardrobeId).toBe('w1')
+})
+
+test('одинаковые байты схлопывают плащи с разными именами и адресами', () => {
+  const bytes = new Map([
+    ['https://cdn.millida.trade/launcher/capes/mig.png', 'data:image/png;base64,AAAA'],
+    [MOJANG + HASH_A, 'data:image/png;base64,AAAA'],
+    [MOJANG + HASH_B, 'data:image/png;base64,BBBB'],
+  ])
+  const list = dedupeCapes(
+    [
+      { url: 'https://cdn.millida.trade/launcher/capes/mig.png', name: 'Мой плащ', wardrobeId: 'w1' },
+      { url: MOJANG + HASH_A, name: 'Переселенец' },
+      { url: MOJANG + HASH_B, name: 'Ванильный' },
+    ],
+    (u) => {
+      const data = bytes.get(u)
+      return data ? contentFingerprint(data) : undefined
+    },
+  )
+  expect(list.map((c) => c.name)).toEqual(['Мой плащ', 'Ванильный'])
+})
+
+test('отпечаток различает текстуры и совпадает у одинаковых', () => {
+  expect(contentFingerprint('data:image/png;base64,AAAA')).toBe(contentFingerprint('data:image/png;base64,AAAA'))
+  expect(contentFingerprint('data:image/png;base64,AAAA')).not.toBe(contentFingerprint('data:image/png;base64,AAAB'))
+})
+
+test('порядок источников сохраняется', () => {
+  const list = dedupeCapes([
+    { url: MOJANG + HASH_A, name: 'первый' },
+    { url: MOJANG + HASH_B, name: 'второй' },
+    { url: MOJANG + HASH_A, name: 'повтор первого' },
+  ])
+  expect(list.map((c) => c.name)).toEqual(['первый', 'второй'])
+})
+
+test('ключом плаща каталога Millida служит его адрес', () => {
+  expect(capeKey({ url: 'https://millida.net/capes/veteran.png', name: 'Ветеран' })).toBe(
+    'https://millida.net/capes/veteran.png',
+  )
+})
+
+/**
+ * Wearing a catalogue cape puts its copy into the account wardrobe under the
+ * same name. The wardrobe is listed first, so the copy absorbed the catalogue
+ * card: the card jumped up under a new id, the choice pointed at nothing and the
+ * cape came off the figure (tester, 29.09.2026).
+ *
+ * chosen id -> card it has to find, why the case is pinned
+ */
+describe('a choice survives its card being folded into another', () => {
+  const CDN = 'https://cdn.millida.trade/launcher/capes/'
+  const worn = dedupeCapes([
+    { id: 'w:9', url: CDN + 'copy-9.png', name: 'Twitch', wardrobeId: '9' },
+    { id: 'w:7', url: MOJANG + HASH_B, name: 'MineCon 2011', wardrobeId: '7' },
+    { id: 'cat:twitch', url: CDN + 'twitch.png', name: 'Twitch' },
+    { id: 'mojang-minecon', url: MOJANG + HASH_B, name: 'MineCon 2011' },
+    { id: 'cat:other', url: CDN + 'other.png', name: 'Путник' },
+  ])
+  const cases: [string, string | undefined, string][] = [
+    ['cat:twitch', 'w:9', 'a catalogue cape just worn: its wardrobe copy took the card over'],
+    ['mojang-minecon', 'w:7', 'a Mojang design worn from the launcher: the same takeover by texture'],
+    ['w:9', 'w:9', 'the surviving card is still found by its own id'],
+    ['cat:other', 'cat:other', 'a card nobody absorbed keeps its id'],
+    ['cat:gone', undefined, 'an id no card ever had finds nothing instead of a stranger'],
+  ]
+  for (const [chosen, expected, why] of cases) {
+    test(why, () => {
+      expect(capeById(worn, chosen)?.id, `the choice "${chosen}" lands on the wrong card`).toBe(expected)
+    })
+  }
+})

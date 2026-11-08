@@ -1,0 +1,92 @@
+// Первым: до модулей, которые читают адрес API при импорте.
+import './preview'
+import { createRoot } from 'react-dom/client'
+import './i18n'
+import './styles/01-base.css'
+import './styles/02-kit.css'
+import './styles/03-mods.css'
+import './styles/04-hosting.css'
+import './styles/05-media.css'
+import './styles/06-onboarding.css'
+import './styles/07-density.css'
+import './styles/09-wide.css'
+import './styles/10-call.css'
+import './styles/11-rooms.css'
+import './styles/12-pixel.css'
+// Экранные дополнения пиксельного языка: по файлу на зону (docs/PIXEL-LANGUAGE.md).
+// Импорты явные, а не glob: glob-импорты Vite поднимает НАД остальными,
+// и кит перебивал эти правила (22.09.2026).
+import './styles/pixel/builds.css'
+import './styles/pixel/first-run.css'
+import './styles/pixel/catalog.css'
+import './styles/pixel/hosting-settings.css'
+import './styles/pixel/premium.css'
+import './styles/pixel/rail.css'
+import './styles/pixel/shop.css'
+import './styles/pixel/settings.css'
+import './styles/pixel/gfx-presets.css'
+import './styles/pixel/shell.css'
+import './styles/pixel/social.css'
+import { App } from './App'
+import { dropBootSplash } from './lib/boot'
+import { initAccent } from './lib/accent'
+import { initPremiumTheme } from './lib/premiumTheme'
+import './styles/pixel/premium-theme.css'
+import './styles/classic.css'
+// Последним: лёгкий режим и «меньше движения» бьют остальные правила (lib/liteMode.ts).
+import './styles/13-lite.css'
+import { openExt } from './lib/api'
+import { initRenderGate } from './lib/renderGate'
+import { initLiteMode } from './lib/liteMode'
+import { initJankWatch } from './lib/jank'
+import { webviewFailure } from './lib/webviewHealth'
+import { installAspectRatioFallback } from './lib/aspectRatioFallback'
+import { installBrokenImageGuard } from './lib/brokenImages'
+
+if (!import.meta.env.DEV) {
+  document.addEventListener('contextmenu', (e) => {
+    const t = e.target as HTMLElement | null
+    if (t && t.closest('input, textarea, [contenteditable="true"]')) return
+    e.preventDefault()
+  })
+}
+
+// Любая внешняя ссылка, которую не перехватил сам компонент, открывается в
+// браузере: иначе окно лаунчера уходит на чужой сайт (аудит 24.09.2026).
+document.addEventListener('click', (e) => {
+  if (e.defaultPrevented) return
+  const a = (e.target as Element | null)?.closest?.('a[href]') as HTMLAnchorElement | null
+  if (!a || !/^https?:/i.test(a.getAttribute('href') || '')) return
+  e.preventDefault()
+  openExt(a.href)
+})
+
+// The overlay is the same bundle under a hash route: a second entry point
+// would double the build and drift from the main one.
+const isOverlay = location.hash.replace('#', '').split('?')[0] === 'overlay'
+if (isOverlay) {
+  document.documentElement.classList.add('overlay-root')
+  dropBootSplash(document)
+  // The overlay is a window of the same launcher, so it wears the same palette:
+  // without this it painted its own dark grey while the launcher stood in the
+  // user's accent.
+  void initAccent()
+} else {
+  // Премиум-темы PLUS / Diamond: сохранённая рисуется сразу, дальше — по подписке.
+  initPremiumTheme()
+  // Лёгкий режим по железу — класс на <html> до первого кадра.
+  initLiteMode()
+  // Окно лаунчера замирает, пока не видно или поверх идёт игра.
+  initRenderGate()
+  initJankWatch()
+  // Прошлое окно убил сбой видеокарты — WebGL выключаем до первого кадра лобби.
+  void webviewFailure()
+}
+
+installAspectRatioFallback()
+installBrokenImageGuard()
+
+const root = createRoot(document.getElementById('root')!)
+// Оверлей игры — тот же бандл по якорю, но его код (чат поверх игры) основному окну не нужен.
+if (isOverlay) void import('./screens/Overlay').then(({ Overlay }) => root.render(<Overlay />))
+else root.render(<App />)

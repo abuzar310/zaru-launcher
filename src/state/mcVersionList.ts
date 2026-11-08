@@ -1,0 +1,101 @@
+// Minecraft version list to pick from. In the app the core gives it. In the preview browser the list is read straight from piston-meta.mojang.com (the official Mojang list).
+import { create } from 'zustand'
+import { listVersionsTyped } from '../ipc/commands'
+import type { McVersion } from '../ipc/commands'
+import { hasTauri } from '../ipc/tauri'
+import { t } from '../i18n'
+
+const PREF = 'm-show-snapshots'
+
+const DEMO: McVersion[] = [
+  { id: '26.2', kind: 'release' },
+  { id: '26w05a', kind: 'snapshot' },
+  { id: '1.21.4', kind: 'release' },
+  { id: '1.21.1', kind: 'release' },
+  { id: '1.20.1', kind: 'release' },
+]
+
+const kindName = (): Record<string, string> => ({
+  snapshot: t('снапшот'),
+  old_beta: t('бета'),
+  old_alpha: t('альфа'),
+})
+
+function storedShow(): boolean {
+  try {
+    return localStorage.getItem(PREF) === '1'
+  } catch {
+    return false
+  }
+}
+
+interface State {
+  show: boolean
+  list: McVersion[]
+  error: string
+  setShow: (v: boolean) => void
+}
+
+export const useMcVersionList = create<State>((set) => ({
+  show: storedShow(),
+  list: [],
+  error: '',
+  setShow: (v) => {
+    try {
+      localStorage.setItem(PREF, v ? '1' : '0')
+    } catch {}
+    set({ show: v })
+  },
+}))
+
+// В браузере (предпросмотр) — тот же манифест Mojang напрямую, что ядро
+// читает в приложении; не ответил — короткий демо-список.
+const MANIFEST = 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json'
+function browserManifest(): Promise<McVersion[]> {
+  return fetch(MANIFEST)
+    .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
+    .then((m: { versions?: { id: string; type: string }[] }) =>
+      (m.versions || []).map((v) => ({ id: v.id, kind: v.type || 'release' })),
+    )
+    .catch(() => DEMO)
+}
+
+let pending: Promise<void> | null = null
+let loadedAt = 0
+
+// Pickers opened back to back share one answer instead of asking the core each.
+const REUSE_MS = 60_000
+
+// One store feeds every picker: the manifest is the same for all of them, and a
+// second copy only bought a second way to show a different list. The list is
+// asked again on a later open: a session-long copy hid a snapshot released
+// while the launcher sat in the tray. The core keeps its own short TTL and
+// answers from disk when offline.
+export function ensureMcVersionList(): Promise<void> {
+  if (pending) return pending
+  const held = useMcVersionList.getState().list.length > 0
+  if (held && Date.now() - loadedAt < REUSE_MS) return Promise.resolve()
+  pending = (hasTauri() ? listVersionsTyped() : browserManifest())
+    .then((list) => {
+      if (!Array.isArray(list) || !list.length) throw new Error(t('Mojang вернул пустой список версий'))
+      loadedAt = Date.now()
+      useMcVersionList.setState({ list, error: '' })
+    })
+    .catch((e) => {
+      if (held) return
+      useMcVersionList.setState({ error: '' + e })
+      throw e
+    })
+    .finally(() => {
+      pending = null
+    })
+  return pending
+}
+
+export function versionOptions(list: McVersion[], show: boolean, pinned?: string) {
+  const opts = list
+    .filter((v) => (show ? true : v.kind === 'release'))
+    .map((v) => ({ value: v.id, label: v.kind === 'release' ? v.id : v.id + ' · ' + (kindName()[v.kind] || v.kind) }))
+  if (pinned && !opts.some((o) => o.value === pinned)) opts.unshift({ value: pinned, label: pinned })
+  return opts
+}

@@ -1,0 +1,1800 @@
+// Finds and installs Java for the game. Looks for JDKs already installed (JAVA_HOME, vendor folders, PATH), and if the right one is missing, downloads its own:
+// metadata from api.adoptium.net and api.azul.com, the archive from GitHub or the vendor CDN (fallback mirror TUNA for Adoptium).
+// The archive is installed only if the sha256 from the vendor answer matches. Installs into the launcher data folder, system settings are not changed.
+use crate::engine::*;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tauri::AppHandle;
+
+/// Inside Flatpak the JDKs come from openjdk SDK extensions. There is no
+/// extension for Java 16, and Minecraft 1.17 runs fine on 17.
+#[cfg(target_os = "linux")]
+fn bundled_java(major: u64) -> Option<PathBuf> {
+    if !is_flatpak() {
+        return None;
+    }
+    let want = if major == 16 { 17 } else { major };
+    let bin = PathBuf::from(format!("/app/jdk/{}/bin/java", want));
+    if bin.exists() { Some(bin) } else { None }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bundled_java(_major: u64) -> Option<PathBuf> {
+    None
+}
+
+/// On macOS the JRE home lives inside the bundle.
+fn java_home(jdir: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") { jdir.join("Contents/Home") } else { jdir.to_path_buf() }
+}
+
+fn java_bin(jdir: &Path) -> PathBuf {
+    let name = if cfg!(target_os = "windows") { "java.exe" } else { "java" };
+    java_home(jdir).join("bin").join(name)
+}
+
+/// jvm.cfg is the first file the JVM reads; without it the process dies before
+/// main. Java 9+ keeps it in lib/, Java 8 in lib/<arch>/.
+fn has_jvm_cfg(home: &Path) -> bool {
+    if home.join("lib").join("jvm.cfg").exists() {
+        return true;
+    }
+    std::fs::read_dir(home.join("lib"))
+        .map(|rd| rd.flatten().any(|e| e.path().join("jvm.cfg").exists()))
+        .unwrap_or(false)
+}
+
+/// Библиотеки, без которых JVM не стартует: «could not find java.dll» и
+/// «Could not find Java SE Runtime Environment» приходили от рантаймов, где был
+/// java.exe и jvm.cfg, но не было самой машины (телеметрия 25.09.2026).
+#[cfg(target_os = "windows")]
+const CORE_LIBS: [&str; 2] = ["java.dll", "jvm.dll"];
+#[cfg(target_os = "macos")]
+const CORE_LIBS: [&str; 2] = ["libjava.dylib", "libjvm.dylib"];
+#[cfg(all(unix, not(target_os = "macos")))]
+const CORE_LIBS: [&str; 2] = ["libjava.so", "libjvm.so"];
+
+/// Метка «этот рантайм сломан»: ставится, когда папку не удалось удалить
+/// (её держит антивирус или запущенная игра), чтобы её больше не выбирать.
+const BROKEN_MARK: &str = ".millida-broken";
+
+fn nonempty(p: &Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
+/// Файл с таким именем где-то в `dir` не глубже `depth` уровней: у Java 8 на
+/// Linux машина лежит в lib/amd64/server, у Java 9+ — в lib/server или bin/server.
+fn has_file_within(dir: &Path, name: &str, depth: u32) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if depth > 0 && has_file_within(&p, name, depth - 1) {
+                return true;
+            }
+        } else if e.file_name().to_str().is_some_and(|n| n.eq_ignore_ascii_case(name)) && nonempty(&p) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Ключевые файлы рантайма: библиотека классов (lib/modules у Java 9+,
+/// lib/rt.jar у Java 8) и обе нативные библиотеки JVM.
+fn runtime_complete(home: &Path) -> bool {
+    let lib = home.join("lib");
+    let classes = nonempty(&lib.join("modules")) || nonempty(&lib.join("rt.jar"));
+    classes
+        && CORE_LIBS
+            .iter()
+            .all(|n| has_file_within(&home.join("bin"), n, 2) || has_file_within(&lib, n, 2))
+}
+
+/// The archive unpacks alphabetically, so bin/ appears long before lib/: an
+/// interrupted extraction leaves a runnable-looking JRE with no jvm.cfg.
+fn java_usable(jdir: &Path) -> bool {
+    let home = java_home(jdir);
+    nonempty(&java_bin(jdir))
+        && has_jvm_cfg(&home)
+        && runtime_complete(&home)
+        && !jdir.join(BROKEN_MARK).exists()
+}
+
+fn parse_major(first_line: &str) -> Option<u32> {
+    let quoted = first_line.split('"').nth(1)?;
+    let mut parts = quoted.split(['.', '_', '-', '+']);
+    let head = parts.next()?.parse::<u32>().ok()?;
+    if head == 1 { parts.next()?.parse().ok() } else { Some(head) }
+}
+
+/// A 32-bit JVM caps the heap far below what modded packs need, so it is never
+/// preferred over a fresh download.
+fn probe_major(path: &Path) -> Option<u32> {
+    // Runs the found java with a single flag -version to read its version. It does nothing else.
+    let out = quiet(&mut Command::new(ansi_safe_path(path))).arg("-version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stderr);
+    if !text.contains("64-Bit") {
+        return None;
+    }
+    // JAVA_TOOL_OPTIONS makes the JVM print a notice above the version line.
+    let line = version_line(&text)?;
+    let major = parse_major(&line)?;
+    trusts_lets_encrypt(major, &line).then_some(major)
+}
+
+const JAVA8_FIRST_UPDATE_WITH_ISRG_ROOT: u32 = 141;
+
+fn java8_update(version_line: &str) -> Option<u32> {
+    let quoted = version_line.split('"').nth(1)?;
+    let update = quoted.strip_prefix("1.8.0_")?;
+    let digits: String = update.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+fn trusts_lets_encrypt(major: u32, version_line: &str) -> bool {
+    major != 8 || java8_update(version_line).is_some_and(|u| u >= JAVA8_FIRST_UPDATE_WITH_ISRG_ROOT)
+}
+
+fn push_children(out: &mut Vec<PathBuf>, base: &Path) {
+    if let Ok(rd) = std::fs::read_dir(base) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                out.push(e.path());
+            }
+        }
+    }
+}
+
+fn system_java_homes() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = vec![];
+    if let Ok(h) = std::env::var("JAVA_HOME") {
+        if !h.trim().is_empty() {
+            out.push(PathBuf::from(h));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let vendors = [
+            "Java",
+            "Eclipse Adoptium",
+            "Eclipse Foundation",
+            "AdoptOpenJDK",
+            "Microsoft",
+            "Amazon Corretto",
+            "Zulu",
+            "BellSoft",
+            "Semeru",
+            "RedHat",
+            "JetBrains",
+        ];
+        let mut roots: Vec<PathBuf> = vec![];
+        for var in ["ProgramFiles", "ProgramW6432"] {
+            if let Ok(p) = std::env::var(var) {
+                roots.push(PathBuf::from(p));
+            }
+        }
+        if let Ok(p) = std::env::var("LOCALAPPDATA") {
+            roots.push(PathBuf::from(p).join("Programs"));
+        }
+        for root in roots {
+            for v in vendors {
+                push_children(&mut out, &root.join(v));
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    for base in ["/usr/lib/jvm", "/usr/lib64/jvm", "/opt/java", "/app/jdk"] {
+        push_children(&mut out, Path::new(base));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        push_children(&mut out, Path::new("/Library/Java/JavaVirtualMachines"));
+        if let Ok(h) = std::env::var("HOME") {
+            push_children(&mut out, &PathBuf::from(h).join("Library/Java/JavaVirtualMachines"));
+        }
+    }
+    out
+}
+
+fn path_java_bins() -> Vec<PathBuf> {
+    let finder = if cfg!(target_os = "windows") { "where" } else { "which" };
+    // where/which java: asks the system where java is in PATH. It only looks, it does not run what it finds.
+    let Ok(out) = quiet(&mut Command::new(finder)).arg("java").output() else { return vec![] };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| PathBuf::from(l.trim()))
+        .filter(|p| p.exists())
+        .collect()
+}
+
+fn scan_system_java() -> Vec<(PathBuf, u32)> {
+    let mut bins: Vec<PathBuf> = system_java_homes()
+        .into_iter()
+        .filter(|d| java_usable(d))
+        .map(|d| java_bin(&d))
+        .collect();
+    bins.extend(path_java_bins());
+    let mut seen = std::collections::HashSet::new();
+    let mut out = vec![];
+    for b in bins {
+        if !seen.insert(b.to_string_lossy().to_string()) {
+            continue;
+        }
+        if let Some(m) = probe_major(&b) {
+            out.push((b, m));
+        }
+    }
+    out
+}
+
+/// Probing spawns a JVM per candidate, so the result is cached for the session.
+fn system_java(major: u64) -> Option<PathBuf> {
+    static CACHE: std::sync::OnceLock<Vec<(PathBuf, u32)>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(scan_system_java)
+        .iter()
+        .find(|(_, m)| u64::from(*m) == major)
+        .map(|(p, _)| p.clone())
+}
+
+/// Majors the launcher is willing to fetch. The value reaches a URL and a
+/// directory name, so it never comes from the webview unchecked.
+pub const JAVA_MAJORS: &[u64] = &[8, 11, 17, 21, 25];
+
+/// Имя папки рантайма: «21», а Intel-сборка под Rosetta — «21-x64».
+fn runtime_base(major: u64, arch: Option<&str>) -> String {
+    match arch {
+        Some(a) => format!("{}-{}", major, a),
+        None => major.to_string(),
+    }
+}
+
+/// Папки рантайма: основная и запасные «21~метка». В запасную ставим, когда
+/// основную не дали удалить — её держит антивирус или запущенная с неё игра.
+/// Иначе каждая попытка упиралась в «Папка не пуста (os error 145)» (273
+/// игрока за две недели, телеметрия 25.09.2026). Новые запасные идут первыми.
+fn runtime_dirs(base: &str) -> Vec<PathBuf> {
+    let root = data_dir().join("java");
+    let prefix = format!("{}~", base);
+    let mut alts: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&root)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix) && e.path().is_dir())
+                .map(|e| {
+                    let t = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                    (t, e.path())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    alts.sort_by_key(|a| std::cmp::Reverse(a.0));
+    std::iter::once(root.join(base)).chain(alts.into_iter().map(|(_, p)| p)).collect()
+}
+
+fn managed_runtime(base: &str) -> Option<PathBuf> {
+    runtime_dirs(base).into_iter().find(|d| java_usable(d))
+}
+
+/// Установки одной Java не должны идти параллельно: вторая подчищала бы
+/// временную папку первой.
+static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Хвосты прошлых попыток: временные папки распаковки и сломанные рантаймы.
+/// Удаляем без повторов — что не удалилось, просто не будет выбрано.
+fn sweep_leftovers(root: &Path, base: &str) {
+    let staging = format!(".{}-new", base);
+    let Ok(rd) = std::fs::read_dir(root) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let ours = name == base || name.starts_with(&format!("{}~", base));
+        let stale = name.starts_with(&staging) || name.starts_with(&format!(".{}-trash", base));
+        if stale || (ours && e.path().is_dir() && !java_usable(&e.path())) {
+            // Deletes only half-installed or broken Java inside the launcher's own java/ folder.
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// Скачивает и ставит рантайм. Распаковка идёт в свою уникальную временную
+/// папку, проверяется и только потом переезжает на место одним rename — с
+/// повторами (антивирус держит свежие файлы) и запасным именем, если старую
+/// папку не удаётся убрать.
+async fn install_runtime(app: &AppHandle, major: u64, arch: Option<&'static str>) -> Result<PathBuf, String> {
+    install_runtime_as(app, major, arch, JavaVendor::Temurin).await
+}
+
+/// The JRE a build runs on. Temurin is the default and falls back to Zulu when
+/// its mirror is unreachable; the other two are what the player picked and come
+/// only from their own vendor. Every package is checked by its sha256.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JavaVendor {
+    Temurin,
+    Zulu,
+    Semeru,
+}
+
+impl JavaVendor {
+    pub fn parse(s: &str) -> Option<JavaVendor> {
+        match s {
+            "temurin" => Some(JavaVendor::Temurin),
+            "zulu" => Some(JavaVendor::Zulu),
+            "semeru" => Some(JavaVendor::Semeru),
+            _ => None,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            JavaVendor::Temurin => "temurin",
+            JavaVendor::Zulu => "zulu",
+            JavaVendor::Semeru => "semeru",
+        }
+    }
+
+    fn sources(self) -> &'static [&'static str] {
+        match self {
+            JavaVendor::Temurin => &["Adoptium", "Azul"],
+            JavaVendor::Zulu => &["Azul"],
+            JavaVendor::Semeru => &["Semeru"],
+        }
+    }
+
+    /// Folder name of the runtime: the default keeps the plain «21» every
+    /// existing install already uses.
+    fn base(self, major: u64, arch: Option<&str>) -> String {
+        match self {
+            JavaVendor::Temurin => runtime_base(major, arch),
+            other => format!("{}-{}", runtime_base(major, arch), other.id()),
+        }
+    }
+}
+
+pub fn profile_java_vendor(profile: &str) -> JavaVendor {
+    std::fs::read(profile_dir(profile).join("millida-settings.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|s| s["javaVendor"].as_str().and_then(JavaVendor::parse))
+        .unwrap_or(JavaVendor::Temurin)
+}
+
+pub(crate) async fn ensure_java_vendor(app: &AppHandle, major: u64, vendor: JavaVendor) -> Result<PathBuf, String> {
+    if vendor == JavaVendor::Temurin {
+        return ensure_java(app, major).await;
+    }
+    let major = if major == 16 { 17 } else { major };
+    if let Some(d) = managed_runtime(&vendor.base(major, None)) {
+        return Ok(java_bin(&d));
+    }
+    install_runtime_as(app, major, None, vendor).await.map(|d| java_bin(&d))
+}
+
+async fn install_runtime_as(app: &AppHandle, major: u64, arch: Option<&'static str>, vendor: JavaVendor) -> Result<PathBuf, String> {
+    let base = vendor.base(major, arch);
+    let _guard = match INSTALL_LOCK.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            emit(app, "java", 0.0, &format!("Ждём, пока докачается Java {}…", major));
+            INSTALL_LOCK.lock().await
+        }
+    };
+    check_cancel()?;
+    if let Some(d) = managed_runtime(&base) {
+        return Ok(d);
+    }
+    let root = data_dir().join("java");
+    std::fs::create_dir_all(&root).map_err(|e| io_fail("Установка Java", &root, &e))?;
+    sweep_leftovers(&root, &base);
+    let staging = root.join(format!(".{}-new-{}", base, unique_tag()));
+    if let Err(e) = install_java_arch(app, major, &staging, arch, vendor.sources()).await {
+        remove_dir_retrying(&staging).await;
+        return Err(e);
+    }
+    let published = publish_runtime(&staging, &root, &base).await;
+    if published.is_err() {
+        remove_dir_retrying(&staging).await;
+    }
+    published
+}
+
+async fn publish_runtime(staging: &Path, root: &Path, base: &str) -> Result<PathBuf, String> {
+    let mut last = String::new();
+    for target in [root.join(base), root.join(format!("{}~{}", base, unique_tag()))] {
+        if !remove_dir_retrying(&target).await {
+            // Остатки держит чужой процесс: помечаем их, чтобы не выбрать
+            // снова, и ставим рядом под новым именем.
+            let _ = std::fs::write(target.join(BROKEN_MARK), b"1");
+            last = format!("Установка Java: не удалось убрать старую папку — {}", mask_home(&target.to_string_lossy()));
+            continue;
+        }
+        match rename_retrying(staging, &target).await {
+            Ok(()) if java_usable(&target) => return Ok(target),
+            Ok(()) => return Err("Java распаковалась не полностью — попробуй запустить ещё раз".into()),
+            Err(e) => last = io_fail("Установка Java", &target, &e),
+        }
+    }
+    Err(last)
+}
+
+/// Downloads a managed runtime into the data directory, skipping whatever the
+/// system already offers. Shared by the automatic path and the explicit
+/// "download this major" action so both install exactly the same way.
+pub(crate) async fn install_managed_java(app: &AppHandle, major: u64) -> Result<PathBuf, String> {
+    install_runtime(app, major, None).await.map(|d| java_bin(&d))
+}
+
+pub(crate) fn managed_runtime_home(bin: &Path) -> Option<PathBuf> {
+    managed_identity(bin).map(|(home, _, _)| home)
+}
+
+/// Наш ли это рантайм и какой: (major, arch) по имени его папки.
+fn managed_identity(bin: &Path) -> Option<(PathBuf, u64, Option<&'static str>)> {
+    let root = data_dir().join("java");
+    let rel = bin.strip_prefix(&root).ok()?;
+    let name = rel.components().next()?.as_os_str().to_str()?.to_string();
+    let base = name.split('~').next()?;
+    let (num, arch) = match base.strip_suffix("-x64") {
+        Some(n) => (n, Some("x64")),
+        None => (base, None),
+    };
+    let major = num.parse::<u64>().ok().filter(|m| JAVA_MAJORS.contains(m))?;
+    Some((root.join(&name), major, arch))
+}
+
+/// Переставляет наш рантайм, который не запустился: убирает папку (или
+/// помечает сломанной, если её держат) и ставит заново. `None` — это не наш
+/// рантайм, и трогать его нельзя.
+pub(crate) async fn reinstall_managed_java(app: &AppHandle, bin: &Path) -> Option<Result<PathBuf, String>> {
+    let (dir, major, arch) = managed_identity(bin)?;
+    emit(app, "java", 0.0, &format!("Java {} повреждена — ставим заново…", major));
+    if !remove_dir_retrying(&dir).await {
+        let _ = std::fs::write(dir.join(BROKEN_MARK), b"1");
+    }
+    Some(install_runtime(app, major, arch).await.map(|d| java_bin(&d)))
+}
+
+pub(crate) async fn ensure_java(app: &AppHandle, major: u64) -> Result<PathBuf, String> {
+    let major = if major == 16 { 17 } else { major };
+    if let Some(bin) = bundled_java(major) {
+        return Ok(bin);
+    }
+    if let Some(d) = managed_runtime(&runtime_base(major, None)) {
+        return Ok(java_bin(&d));
+    }
+    if let Some(sys) = system_java(major) {
+        return Ok(sys);
+    }
+    install_managed_java(app, major).await
+}
+
+/// `ensure_java` without the download: the Java it would answer with, if that is already on this
+/// computer. The lobby prepares a build with it and never fetches a runtime ahead of Play.
+pub(crate) fn java_present(major: u64) -> Option<PathBuf> {
+    let major = if major == 16 { 17 } else { major };
+    bundled_java(major)
+        .or_else(|| managed_runtime(&runtime_base(major, None)).map(|d| java_bin(&d)))
+        .or_else(|| system_java(major))
+}
+
+/// `ensure_java_vendor` without the download.
+pub(crate) fn java_vendor_present(major: u64, vendor: JavaVendor) -> Option<PathBuf> {
+    if vendor == JavaVendor::Temurin {
+        return java_present(major);
+    }
+    let major = if major == 16 { 17 } else { major };
+    managed_runtime(&vendor.base(major, None)).map(|d| java_bin(&d))
+}
+
+/// `ensure_java_for` without the download (and without asking for Rosetta).
+pub(crate) fn java_present_for(major: u64, version: &str) -> Option<PathBuf> {
+    if !needs_rosetta(version) {
+        return java_present(major);
+    }
+    let major = if major == 16 { 17 } else { major };
+    managed_runtime(&runtime_base(major, Some("x64"))).map(|d| java_bin(&d))
+}
+
+/// Major Java по её `java -version`. Запоминается на сессию по пути и времени
+/// изменения файла: запуск спрашивает его на каждом старте.
+pub(crate) fn java_major_of_bin(bin: &Path) -> Option<u32> {
+    type Seen = std::collections::HashMap<PathBuf, (Option<std::time::SystemTime>, u32)>;
+    static CACHE: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+    let stamp = std::fs::metadata(bin).and_then(|m| m.modified()).ok();
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((t, m)) = guard.as_ref().and_then(|c| c.get(bin)) {
+            if *t == stamp {
+                return Some(*m);
+            }
+        }
+    }
+    let major = parse_major(&java_version_of(bin)?)?;
+    if let Ok(mut guard) = CACHE.lock() {
+        guard.get_or_insert_with(Default::default).insert(bin.to_path_buf(), (stamp, major));
+    }
+    Some(major)
+}
+
+fn too_old(have: u32, need: u64) -> bool {
+    u64::from(have) < need
+}
+
+/// Java, выбранная игроком (путь, номер или Java по умолчанию), не должна
+/// быть старше той, что требует версия: Java 8 на Forge 1.20.1 падала с
+/// «Unrecognized option: -p», Java 21 на 26.x — с «--sun-misc-unsafe-memory-access»
+/// (телеметрия 25.09.2026). Такая Java пропускается с предупреждением, и
+/// запуск берёт нужную сам. `None` — ставить автоматически.
+pub(crate) fn java_fits(app: &AppHandle, picked: PathBuf, need: u64, version: &str) -> Option<PathBuf> {
+    match java_major_of_bin(&picked) {
+        Some(have) if too_old(have, need) => {
+            warn(
+                app,
+                &format!(
+                    "Выбранная Java {} слишком старая для Minecraft {} — нужна {} или новее. Запускаем на подходящей Java",
+                    have, version, need
+                ),
+            );
+            None
+        }
+        _ => Some(picked),
+    }
+}
+
+/// `java_fits` without telling the window: the lobby's preparation must not raise a launch warning.
+pub(crate) fn java_fits_quietly(picked: PathBuf, need: u64) -> Option<PathBuf> {
+    match java_major_of_bin(&picked) {
+        Some(have) if too_old(have, need) => None,
+        _ => Some(picked),
+    }
+}
+
+/// Версии до 1.19 везут нативные библиотеки LWJGL только под Intel: на Mac с
+/// M-чипом JVM под arm64 падает на `liblwjgl.dylib` ещё до окна (владелец
+/// 25.09.2026: 1.12.2 не запускалась). Как Prism и MultiMC, такие версии
+/// идут на Java для Intel через Rosetta 2.
+pub(crate) fn needs_rosetta(version: &str) -> bool {
+    if !(cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")) {
+        return false;
+    }
+    legacy_natives_version(version)
+}
+
+/// Версия без arm64-нативов для macOS: всё до 1.19 и старые альфы/беты.
+pub(crate) fn legacy_natives_version(version: &str) -> bool {
+    let v = version.trim();
+    if let Some(rest) = v.strip_prefix("1.") {
+        let minor: u32 = rest.split(|c: char| !c.is_ascii_digit()).next().and_then(|n| n.parse().ok()).unwrap_or(99);
+        return minor < 19;
+    }
+    ["a1.", "b1.", "c0.", "rd-", "inf-"].iter().any(|p| v.starts_with(p))
+}
+
+/// Rosetta стоит, если есть её рантайм. `arch -x86_64 /usr/bin/true` не годится:
+/// системные утилиты в новых macOS только под arm64 и дают «Bad CPU type».
+fn rosetta_ready() -> bool {
+    std::path::Path::new("/Library/Apple/usr/libexec/oah/libRosettaRuntime").exists()
+}
+
+/// Java под нужную версию игры: на Mac с M-чипом для старых версий — Intel-сборка
+/// через Rosetta (ставится системным окном, если её нет).
+pub(crate) async fn ensure_java_for(app: &AppHandle, major: u64, version: &str) -> Result<PathBuf, String> {
+    if !needs_rosetta(version) {
+        return ensure_java(app, major).await;
+    }
+    if !rosetta_ready() {
+        emit(app, "java", 0.0, "Для этой версии нужна Rosetta — подтверди установку");
+        // System macOS window that asks for the password, to install Rosetta from Apple (needed for old game versions on M chips). It does nothing without the user's OK.
+        let _ = quiet(&mut Command::new("/usr/bin/osascript"))
+            .args(["-e", "do shell script \"/usr/sbin/softwareupdate --install-rosetta --agree-to-license\" with administrator privileges"])
+            .status();
+        if !rosetta_ready() {
+            return Err("Версии до 1.19 на Mac с M-чипом запускаются через Rosetta. Установи её и запусти ещё раз.".into());
+        }
+    }
+    let major = if major == 16 { 17 } else { major };
+    install_runtime(app, major, Some("x64")).await.map(|d| java_bin(&d))
+}
+
+/// Fetches a major on demand. The webview may only name a version from the
+/// published list: the number ends up in the Adoptium URL and in a path.
+pub async fn download_java_runtime(app: &AppHandle, major: u64) -> Result<String, String> {
+    if !JAVA_MAJORS.contains(&major) {
+        return Err("Такую версию Java лаунчер не скачивает".into());
+    }
+    let bin = install_managed_java(app, major).await?;
+    java_version_of(&bin).ok_or_else(|| "Java скачалась, но не запускается".to_string())
+}
+
+/// Installs, or reuses, the runtime for a major the webview named. Same closed
+/// list as the manual download, but it goes through `ensure_java`, so inside
+/// Flatpak the bundled SDK extension is used instead of a fresh Adoptium fetch.
+pub async fn ensure_java_major(app: &AppHandle, major: u64) -> Result<String, String> {
+    if !JAVA_MAJORS.contains(&major) {
+        return Err("Такую версию Java лаунчер не ставит".into());
+    }
+    let bin = ensure_java(app, major).await?;
+    java_version_of(&bin).ok_or_else(|| "Java установилась, но не запускается".to_string())
+}
+
+struct JavaPackage {
+    url: String,
+    sha256: String,
+    size: Option<u64>,
+    /// Имя файла у Adoptium: по нему архив ищется на зеркале.
+    name: Option<String>,
+}
+
+/// The archive is executed right after unpacking, so an entry without an https
+/// link and a full sha256 is dropped rather than installed unverified.
+fn adoptium_package(assets: &serde_json::Value) -> Option<JavaPackage> {
+    let pkg = &assets.as_array()?.first()?["binary"]["package"];
+    let url = pkg["link"].as_str().filter(|u| u.starts_with("https://"))?.to_string();
+    let sha256 = pkg["checksum"].as_str()?.to_lowercase();
+    if !is_sha256(&sha256) {
+        return None;
+    }
+    let name = pkg["name"].as_str().map(str::to_string);
+    Some(JavaPackage { url, sha256, size: pkg["size"].as_u64(), name })
+}
+
+fn is_sha256(digest: &str) -> bool {
+    digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Azul answers a package listing without digests, so the uuid from the listing
+/// is resolved to the package record that carries sha256_hash.
+fn azul_uuid(list: &serde_json::Value) -> Option<String> {
+    let uuid = list.as_array()?.first()?["package_uuid"].as_str()?;
+    if uuid.len() > 64 || !uuid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    Some(uuid.to_string())
+}
+
+fn azul_package(detail: &serde_json::Value) -> Option<JavaPackage> {
+    let url = detail["download_url"]
+        .as_str()
+        .filter(|u| u.starts_with("https://cdn.azul.com/"))?
+        .to_string();
+    let sha256 = detail["sha256_hash"].as_str()?.to_lowercase();
+    if !is_sha256(&sha256) {
+        return None;
+    }
+    // Azul отдаёт размер, округлённый до сотни байт (40158500 при реальных
+    // 40158493), и точная сверка отбрасывала целый архив — Java 8 на Mac arm64
+    // есть только у Azul, и 1.12.2 не запускалась (владелец 25.09.2026).
+    // Целостность и так гарантирует sha256.
+    Some(JavaPackage { url, sha256, size: None, name: None })
+}
+
+struct Target {
+    os: &'static str,
+    ext: &'static str,
+    arch: &'static str,
+}
+
+fn target_arch(force: Option<&'static str>) -> Target {
+    let (os, ext) = if cfg!(target_os = "macos") {
+        ("mac", "tar.gz")
+    } else if cfg!(target_os = "windows") {
+        ("windows", "zip")
+    } else {
+        ("linux", "tar.gz")
+    };
+    let arch = force.unwrap_or(if cfg!(target_arch = "aarch64") { "aarch64" } else { "x64" });
+    Target { os, ext, arch }
+}
+
+async fn adoptium_source(major: u64, t: &Target) -> Result<JavaPackage, String> {
+    // The JRE is executed right after unpacking, so it is fetched through the
+    // assets endpoint, which returns a sha256 alongside the link.
+    let url = format!(
+        "https://api.adoptium.net/v3/assets/latest/{}/hotspot?architecture={}&image_type=jre&os={}&vendor=eclipse",
+        major, t.arch, t.os
+    );
+    // The archive is checksum-verified, so a remembered answer is as safe as a
+    // fresh one and keeps a flaky connection from blocking a launch entirely.
+    let cache = data_dir().join("java").join(format!("adoptium-{}-{}-{}.json", major, t.os, t.arch));
+    let assets = get_json_cached(&url, &cache).await?;
+    adoptium_package(&assets).ok_or_else(|| {
+        let _ = std::fs::remove_file(&cache);
+        "нет сборки JRE для этой системы".to_string()
+    })
+}
+
+/// Adoptium serves its archives from github.com, which whole networks cannot
+/// reach; Azul is a second vendor on an unrelated CDN, so a blocked or timing
+/// out primary no longer leaves the player without a runtime.
+async fn azul_source(major: u64, t: &Target) -> Result<JavaPackage, String> {
+    let os = match t.os {
+        "mac" => "macos",
+        other => other,
+    };
+    let list_url = format!(
+        "https://api.azul.com/metadata/v1/zulu/packages/?java_version={}&os={}&arch={}&archive_type={}&java_package_type=jre&javafx_bundled=false&release_status=ga&latest=true&availability_types=CA&page_size=1",
+        major, os, t.arch, t.ext
+    );
+    let list_cache = data_dir().join("java").join(format!("azul-{}-{}-{}.json", major, os, t.arch));
+    let list = get_json_cached(&list_url, &list_cache).await?;
+    let uuid = azul_uuid(&list).ok_or_else(|| {
+        let _ = std::fs::remove_file(&list_cache);
+        "нет сборки JRE для этой системы".to_string()
+    })?;
+    let detail_url = format!("https://api.azul.com/metadata/v1/zulu/packages/{}", uuid);
+    let detail_cache = data_dir().join("java").join(format!("azul-pkg-{}.json", uuid));
+    let detail = get_json_immutable(&detail_url, &detail_cache).await?;
+    azul_package(&detail).ok_or_else(|| {
+        let _ = std::fs::remove_file(&detail_cache);
+        let _ = std::fs::remove_file(&list_cache);
+        "ответ без sha256 — архив нечем проверить".to_string()
+    })
+}
+
+/// Vendors wrap the runtime differently: Adoptium puts bin/ at the top of the
+/// archive, Azul on macOS nests another zulu-NN.jre directory inside. One extra
+/// level is unwrapped so both land where java_bin looks.
+fn unwrap_single_dir(jdir: &Path) -> Result<(), String> {
+    if java_usable(jdir) {
+        return Ok(());
+    }
+    let mut entries = std::fs::read_dir(jdir)
+        .map_err(|e| io_fail("Установка Java", jdir, &e))?
+        .flatten()
+        .map(|e| e.path())
+        .collect::<Vec<_>>();
+    if entries.len() != 1 {
+        return Ok(());
+    }
+    let inner = entries.pop().expect("length checked above");
+    if !inner.is_dir() || !java_usable(&inner) {
+        return Ok(());
+    }
+    let lifted = jdir.with_file_name(format!(
+        "{}-lift",
+        jdir.file_name().and_then(|n| n.to_str()).unwrap_or("java")
+    ));
+    // Our own temp folder next to the unpacked Java: move the nested folder one level up.
+    let _ = std::fs::remove_dir_all(&lifted);
+    std::fs::rename(&inner, &lifted).map_err(|e| io_fail("Установка Java", &lifted, &e))?;
+    // Here jdir is the folder of the new Java inside the launcher data. While installing, we do not need its contents anymore.
+    std::fs::remove_dir_all(jdir).map_err(|e| io_fail("Установка Java", jdir, &e))?;
+    std::fs::rename(&lifted, jdir).map_err(|e| io_fail("Установка Java", jdir, &e))
+}
+
+fn forget_java_metadata(major: u64, t: &Target) {
+    let dir = data_dir().join("java");
+    for name in [
+        format!("adoptium-{}-{}-{}.json", major, t.os, t.arch),
+        format!("azul-{}-{}-{}.json", major, if t.os == "mac" { "macos" } else { t.os }, t.arch),
+    ] {
+        // Deletes the cache of Adoptium/Azul answers (small json files), so the next try asks again.
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+}
+
+/// Причина отказа одной строкой без адреса: сообщение уходит в тост и в
+/// телеметрию (120 символов), и ссылка на github съедала его целиком — причину
+/// у второго поставщика не было видно вовсе.
+fn short_reason(e: &str) -> String {
+    let words: Vec<&str> = e.split_whitespace().filter(|w| !w.contains("://")).collect();
+    let joined = words.join(" ");
+    let mut s = joined.split(" — ").next().unwrap_or(&joined).trim().to_string();
+    for tail in [" от", ":", "—", " -"] {
+        while let Some(t) = s.strip_suffix(tail) {
+            s = t.trim_end().to_string();
+        }
+    }
+    if s.matches('(').count() > s.matches(')').count() {
+        s.push(')');
+    }
+    const MAX: usize = 70;
+    if s.chars().count() > MAX {
+        s = s.chars().take(MAX).collect::<String>() + "…";
+    }
+    if s.is_empty() { "нет ответа".into() } else { s }
+}
+
+/// Файла по ссылке больше нет или он другой: ответ справочника устарел.
+fn stale_package(e: &str) -> bool {
+    e.contains("404") || e.contains("410") || e.contains("контрольная сумма") || e.contains("размер")
+}
+
+fn disk_full(e: &str) -> bool {
+    let low = e.to_lowercase();
+    low.contains("os error 112") || low.contains("os error 28") || low.contains("no space left") || low.contains("недостаточно места")
+}
+
+/// Зеркало Adoptium на TUNA (университет Цинхуа) раскладывает те же файлы под
+/// теми же именами. Архив сверяется по sha256 из ответа самого Adoptium, так
+/// что зеркало не может подсунуть другой файл, а github — главный источник
+/// обрывов у игроков из России.
+// Fallback address: a university mirror in China. Swapping the file there would not help, because the sha256 comes from the Adoptium answer itself.
+const ADOPTIUM_MIRROR: &str = "https://mirrors.tuna.tsinghua.edu.cn/Adoptium";
+
+fn adoptium_mirror_url(major: u64, t: &Target, name: &str) -> Option<String> {
+    let safe = !name.is_empty()
+        && name.len() <= 128
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && !name.starts_with('.');
+    safe.then(|| format!("{}/{}/jre/{}/{}/{}", ADOPTIUM_MIRROR, major, t.arch, t.os, name))
+}
+
+/// IBM Semeru (OpenJ9) through the AdoptOpenJDK API, which answers with the
+/// same package record and sha256 as Adoptium does.
+async fn semeru_source(major: u64, t: &Target) -> Result<JavaPackage, String> {
+    let url = format!(
+        "https://api.adoptopenjdk.net/v3/assets/latest/{}/openj9?architecture={}&image_type=jre&os={}&vendor=ibm",
+        major, t.arch, t.os
+    );
+    let cache = data_dir().join("java").join(format!("semeru-{}-{}-{}.json", major, t.os, t.arch));
+    let assets = get_json_cached(&url, &cache).await?;
+    adoptium_package(&assets).ok_or_else(|| {
+        let _ = std::fs::remove_file(&cache);
+        "нет сборки JRE для этой системы".to_string()
+    })
+}
+
+async fn install_java_arch(app: &AppHandle, major: u64, jdir: &Path, arch: Option<&'static str>, sources: &[&'static str]) -> Result<(), String> {
+    emit(app, "java", 0.0, &format!("Скачиваем Java {}…", major));
+    let cancel = launch_cancel_flag();
+    let t = target_arch(arch);
+    let mut reasons = Vec::new();
+    let archive = data_dir().join(format!("java-{}-{}.{}", major, t.arch, t.ext));
+    // Второй поставщик нужен не только когда молчит справочник, но и когда
+    // молчит его файловое зеркало: у Adoptium это github, и «сборка не
+    // запускается, ошибка на скачивании Java» приходила именно оттуда. Падение
+    // загрузки — повод взять следующего, а не повод сдаться.
+    let mut fetched = false;
+    // A vendor is asked only after the previous one failed: an unreachable Azul
+    // directory kept the player at 0% even when Adoptium had already answered.
+    'vendors: for &vendor in sources {
+        let found = match vendor {
+            "Adoptium" => adoptium_source(major, &t).await,
+            "Semeru" => semeru_source(major, &t).await,
+            _ => azul_source(major, &t).await,
+        };
+        let pkg = match found {
+            Err(e) => {
+                reasons.push(format!("{}: {}", vendor, short_reason(&e)));
+                continue;
+            }
+            Ok(pkg) => pkg,
+        };
+        let mut urls = vec![(vendor, pkg.url.clone())];
+        if let Some(m) = pkg.name.as_deref().filter(|_| vendor == "Adoptium").and_then(|n| adoptium_mirror_url(major, &t, n)) {
+            urls.push(("зеркало", m));
+        }
+        for (label, url) in urls {
+            let shown = std::sync::atomic::AtomicU32::new(u32::MAX);
+            let report = |got: u64, total: Option<u64>| {
+                let Some(pct) = download_pct(got, total.or(pkg.size)) else { return };
+                if shown.swap(pct, std::sync::atomic::Ordering::Relaxed) != pct {
+                    emit(app, "java", pct as f32 * 0.58, &format!("Скачиваем Java {}… {}%", major, pct));
+                }
+            };
+            let fetched_now = download_checked_progress(
+                &url,
+                &archive,
+                Some(Sum::Sha256(&pkg.sha256)),
+                pkg.size,
+                cancel.as_deref(),
+                &report,
+            )
+            .await;
+            match fetched_now {
+                Ok(()) => {
+                    fetched = true;
+                    break 'vendors;
+                }
+                Err(e) if e == CANCELLED => return Err(LAUNCH_CANCELLED.into()),
+                Err(e) => {
+                    // A remembered answer can point at a release that has since
+                    // been pulled; dropping the cache turns the next attempt
+                    // back into a fresh lookup. Обрыв связи — не тот случай:
+                    // кэш нужен именно тогда, когда справочник недоступен.
+                    if stale_package(&e) {
+                        forget_java_metadata(major, &t);
+                    }
+                    if disk_full(&e) {
+                        return Err(format!("Не удалось скачать Java {} — не хватает места на диске. Освободи пару гигабайт и запусти ещё раз.", major));
+                    }
+                    reasons.push(format!("{}: {}", label, short_reason(&e)));
+                }
+            }
+        }
+    }
+    if !fetched {
+        return Err(format!(
+            "Не удалось скачать Java {} — {}. Проверь интернет, VPN или фаервол.",
+            major,
+            reasons.join("; ")
+        ));
+    }
+    emit(app, "java", 60.0, "Распаковываем Java…");
+    std::fs::create_dir_all(jdir).map_err(|e| io_fail("Установка Java", jdir, &e))?;
+    /*
+     * «Отказано в доступе (os error 5)» при распаковке — почти всегда антивирус
+     * или индексатор держит свежий файл (≈230 устройств в сутки, 10.10.2026).
+     * Через пару секунд он отпускает: повторяем с чистой папкой, а не просим
+     * человека запускать заново.
+     */
+    let mut unpacked = Ok(());
+    for attempt in 0..3u64 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2 * attempt)).await;
+            // Unpack again from scratch: clean our own folder of the new Java.
+            let _ = std::fs::remove_dir_all(jdir);
+            std::fs::create_dir_all(jdir).map_err(|e| io_fail("Установка Java", jdir, &e))?;
+        }
+        unpacked = if t.ext == "zip" {
+            unzip_strip1(&archive, jdir, app_local_ucrt).map_err(|e| format!("Распаковка Java: {}", e))
+        } else {
+            // The system tar unpacks the downloaded Java archive, already checked by sha256, into the launcher folder.
+            quiet(&mut Command::new("tar"))
+                .args(["-xzf"]).arg(&archive).arg("-C").arg(jdir).arg("--strip-components=1")
+                .status()
+                .map_err(|e| io_fail("Распаковка Java", &archive, &e))
+                .and_then(|s| if s.success() { Ok(()) } else { Err("Не удалось распаковать Java".into()) })
+        };
+        match &unpacked {
+            Err(e) if e.contains("os error 5") || e.contains("os error 32") || e.contains("Отказано в доступе") => continue,
+            _ => break,
+        }
+    }
+    // The downloaded archive is not needed after unpacking.
+    let _ = std::fs::remove_file(&archive);
+    unpacked?;
+    unwrap_single_dir(jdir)?;
+    if java_usable(jdir) {
+        Ok(())
+    } else {
+        Err("Java распаковалась не полностью — попробуй запустить ещё раз".into())
+    }
+}
+
+/// Windows JRE archives carry their own copy of the Universal CRT
+/// (`bin/ucrtbase.dll`, `bin/api-ms-win-*.dll`) for systems older than
+/// Windows 10. Windows 10+ always loads the system UCRT and ignores an
+/// app-local copy, while antivirus software refuses a file named like a system
+/// library outside System32, and no retry gets past that. Such a copy may be
+/// left out when the system one is present.
+fn app_local_ucrt(rel: &str) -> bool {
+    let path = Path::new(rel);
+    let in_bin = path.parent().is_some_and(|p| p == Path::new("bin"));
+    let name = path.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let ucrt = name == "ucrtbase.dll" || (name.starts_with("api-ms-win-") && name.ends_with(".dll"));
+    cfg!(target_os = "windows") && in_bin && ucrt && system_ucrt_present()
+}
+
+fn system_ucrt_present() -> bool {
+    std::env::var_os("SystemRoot")
+        .map(|root| Path::new(&root).join("System32").join("ucrtbase.dll").is_file())
+        .unwrap_or(false)
+}
+
+/// Whole percent of a download, when its size is known. Without it the Java
+/// card sat on «0%» for the whole download and read as a hang.
+fn download_pct(got: u64, total: Option<u64>) -> Option<u32> {
+    let total = total.filter(|t| *t > 0)?;
+    Some((got.min(total) * 100 / total) as u32)
+}
+
+/// ASCII without spaces: the name goes through the ANSI path rewrite, command
+/// lines and the GPU preference registry key unchanged on every system.
+const GAME_EXE_STEM: &str = "MillidaMinecraft";
+
+/// Named after the launcher the game was mistaken for it: Task Manager showed
+/// "MillidaLauncher.exe" eating the CPU and memory of Minecraft.
+const LEGACY_GAME_EXE_STEM: &str = "MillidaLauncher";
+
+/// Linux reports a process name cut to 15 bytes (TASK_COMM_LEN).
+const COMM_LEN: usize = 15;
+
+fn exe_name(stem: &str) -> String {
+    if cfg!(target_os = "windows") { format!("{}.exe", stem) } else { stem.to_string() }
+}
+
+pub(crate) fn branded_alias(java: &Path) -> Option<PathBuf> {
+    java.parent().map(|d| d.join(exe_name(GAME_EXE_STEM)))
+}
+
+fn legacy_alias(java: &Path) -> Option<PathBuf> {
+    java.parent().map(|d| d.join(exe_name(LEGACY_GAME_EXE_STEM)))
+}
+
+/// Whether a process name from the system list can be a game this launcher
+/// started: plain java, the current copy, or the copy a previous version made.
+pub(crate) fn is_game_process_name(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    let stem = low.strip_suffix(".exe").unwrap_or(&low);
+    stem.starts_with("java")
+        || [GAME_EXE_STEM, LEGACY_GAME_EXE_STEM].iter().any(|known| {
+            let known = known.to_ascii_lowercase();
+            stem == known || (stem.len() == COMM_LEN && known.starts_with(stem))
+        })
+}
+
+/// The game runs as a renamed copy of java so that Task Manager and Discord
+/// show a Minecraft process instead of java.exe. The copy must sit in the same
+/// bin/ because the JVM locates its home relative to the executable. Falls
+/// back to the original when copying is not permitted.
+pub(crate) fn branded_java(java: &Path) -> PathBuf {
+    let Some(alias) = branded_alias(java) else { return java.to_path_buf() };
+    let src_len = std::fs::metadata(java).map(|m| m.len()).unwrap_or(0);
+    if src_len == 0 {
+        return java.to_path_buf();
+    }
+    if std::fs::metadata(&alias).map(|m| m.len()).ok() != Some(src_len) {
+        if std::fs::copy(java, &alias).is_err() {
+            return java.to_path_buf();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&alias, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    if !alias.exists() {
+        return java.to_path_buf();
+    }
+    drop_legacy_alias(java);
+    alias
+}
+
+/// Runs only once the new copy exists, and only on a file of java's size: the
+/// player may point the launcher at a Java folder of their own. A game started
+/// by the previous version may still hold the old file, and Windows then
+/// refuses the delete: the file stays until a later launch, which costs nothing.
+fn drop_legacy_alias(java: &Path) {
+    let size = |p: &Path| std::fs::metadata(p).ok().filter(|m| m.is_file()).map(|m| m.len());
+    let Some(old) = legacy_alias(java) else { return };
+    if size(&old).is_some() && size(&old) == size(java) {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct JavaInfo { pub path: String, pub version: String }
+
+#[derive(serde::Serialize)]
+pub struct JavaRuntime {
+    pub major: u32,
+    pub size: u64,
+    pub path: String,
+    pub in_use: bool,
+}
+
+/// Java majors required by installed profiles, read from on-disk version
+/// metadata only so this stays offline.
+fn required_majors() -> std::collections::HashSet<u32> {
+    let root = game_root();
+    let mut out = std::collections::HashSet::new();
+    for p in load_profiles() {
+        let meta = root
+            .join("versions")
+            .join(&p.version)
+            .join(format!("{}-meta.json", p.version));
+        let major = std::fs::read(&meta)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["javaVersion"]["majorVersion"].as_u64())
+            .unwrap_or(21);
+        out.insert(major as u32);
+    }
+    out
+}
+
+pub fn list_java_runtimes() -> Vec<JavaRuntime> {
+    let need = required_majors();
+    let mut out: Vec<JavaRuntime> = vec![];
+    if let Ok(rd) = std::fs::read_dir(data_dir().join("java")) {
+        for e in rd.flatten() {
+            // «21» и запасные «21~метка» — одна и та же Java.
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(major) = name.split('~').next().and_then(|n| n.parse::<u32>().ok()) else { continue };
+            if !e.path().is_dir() { continue }
+            let size = dir_size(&e.path());
+            if let Some(r) = out.iter_mut().find(|r| r.major == major) {
+                r.size += size;
+                continue;
+            }
+            out.push(JavaRuntime {
+                major,
+                size,
+                path: e.path().to_string_lossy().to_string(),
+                in_use: need.contains(&major),
+            });
+        }
+    }
+    out.sort_by_key(|r| r.major);
+    out
+}
+
+pub fn remove_java_runtime(major: u32) -> Result<u64, String> {
+    // A runtime needed by installed packs may go: launch reinstalls it. A running
+    // game holds its files, and a half-deleted runtime would be picked next time.
+    if !super::launch::running_games().is_empty() {
+        return Err("Сначала закрой игру — она сейчас работает на этой Java".into());
+    }
+    let dirs: Vec<PathBuf> = runtime_dirs(&major.to_string()).into_iter().filter(|d| d.is_dir()).collect();
+    if dirs.is_empty() {
+        return Err("Такая Java не установлена".into());
+    }
+    let mut freed = 0;
+    for dir in dirs {
+        let size = dir_size(&dir);
+        // The player clicked "Delete" on a Java in settings. runtime_dirs only goes through Java folders inside the launcher data.
+        std::fs::remove_dir_all(&dir).map_err(|e| format!("Не удалось удалить: {}", e))?;
+        freed += size;
+    }
+    Ok(freed)
+}
+
+/// `java -version` writes to stderr: `openjdk version "21.0.2"`. A binary that
+/// cannot start writes its loader error to the very same stream, so taking the
+/// first line would report `libjli.so: cannot open shared object file` as the
+/// installed Java version and let a dead binary through every check below.
+fn version_line(stderr: &str) -> Option<String> {
+    stderr.lines().map(str::trim).find(|l| parse_major(l).is_some()).map(str::to_string)
+}
+
+/// Major version of the Java at `path`, read from `java -version`.
+pub(crate) fn java_major_at(path: &Path) -> Option<u32> {
+    parse_major(&java_version_of(path)?)
+}
+
+pub(crate) fn java_version_of(path: &Path) -> Option<String> {
+    let out = quiet(&mut Command::new(ansi_safe_path(path))).arg("-version").output().ok()?;
+    version_line(&String::from_utf8_lossy(&out.stderr))
+}
+
+/// Java binaries the launcher discovered on its own: managed runtimes under the
+/// data directory, vendor install locations and whatever PATH points at.
+fn java_candidates() -> Vec<PathBuf> {
+    let mut cands: Vec<PathBuf> = vec![];
+    let bin_name = if cfg!(target_os = "windows") { "java.exe" } else { "java" };
+    if let Ok(rd) = std::fs::read_dir(data_dir().join("java")) {
+        // временные папки распаковки («.21-new-…») рантаймами не считаются
+        for e in rd.flatten().filter(|e| !e.file_name().to_string_lossy().starts_with('.')) {
+            let b = if cfg!(target_os = "macos") { e.path().join("Contents/Home/bin").join(bin_name) }
+                    else { e.path().join("bin").join(bin_name) };
+            if b.exists() { cands.push(b); }
+        }
+    }
+    cands.extend(system_java_homes().into_iter().filter(|d| java_usable(d)).map(|d| java_bin(&d)));
+    cands.extend(path_java_bins());
+    cands
+}
+
+const TRUSTED_MAX: usize = 16;
+
+/// Paths the user picked in the native file dialog. Kept on disk because the
+/// choice has to survive a restart: the picked JRE may live anywhere, so it can
+/// never be re-derived from the known JRE locations.
+fn trusted_java_index() -> PathBuf {
+    data_dir().join("java").join("trusted.json")
+}
+
+fn trusted_java_paths() -> Vec<String> {
+    std::fs::read(trusted_java_index())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+        .unwrap_or_default()
+}
+
+fn trust_java_path(path: &Path) {
+    let entry = path.to_string_lossy().to_string();
+    let mut all = trusted_java_paths();
+    all.retain(|p| p != &entry);
+    all.insert(0, entry);
+    all.truncate(TRUSTED_MAX);
+    let _ = write_json_atomic(&trusted_java_index(), &all);
+}
+
+/// Symlinks and 8.3 short names make two spellings of the same binary compare
+/// unequal, so paths are matched after canonicalisation.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    real(a) == real(b)
+}
+
+fn java_file_name_ok(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
+    if cfg!(target_os = "windows") { name.eq_ignore_ascii_case("java.exe") } else { name == "java" }
+}
+
+/// The JRE launcher only works inside its own runtime: it finds libjli and
+/// jvm.cfg relative to itself. A sandboxed file dialog answers with a single-file
+/// copy under /run/user/<uid>/doc, which is named `java`, is executable, and dies
+/// on the first library it needs — so the surrounding tree is what decides.
+/// Resolved first: /usr/bin/java is a symlink chain into the real JRE, and the
+/// tree only exists at the far end of it.
+fn java_tree_ok(bin: &Path) -> bool {
+    let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
+    real.parent().and_then(|b| b.parent()).is_some_and(has_jvm_cfg)
+}
+
+/// Why a path the user typed or picked cannot be started. The generic "choose it
+/// with the button" answer sends Flatpak users into the file dialog, which hands
+/// back a broken single-file path, so each case says what actually helps.
+pub fn java_reject_reason(path: &Path) -> String {
+    if !java_file_name_ok(path) {
+        let want = if cfg!(target_os = "windows") { "java.exe" } else { "java" };
+        return format!("Нужен сам файл {} из папки bin выбранной Java", want);
+    }
+    if !path.is_file() {
+        if is_flatpak() {
+            return "Flatpak не видит папки системы, поэтому такую Java запустить нельзя — впиши номер версии (например 25), лаунчер скачает её сам".into();
+        }
+        return "По этому пути файла java нет".into();
+    }
+    if !java_tree_ok(path) {
+        let base = "Это одиночный файл java без своей папки lib — Java запускается только целиком";
+        if is_flatpak() {
+            return format!("{}. Во Flatpak выбор системной Java не работает — впиши номер версии (например 25), скачаем сами", base);
+        }
+        return format!("{}. Выбери bin/java внутри папки установленной Java", base);
+    }
+    "Эту Java лаунчер ещё не проверял — выбери её кнопкой «Обзор…» или впиши номер версии, скачаем сами".into()
+}
+
+/// The webview may name a Java binary, and the launcher then executes it, so the
+/// path has to be one the core produced itself: a discovered JRE or a file the
+/// user picked in the native dialog. Anything else would turn a scripting hole
+/// in the UI into "run this arbitrary executable".
+pub fn java_path_allowed(path: &Path) -> bool {
+    if !java_file_name_ok(path) || !path.is_file() || !java_tree_ok(path) {
+        return false;
+    }
+    java_candidates().iter().any(|c| same_file(c, path))
+        || trusted_java_paths().iter().any(|c| same_file(Path::new(c), path))
+}
+
+/// Java the user picked for every build that has none of its own. Stored next to
+/// the trusted index and re-validated on read: the file may have been written by
+/// an older build, and the binary can disappear between launches.
+fn default_java_index() -> PathBuf {
+    data_dir().join("java").join("default.json")
+}
+
+pub fn default_java() -> Option<PathBuf> {
+    let raw: String = std::fs::read(default_java_index())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())?;
+    let p = PathBuf::from(raw.trim());
+    java_path_allowed(&p).then_some(p)
+}
+
+pub fn default_java_info() -> Option<JavaInfo> {
+    let p = default_java()?;
+    let version = java_version_of(&p)?;
+    Some(JavaInfo { path: p.to_string_lossy().to_string(), version })
+}
+
+pub fn set_default_java(path: Option<String>) -> Result<(), String> {
+    let path = path.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+    let Some(path) = path else {
+        let _ = std::fs::remove_file(default_java_index());
+        return Ok(());
+    };
+    if !java_path_allowed(Path::new(&path)) {
+        return Err(java_reject_reason(Path::new(&path)));
+    }
+    write_json_atomic(&default_java_index(), &path).map_err(|e| format!("Не удалось сохранить выбор: {}", e))
+}
+
+pub fn detect_java() -> Vec<JavaInfo> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = vec![];
+    for c in java_candidates() {
+        let cs = c.to_string_lossy().to_string();
+        if !seen.insert(cs.clone()) { continue }
+        if let Some(v) = java_version_of(&c) { out.push(JavaInfo { path: cs, version: v }); }
+    }
+    out
+}
+
+pub fn test_java(path: String) -> Result<String, String> {
+    let p = PathBuf::from(&path);
+    if !java_path_allowed(&p) {
+        return Err(java_reject_reason(&p));
+    }
+    java_version_of(&p).ok_or_else(|| "Не удалось запустить Java по этому пути".to_string())
+}
+
+/// Probes a binary the user picked in the native dialog and, when it really is a
+/// JRE, remembers it as an allowed Java for later launches.
+pub fn accept_picked_java(path: String) -> Result<String, String> {
+    let p = PathBuf::from(&path);
+    if !java_file_name_ok(&p) || !p.is_file() || !java_tree_ok(&p) {
+        return Err(java_reject_reason(&p));
+    }
+    let version = java_version_of(&p).ok_or_else(|| "Не удалось запустить Java по этому пути".to_string())?;
+    trust_java_path(&p);
+    Ok(version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// archive entry -> may be left out. Only the app-local UCRT in bin/ is
+    /// optional: leaving out anything else gives a Java that does not start.
+    #[test]
+    fn only_app_local_ucrt_is_optional() {
+        let windows = cfg!(target_os = "windows") && system_ucrt_present();
+        for (rel, want, why) in [
+            ("bin/ucrtbase.dll", windows, "антивирус не даёт записать копию системной библиотеки, а Windows 10+ её всё равно не грузит"),
+            ("bin/API-MS-WIN-CRT-RUNTIME-L1-1-0.dll", windows, "переходники UCRT тоже системные, регистр имени не важен"),
+            ("bin/server/jvm.dll", false, "без jvm.dll Java не стартует"),
+            ("bin/java.exe", false, "без java.exe запускать нечего"),
+            ("bin/vcruntime140.dll", false, "VC-рантайм в системе может отсутствовать"),
+            ("lib/ucrtbase.dll", false, "необязательна только копия рядом с java.exe"),
+        ] {
+            assert_eq!(app_local_ucrt(rel), want, "{rel}: {why}");
+        }
+    }
+
+    fn make(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join("millida-java-test").join(name);
+        let _ = std::fs::remove_dir_all(&d);
+        let bin = java_bin(&d);
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"x").unwrap();
+        d
+    }
+
+    /// Полный рантайм: jvm.cfg, библиотека классов и обе нативные библиотеки.
+    fn complete(d: &Path, java8: bool) {
+        let home = java_home(d);
+        let lib = if java8 && !cfg!(target_os = "macos") { home.join("lib").join("amd64") } else { home.join("lib") };
+        std::fs::create_dir_all(lib.join("server")).unwrap();
+        std::fs::write(lib.join("jvm.cfg"), b"-server KNOWN").unwrap();
+        std::fs::write(home.join("lib").join(if java8 { "rt.jar" } else { "modules" }), b"classes").unwrap();
+        let (core, jvm) = (CORE_LIBS[0], CORE_LIBS[1]);
+        if cfg!(target_os = "windows") {
+            std::fs::create_dir_all(home.join("bin").join("server")).unwrap();
+            std::fs::write(home.join("bin").join(core), b"x").unwrap();
+            std::fs::write(home.join("bin").join("server").join(jvm), b"x").unwrap();
+        } else {
+            std::fs::write(lib.join(core), b"x").unwrap();
+            std::fs::write(lib.join("server").join(jvm), b"x").unwrap();
+        }
+    }
+
+    #[test]
+    fn runtime_without_the_jvm_itself_is_not_usable() {
+        let d = make("no-dll");
+        complete(&d, false);
+        assert!(java_usable(&d), "полный рантайм годен");
+        let home = java_home(&d);
+        let core = if cfg!(target_os = "windows") { home.join("bin").join(CORE_LIBS[0]) } else { home.join("lib").join(CORE_LIBS[0]) };
+        std::fs::remove_file(&core).unwrap();
+        assert!(!java_usable(&d), "без {} JVM падает с «could not find java.dll» — такой рантайм надо ставить заново", CORE_LIBS[0]);
+        let d = make("no-modules");
+        complete(&d, false);
+        std::fs::remove_file(java_home(&d).join("lib").join("modules")).unwrap();
+        assert!(!java_usable(&d), "без lib/modules JVM не найдёт java.lang.Object");
+        let d = make("marked");
+        complete(&d, false);
+        std::fs::write(d.join(BROKEN_MARK), b"1").unwrap();
+        assert!(!java_usable(&d), "помеченный сломанным рантайм больше не выбирается");
+    }
+
+    #[test]
+    fn download_failure_keeps_every_vendor_visible() {
+        let cases = [
+            (
+                "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.4.1%2B1/OpenJDK25U-jre_x64_windows_hotspot_25.0.4.1_1.zip: нет связи (operation timed out — сервер не ответил вовремя: проверь интернет и VPN)",
+                "нет связи (operation timed out)",
+            ),
+            (
+                "ответ оборвался: нет связи (connection reset) — https://api.adoptium.net/v3/assets/latest/21/hotspot?architecture=x64",
+                "ответ оборвался: нет связи (connection reset)",
+            ),
+            ("404 Not Found от https://api.azul.com/x", "404 Not Found"),
+            ("https://x.y/z → 502 Bad Gateway", "→ 502 Bad Gateway"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(short_reason(raw), want, "{raw}");
+        }
+        assert!(short_reason(&"а".repeat(500)).chars().count() <= 71, "причина одного поставщика не съедает всё сообщение");
+    }
+
+    #[test]
+    fn mirror_url_follows_the_adoptium_layout() {
+        let t = Target { os: "windows", ext: "zip", arch: "x64" };
+        assert_eq!(
+            adoptium_mirror_url(21, &t, "OpenJDK21U-jre_x64_windows_hotspot_21.0.12.1_1.zip").as_deref(),
+            Some("https://mirrors.tuna.tsinghua.edu.cn/Adoptium/21/jre/x64/windows/OpenJDK21U-jre_x64_windows_hotspot_21.0.12.1_1.zip"),
+        );
+        for bad in ["", "../x.zip", "a/b.zip", "x.zip?y=1", ".hidden"] {
+            assert!(adoptium_mirror_url(21, &t, bad).is_none(), "{bad:?}: имя идёт в адрес и не должно его менять");
+        }
+    }
+
+    #[test]
+    fn managed_runtime_is_recognised_by_its_folder() {
+        let root = data_dir().join("java");
+        let bin = |dir: &str| root.join(dir).join("bin").join("java");
+        let id = |dir: &str| managed_identity(&bin(dir)).map(|(_, m, a)| (m, a));
+        assert_eq!(id("21"), Some((21, None)));
+        assert_eq!(id("25~1a2b"), Some((25, None)), "запасная папка — та же Java");
+        assert_eq!(id("8-x64"), Some((8, Some("x64"))), "Intel-сборка под Rosetta");
+        assert_eq!(id("99"), None, "версию вне списка лаунчер не ставит");
+        assert_eq!(managed_identity(Path::new("/usr/lib/jvm/java-21/bin/java")), None, "системную Java не трогаем");
+    }
+
+    #[test]
+    fn half_unpacked_jre_is_not_usable() {
+        let d = make("broken");
+        assert!(!java_usable(&d));
+    }
+
+    #[test]
+    fn jre_with_jvm_cfg_is_usable() {
+        let d = make("ok");
+        complete(&d, false);
+        assert!(java_usable(&d));
+    }
+
+    #[test]
+    fn major_is_read_from_version_line() {
+        assert_eq!(parse_major("openjdk version \"21.0.2\" 2024-01-16"), Some(21));
+        assert_eq!(parse_major("java version \"1.8.0_402\""), Some(8));
+        assert_eq!(parse_major("openjdk version \"17\""), Some(17));
+        assert_eq!(parse_major("openjdk 21.0.2"), None);
+    }
+
+    #[test]
+    fn system_java8_without_lets_encrypt_root_is_never_picked_on_its_own() {
+        let cases = [
+            ("java version \"1.8.0_51\"", false, "Mojang's legacy runtime has no ISRG root: authlib-injector cannot fetch the Millida metadata and exits the game on start"),
+            ("java version \"1.8.0_131\"", false, "the last Java 8 update shipped before ISRG Root X1 entered cacerts"),
+            ("java version \"1.8.0_141\"", true, "the first Java 8 update that trusts Let's Encrypt"),
+            ("openjdk version \"1.8.0_462\"", true, "a current Java 8 build must keep saving the download"),
+            ("openjdk version \"1.8.0_402-internal\"", true, "a vendor suffix after the update number is not part of it"),
+            ("java version \"1.8.0\"", false, "Java 8 GA has no update number and no ISRG root"),
+            ("openjdk version \"17.0.2\" 2022-01-18", true, "every Java 9+ ships the ISRG roots, the floor is for Java 8 only"),
+        ];
+        for (line, want, why) in cases {
+            let major = parse_major(line).expect("every case is a real version line");
+            assert_eq!(trusts_lets_encrypt(major, line), want, "{line}: {why}");
+        }
+    }
+
+    fn temp_file(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join("millida-java-guard");
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join(name);
+        std::fs::write(&p, b"x").unwrap();
+        p
+    }
+
+    #[test]
+    fn legacy_versions_need_intel_natives_on_apple_silicon() {
+        for v in ["1.12.2", "1.8.9", "1.7.10", "1.16.5", "1.18.2", "b1.7.3"] {
+            assert!(legacy_natives_version(v), "{} — нативы LWJGL только под Intel", v);
+        }
+        for v in ["1.19", "1.20.1", "1.21.11", "26.3", "24w14a"] {
+            assert!(!legacy_natives_version(v), "{} — есть arm64-нативы", v);
+        }
+    }
+
+    #[test]
+    fn java_binary_name_verdicts() {
+        let win = cfg!(target_os = "windows");
+        // (file name, should be accepted, why this case exists)
+        let cases: &[(&str, bool, &str)] = &[
+            ("java.exe", win, "the Windows JRE launcher is the only accepted name there"),
+            ("JAVA.EXE", win, "Windows file names are case-insensitive"),
+            ("java", !win, "the Unix JRE launcher"),
+            ("javaw.exe", false, "javaw is not probed and would hide its own output"),
+            ("cmd.exe", false, "the whole point: no other executable may be started"),
+            ("java.exe.bat", false, "double extension is a different program"),
+            ("java-old", false, "a name that merely starts with java is not the JRE launcher"),
+            ("", false, "an empty path has no file name"),
+        ];
+
+        for (name, expected_ok, why) in cases {
+            let verdict = java_file_name_ok(Path::new(name));
+            assert_eq!(
+                verdict, *expected_ok,
+                "java_file_name_ok({name:?}) returned {verdict}, expected {expected_ok}. \
+                 Reason this case is pinned: {why}",
+            );
+        }
+    }
+
+    /// Discord labels any process named java/javaw as Minecraft and that label
+    /// replaces our Rich Presence: the game must start under a name Discord has
+    /// no game entry for, and it must stay in the JRE's own bin/ or the JVM
+    /// fails to find its home.
+    #[test]
+    fn game_process_is_never_named_like_java() {
+        let dir = std::env::temp_dir().join("millida-java-brand").join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let java = dir.join(if cfg!(target_os = "windows") { "java.exe" } else { "java" });
+        std::fs::write(&java, b"jre").unwrap();
+
+        let exe = branded_java(&java);
+
+        let name = exe.file_name().unwrap().to_string_lossy().to_ascii_lowercase();
+        assert!(
+            !name.starts_with("java"),
+            "the game started as {name:?}: Discord matches process names and would show Minecraft              instead of Millida Launcher",
+        );
+        assert_eq!(
+            exe.parent(),
+            java.parent(),
+            "the renamed copy left the JRE bin/ ({exe:?}): the JVM locates its home relative to the              executable and would refuse to start",
+        );
+        assert!(exe.exists(), "the copy the game is started from must exist");
+        std::fs::remove_file(&java).ok();
+    }
+
+    /// Antivirus reports and players saw "MillidaLauncher.exe" using 100% CPU
+    /// and 4 GB: the game copy has to read as Minecraft, never as the launcher.
+    #[test]
+    fn game_process_reads_as_minecraft_not_as_the_launcher() {
+        let exe = branded_alias(Path::new("/jre/bin/java")).unwrap();
+        let name = exe.file_name().unwrap().to_string_lossy().to_ascii_lowercase();
+        assert!(name.contains("minecraft"), "the game process {name:?} does not say it is Minecraft");
+        assert!(!name.contains("launcher"), "the game process {name:?} is named like the launcher again");
+        assert!(
+            name.is_ascii() && !name.contains(' ') && !name.contains('(') && !name.contains(')'),
+            "{name:?} must stay plain ASCII: it goes through the ANSI path rewrite and command lines",
+        );
+    }
+
+    #[test]
+    fn running_games_are_recognised_by_every_name_they_had() {
+        let cases: [(&str, bool, &str); 9] = [
+            ("java.exe", true, "a launch that fell back to the original java"),
+            ("javaw.exe", true, "a game started by an older launcher through javaw"),
+            ("java", true, "the Unix launcher"),
+            ("MillidaMinecraft.exe", true, "the current copy on Windows"),
+            ("MillidaMinecraft", true, "the current copy on macOS"),
+            ("MillidaMinecraf", true, "Linux cuts process names to 15 bytes"),
+            ("MillidaLauncher.exe", true, "a game started by the previous version is still running after the update"),
+            ("Millida Launcher.exe", false, "the launcher itself is not a game"),
+            ("chrome.exe", false, "unrelated processes"),
+        ];
+        for (name, want, why) in cases {
+            assert_eq!(is_game_process_name(name), want, "{name}: {why}");
+        }
+    }
+
+    fn brand_dir(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join("millida-java-rename").join(name).join("bin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let java = dir.join(exe_name("java"));
+        std::fs::write(&java, b"jre-bytes").unwrap();
+        let legacy = legacy_alias(&java).unwrap();
+        (dir, java, legacy)
+    }
+
+    #[test]
+    fn the_old_copy_goes_only_after_the_new_one_exists() {
+        let (dir, java, legacy) = brand_dir("ok");
+        std::fs::write(&legacy, b"jre-bytes").unwrap();
+        let exe = branded_java(&java);
+        assert_eq!(Some(exe.clone()), branded_alias(&java), "the game must start from the new copy");
+        assert!(exe.is_file(), "the new copy must exist before anything is removed");
+        assert!(!legacy.exists(), "the old MillidaLauncher copy stays and keeps confusing antivirus software");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_old_copy_stays_when_the_new_one_cannot_be_made() {
+        let (dir, java, legacy) = brand_dir("blocked");
+        std::fs::write(&legacy, b"jre-bytes").unwrap();
+        std::fs::create_dir_all(branded_alias(&java).unwrap()).unwrap();
+        let exe = branded_java(&java);
+        assert_eq!(exe, java, "a failed copy must fall back to the original java");
+        assert!(legacy.is_file(), "the old copy was removed although no new one replaced it");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_foreign_file_with_the_old_name_is_left_alone() {
+        let (dir, java, legacy) = brand_dir("foreign");
+        std::fs::write(&legacy, b"something else entirely").unwrap();
+        branded_java(&java);
+        assert!(legacy.is_file(), "only a copy of java may be deleted, never a file the player put there");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The webview can pass any string to `test_java`; only binaries the core
+    /// itself discovered or the user picked in the native dialog may run.
+    #[test]
+    fn unknown_paths_are_never_executed() {
+        let bin_name = if cfg!(target_os = "windows") { "java.exe" } else { "java" };
+        let planted = temp_file(bin_name);
+        assert!(
+            !java_path_allowed(&planted),
+            "a file named like the JRE launcher but sitting outside every known JRE location must be refused"
+        );
+        assert!(test_java(planted.to_string_lossy().to_string()).is_err(), "test_java must refuse it too");
+
+        let other = temp_file("evil.exe");
+        assert!(!java_path_allowed(&other), "an arbitrary executable must be refused");
+
+        let missing = std::env::temp_dir().join("millida-java-guard").join("nope").join(bin_name);
+        assert!(!java_path_allowed(&missing), "a path that does not exist cannot be a JRE");
+    }
+
+    /// The Java chosen in settings is started for every build that has none of
+    /// its own, so it goes through the same gate as a per-build path.
+    #[test]
+    fn default_java_refuses_unvouched_paths() {
+        let bin_name = if cfg!(target_os = "windows") { "java.exe" } else { "java" };
+        let planted = temp_file(bin_name);
+        assert!(
+            set_default_java(Some(planted.to_string_lossy().to_string())).is_err(),
+            "a file named like the JRE launcher but outside every known JRE location must not become the default Java"
+        );
+        assert!(
+            set_default_java(Some(temp_file("evil.exe").to_string_lossy().to_string())).is_err(),
+            "an arbitrary executable must never be stored as the default Java"
+        );
+    }
+
+    /// A sandboxed file dialog answers with a single-file copy of the binary. It
+    /// is named `java`, it is executable, and it dies on `libjli.so`, so the tree
+    /// around it is what separates a real JRE from a useless proxy.
+    #[test]
+    fn lone_java_binary_is_not_a_runtime() {
+        let d = make("lone");
+        let bin = java_bin(&d);
+        assert!(!java_tree_ok(&bin), "java without its own lib/jvm.cfg cannot start a JVM");
+        assert!(
+            accept_picked_java(bin.to_string_lossy().to_string()).is_err(),
+            "picking a single-file java must be refused instead of stored as a working runtime"
+        );
+
+        let lib = java_home(&d).join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("jvm.cfg"), b"-server KNOWN").unwrap();
+        assert!(java_tree_ok(&bin), "the same binary inside a complete JRE is fine");
+    }
+
+    /// `java -version` and a failing loader both write to stderr, so a version has
+    /// to be recognised as one — otherwise `libjli.so: cannot open shared object
+    /// file` is stored and shown to the user as the installed Java version.
+    #[test]
+    fn only_a_real_version_line_counts() {
+        // (stderr of `java -version`, version reported, why this case is pinned)
+        let cases: &[(&str, Option<&str>, &str)] = &[
+            (
+                "openjdk version \"25.0.1\" 2025-10-21\nOpenJDK Runtime Environment\n",
+                Some("openjdk version \"25.0.1\" 2025-10-21"),
+                "a normal answer",
+            ),
+            ("java version \"1.8.0_402\"\n", Some("java version \"1.8.0_402\""), "the Java 8 spelling"),
+            (
+                "Picked up JAVA_TOOL_OPTIONS: -Dfoo\nopenjdk version \"21.0.2\" 2024-01-16\n",
+                Some("openjdk version \"21.0.2\" 2024-01-16"),
+                "the JVM prints an options notice above the version line",
+            ),
+            (
+                "/run/user/1000/doc/S6NX/java: error while loading shared libraries: libjli.so: cannot open shared object file: No such file or directory\n",
+                None,
+                "the sandbox single-file copy fails exactly like this and used to be stored as a working Java",
+            ),
+            ("Error occurred during initialization of VM\n", None, "a JVM that dies before printing a version"),
+            ("", None, "no output at all"),
+        ];
+        for (stderr, expected, why) in cases {
+            let got = version_line(stderr);
+            assert_eq!(
+                got.as_deref(),
+                *expected,
+                "stderr {stderr:?} reported {got:?}, expected {expected:?}. Pinned because: {why}",
+            );
+        }
+    }
+
+    #[test]
+    fn downloadable_majors_are_a_closed_list() {
+        // The number reaches the Adoptium URL and a directory name.
+        assert!(JAVA_MAJORS.contains(&21), "the current default runtime must stay fetchable");
+        assert!(!JAVA_MAJORS.contains(&0), "a major the launcher cannot map to a release must not be requestable");
+    }
+
+    /// Writes the trusted-paths index into the launcher data directory, so it is
+    /// run manually: `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "writes into the launcher data directory"]
+    fn picked_java_stays_allowed() {
+        let bin_name = if cfg!(target_os = "windows") { "java.exe" } else { "java" };
+        let picked = temp_file(bin_name);
+        assert!(!java_path_allowed(&picked), "not allowed before it is picked");
+        trust_java_path(&picked);
+        assert!(java_path_allowed(&picked), "a Java picked in the dialog must keep working after a restart");
+        let mut left = trusted_java_paths();
+        left.retain(|p| !same_file(Path::new(p), &picked));
+        let _ = write_json_atomic(&trusted_java_index(), &left);
+    }
+
+    fn assets(link: &str, checksum: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "binary": { "package": { "link": link, "checksum": checksum, "size": 42u64 } }
+        }])
+    }
+
+    #[test]
+    fn adoptium_entry_verdicts() {
+        let good = "7fe2324cc5901a89aaa0e8dc232075c59f2aca5270c533bdb1b861a5274af834";
+        // (link, checksum, accepted, why this case is pinned)
+        let cases: &[(&str, &str, bool, &str)] = &[
+            ("https://github.com/a/OpenJDK17U-jre.zip", good, true, "a normal Adoptium answer"),
+            ("http://github.com/a/OpenJDK17U-jre.zip", good, false, "plain HTTP could be swapped in transit"),
+            ("https://github.com/a/OpenJDK17U-jre.zip", "", false, "no checksum means the archive cannot be verified"),
+            ("https://github.com/a/OpenJDK17U-jre.zip", "7fe232", false, "a truncated digest is not a sha256"),
+            ("https://github.com/a/OpenJDK17U-jre.zip", &good.replace('7', "z"), false, "a non-hex digest never matches"),
+        ];
+        for (link, checksum, expected, why) in cases {
+            let got = adoptium_package(&assets(link, checksum)).is_some();
+            assert_eq!(got, *expected, "link {link:?} checksum {checksum:?} accepted={got}, expected {expected}. Pinned because: {why}");
+        }
+        assert!(adoptium_package(&serde_json::json!([])).is_none(), "an empty answer offers no JRE");
+        assert_eq!(
+            adoptium_package(&assets("https://h/x.zip", good)).map(|p| p.sha256),
+            Some(good.to_string()),
+            "the digest must reach download_checked unchanged"
+        );
+    }
+
+    #[test]
+    fn azul_entry_verdicts() {
+        let good = "6653196e329d393ea2ef007af90517c01781dbf5aac02fdfa84d912a55bf78f3";
+        let detail = |url: &str, sum: &str| serde_json::json!({ "download_url": url, "sha256_hash": sum });
+        // (download_url, sha256, accepted, why this case is pinned)
+        let cases: &[(&str, &str, bool, &str)] = &[
+            ("https://cdn.azul.com/zulu/bin/zulu21-jre.zip", good, true, "a normal Azul answer"),
+            ("http://cdn.azul.com/zulu/bin/zulu21-jre.zip", good, false, "plain HTTP could be swapped in transit"),
+            ("https://cdn.evil.com/zulu/bin/zulu21-jre.zip", good, false, "only the vendor CDN may serve an executed archive"),
+            ("https://cdn.azul.com/zulu/bin/zulu21-jre.zip", "", false, "no checksum means the archive cannot be verified"),
+            ("https://cdn.azul.com/zulu/bin/zulu21-jre.zip", "6653196e", false, "a truncated digest is not a sha256"),
+        ];
+        for (url, sum, expected, why) in cases {
+            let got = azul_package(&detail(url, sum)).is_some();
+            assert_eq!(got, *expected, "url {url:?} sha256 {sum:?} accepted={got}, expected {expected}. Pinned because: {why}");
+        }
+        assert_eq!(
+            azul_package(&detail("https://cdn.azul.com/zulu/bin/z.zip", good)).map(|p| p.sha256),
+            Some(good.to_string()),
+            "the digest must reach download_checked unchanged"
+        );
+    }
+
+    #[test]
+    fn azul_uuid_must_be_path_safe() {
+        let list = |uuid: &str| serde_json::json!([{ "package_uuid": uuid }]);
+        assert!(azul_uuid(&list("55b71f6b-cb92-4a1f-8d96-dcb5bc680881")).is_some(), "a normal uuid resolves the package");
+        assert!(azul_uuid(&list("../../etc/passwd")).is_none(), "the uuid reaches a URL and a cache file name");
+        assert!(azul_uuid(&list("a b")).is_none(), "a space would split the request line");
+        assert!(azul_uuid(&serde_json::json!([])).is_none(), "an empty listing offers no JRE");
+    }
+
+    #[test]
+    fn nested_runtime_is_lifted_to_the_top() {
+        let d = std::env::temp_dir().join("millida-java-test").join("nested-jre");
+        let _ = std::fs::remove_dir_all(&d);
+        let inner = d.join("zulu-21.jre");
+        complete(&inner, false);
+        let bin = java_home(&inner).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join(if cfg!(target_os = "windows") { "java.exe" } else { "java" }), b"x").unwrap();
+        assert!(!java_usable(&d), "the runtime starts one level too deep");
+        unwrap_single_dir(&d).unwrap();
+        assert!(java_usable(&d), "a vendor that nests the runtime must still install");
+    }
+
+    #[test]
+    fn java8_arch_subdir_is_usable() {
+        let d = make("java8");
+        complete(&d, true);
+        assert!(java_usable(&d));
+    }
+}

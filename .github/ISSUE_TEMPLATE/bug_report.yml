@@ -1,0 +1,104 @@
+name: Bug report
+description: Something does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the report. The more exact the steps, the faster we find the cause.
+        Please write in English.
+
+        Found a vulnerability? Do not create an issue. The procedure is in
+        [SECURITY.md](https://github.com/millida/launcher/blob/main/SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: Launcher version
+      description: Shown in the launcher settings. Check that the problem happens on the latest version.
+      placeholder: 1.0.123
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux
+    validations:
+      required: true
+
+  - type: input
+    id: os_details
+    attributes:
+      label: OS details
+      description: The version and, for Linux, the distribution and install method (deb, rpm, AppImage).
+      placeholder: Ubuntu 24.04, AppImage
+    validations:
+      required: false
+
+  - type: input
+    id: minecraft
+    attributes:
+      label: Minecraft version and loader
+      description: The game version and the mod loader, if you use one.
+      placeholder: 1.21.4, Fabric 0.16.9
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: What you did
+      description: Step by step, from the very start, so that it can be repeated on a clean install.
+      placeholder: |
+        1. Opened the "My instances" tab
+        2. Clicked "Play" on an instance with Fabric
+        3. Waited for the download to finish
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: The full error text, if there is one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log
+      description: |
+        The launch log or the launcher console. A piece around the error is enough. Do not paste the whole file.
+
+        Before you send it, read through the text: logs and screenshots can contain
+        session tokens, links with access keys and email addresses. Replace them
+        with `***`. Do not post the whole launcher data folder: it holds
+        `secrets.bin` and `device.key`, and saved sessions.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you send
+      options:
+        - label: I checked on the latest launcher version
+          required: true
+        - label: I removed tokens, links with keys and personal data from logs and screenshots
+          required: true

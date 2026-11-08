@@ -1,0 +1,545 @@
+import { useEffect, useRef, useState } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
+import { Icon } from '../Icon'
+import { MrIcon, TagGlyph } from './SiteRow'
+import { SITE_SECTIONS, capFirst, categoryIconSrc, categoryLabel, fmtNum, loaderIconSrc, loaderLabel, loaderTone } from './site'
+import { useCatalogHide } from './catalogHide'
+import type { SiteFacets, SiteSection } from './site'
+import type { SiteAccess, SiteSort } from './siteStore'
+import type { PriceFilter, SideFilter } from './sections'
+import { t, useT } from '../../i18n'
+import { sellsPaidPacks } from '../../lib/paidPacks'
+
+/*
+ * Колонка фильтров — как на сайте (`mr-filters.tsx`): группы «Версия игры»,
+ * «Загрузчик», «Категории» со сворачиванием, пиксельной галочкой и числом
+ * материалов; у версий сперва видны наполненные (от 12 материалов), «Показать
+ * все · N» раскрывает весь список в порядке версий. Версия и загрузчик
+ * выбираются по одному, повторное нажатие снимает выбор — поведение галочки
+ * на сайте.
+ */
+
+const VISIBLE = 10
+
+export interface FilterOpt {
+  key: string
+  label: string
+  count?: number
+  active: boolean
+  onPick: () => void
+  icon?: ReactNode
+  tone?: string | null
+}
+
+export function FilterGroup({
+  title,
+  opts,
+  lead,
+  name,
+}: {
+  title: string
+  opts: FilterOpt[]
+  lead?: (o: FilterOpt) => boolean
+  /** Машинное имя фильтра для аналитики: filter_<name>. */
+  name?: string
+}) {
+  const t = useT()
+  const [open, setOpen] = useState(true)
+  const head = (lead ? opts.filter(lead) : opts).slice(0, VISIBLE)
+  const shown = head.length ? head : opts.slice(0, 1)
+  const hidden = opts.length - shown.length
+  const [more, setMore] = useState(() => opts.some((o) => o.active && !shown.includes(o)))
+  if (!opts.length) return null
+  return (
+    <div className={'card mr-group' + (open ? ' is-open' : '')}>
+      <button type="button" className="mr-group-head" aria-expanded={open} data-track={name ? 'filter_' + name + '_group' : undefined} onClick={() => setOpen((v) => !v)}>
+        <span>{title}</span>
+        <Icon id="i-chev-d" />
+      </button>
+      {open ? (
+        <div className="mr-opts">
+          {(more ? opts : shown).map((o) => (
+            <Opt key={o.key} o={o} name={name} />
+          ))}
+          {hidden && !more ? (
+            <button type="button" className="mr-more-btn" data-track={name ? 'filter_' + name + '_more' : undefined} onClick={() => setMore(true)}>
+              {t('Показать все · {n}', { n: hidden })}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function Opt({ o, name }: { o: FilterOpt; name?: string }) {
+  const tone = o.tone ? ({ color: o.tone } as CSSProperties) : undefined
+  return (
+    <button
+      type="button"
+      className={'mr-opt' + (o.active ? ' is-on' : '')}
+      aria-pressed={o.active}
+      data-track={name ? 'filter_' + name : undefined}
+      data-id={name ? o.key : undefined}
+      onClick={o.onPick}
+    >
+      <span className={'mr-check' + (o.active ? ' is-on' : '')} aria-hidden="true" />
+      <span className="mr-opt-label">
+        {o.icon ? (
+          <span className="mr-opt-ic" style={tone}>
+            {o.icon}
+          </span>
+        ) : null}
+        <span className="mr-opt-name" style={tone}>
+          {o.label}
+        </span>
+      </span>
+      {o.count !== undefined ? <span className="mr-opt-cnt">{fmtNum(o.count)}</span> : null}
+    </button>
+  )
+}
+
+/* ── Ключи: компактная панель как на сайте (`mr-filters.tsx`, 30.09.2026) ── */
+
+const LOADERS_VISIBLE = 6
+const CATS_VISIBLE = 12
+const CATS_VISIBLE_TIGHT = 6
+const USES_VISIBLE = 6
+
+const sorts = (): [SiteSort, string][] => [
+  ['relevance', t('По релевантности')],
+  ['recommended', t('Рекомендуемые')],
+  ['popular', t('По скачиваниям')],
+  ['follows', t('По подписчикам')],
+  ['new', t('Новые')],
+  ['updated', t('Обновлённые')],
+]
+/** Без поиска релевантности нет; подписчиков и «обновлённых» — только если сервер их знает. */
+const sortsFor = (searching: boolean, server: string[]) =>
+  sorts().filter(([id]) => (id === 'relevance' ? searching : id === 'follows' || id === 'updated' ? server.includes(id) : true))
+
+function Key({ o, name, plain }: { o: FilterOpt; name?: string; plain?: boolean }) {
+  const tone = o.tone ? ({ color: o.tone } as CSSProperties) : undefined
+  return (
+    <button
+      type="button"
+      className={'seg mr-key' + (o.active ? ' on' : '')}
+      aria-pressed={o.active}
+      data-track={name ? 'filter_' + name : undefined}
+      data-id={name ? o.key : undefined}
+      onClick={o.onPick}
+    >
+      {!plain && o.icon ? (
+        <span className="mr-key-ic" style={tone}>
+          {o.icon}
+        </span>
+      ) : null}
+      <span className="mr-key-t" style={tone}>
+        {o.label}
+      </span>
+      {o.count !== undefined ? <span className="mr-key-n">{fmtNum(o.count)}</span> : null}
+    </button>
+  )
+}
+
+/** Закрывает раскрытый список по клику мимо и по Escape. */
+function useDismiss(open: boolean, close: () => void) {
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const down = (e: PointerEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) close()
+    }
+    const key = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') close()
+    }
+    document.addEventListener('pointerdown', down)
+    document.addEventListener('keydown', key)
+    return () => {
+      document.removeEventListener('pointerdown', down)
+      document.removeEventListener('keydown', key)
+    }
+  }, [open, close])
+  return ref
+}
+
+function PickBtn({ open, onClick, children, label }: { open: boolean; onClick: () => void; children: ReactNode; label: string }) {
+  return (
+    <button type="button" className={'seg mr-pick-btn' + (open ? ' is-open' : '')} aria-expanded={open} aria-label={label} onClick={onClick}>
+      {children}
+      <Icon id="i-chev-d" />
+    </button>
+  )
+}
+
+function SortPicker({ value, onPick, searching, server }: { value: SiteSort; onPick: (v: SiteSort) => void; searching: boolean; server: string[] }) {
+  const t = useT()
+  const [open, setOpen] = useState(false)
+  const ref = useDismiss(open, () => setOpen(false))
+  const list = sortsFor(searching, server)
+  const cur = sorts().find(([id]) => id === value) ?? list[0]!
+  return (
+    <div className="mr-pick" ref={ref}>
+      <PickBtn open={open} onClick={() => setOpen((v) => !v)} label={t('Сортировка')}>
+        <span className="mr-pick-v">
+          <span className="mr-pick-l">{t('Сорт.:')}</span> {cur[1]}
+        </span>
+      </PickBtn>
+      {open ? (
+        <div className="mr-pick-pop">
+          {list.map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              className={'seg mr-key mr-key-wide' + (id === value ? ' on' : '')}
+              data-track={'sort_' + id}
+              onClick={() => {
+                onPick(id)
+                setOpen(false)
+              }}
+            >
+              <span className="mr-key-t">{label}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function VersionPicker({ opts, current, quick }: { opts: FilterOpt[]; current: string | null; quick: FilterOpt[] }) {
+  const t = useT()
+  const [open, setOpen] = useState(false)
+  const [q, setQ] = useState('')
+  const ref = useDismiss(open, () => setOpen(false))
+  const needle = q.trim().toLowerCase()
+  const list = needle ? opts.filter((o) => o.label.toLowerCase().includes(needle)) : opts
+  return (
+    <div className="mr-pick" ref={ref}>
+      <PickBtn open={open} onClick={() => setOpen((v) => !v)} label={t('Версия игры')}>
+        <span className={'mr-pick-v' + (current ? '' : ' is-empty')}>{current ?? t('Все версии')}</span>
+      </PickBtn>
+      {open ? (
+        <div className="mr-pick-pop">
+          <label className="mr-pick-q">
+            <Icon id="i-search" />
+            <input type="search" inputMode="decimal" autoFocus value={q} placeholder={t('Найти версию')} aria-label={t('Найти версию')} onChange={(e) => setQ(e.target.value)} />
+          </label>
+          <div className="mr-pick-list">
+            {list.map((o) => (
+              <button
+                key={o.key}
+                type="button"
+                className={'seg mr-key' + (o.active ? ' on' : '')}
+                aria-pressed={o.active}
+                data-track="filter_version"
+                data-id={o.key}
+                onClick={() => {
+                  o.onPick()
+                  setOpen(false)
+                }}
+              >
+                <span className="mr-key-t">{o.label}</span>
+                {o.count !== undefined ? <span className="mr-key-n">{fmtNum(o.count)}</span> : null}
+              </button>
+            ))}
+            {list.length === 0 ? <div className="mr-pick-none">{t('Нет такой версии')}</div> : null}
+          </div>
+        </div>
+      ) : null}
+      {!open && quick.length > 1 ? (
+        <div className="mr-quick">
+          {quick.map((o) => (
+            <button key={o.key} type="button" className={'seg mr-key' + (o.active ? ' on' : '')} aria-pressed={o.active} data-track="filter_version" data-id={o.key} onClick={o.onPick}>
+              <span className="mr-key-t">{o.label}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function KeySection({
+  title,
+  opts,
+  split = VISIBLE,
+  name,
+  plain,
+  moreLabel,
+}: {
+  title: string
+  opts: FilterOpt[]
+  split?: number
+  name: string
+  plain?: boolean
+  moreLabel?: string
+}) {
+  const t = useT()
+  const cut = Math.max(1, Math.min(opts.length, split))
+  // Хвост из одного ключа не прячем: «Ещё 1» занимает столько же места.
+  const head = opts.length - cut <= 1 ? opts : opts.slice(0, cut)
+  const rest = opts.slice(head.length)
+  const [more, setMore] = useState(() => rest.some((o) => o.active))
+  if (!opts.length) return null
+  return (
+    <section className="mr-fsec">
+      <div className="mr-fsec-t">{title}</div>
+      <div className="mr-keys">
+        {head.map((o) => (
+          <Key key={o.key} o={o} name={name} plain={plain} />
+        ))}
+        {rest.length && !more ? (
+          <button type="button" className="seg mr-key mr-more" data-track={'filter_' + name + '_more'} onClick={() => setMore(true)}>
+            <span className="mr-key-t">{moreLabel ?? t('Ещё')}</span>
+            <span className="mr-key-n">{rest.length}</span>
+            <Icon id="i-chev-d" />
+          </button>
+        ) : null}
+        {more ? rest.map((o) => <Key key={o.key} o={o} name={name} plain={plain} />) : null}
+        {rest.length && more ? (
+          <button type="button" className="seg mr-key mr-more mr-more-close" data-track={'filter_' + name + '_less'} onClick={() => setMore(false)}>
+            <span className="mr-key-t">{t('Свернуть')}</span>
+            <Icon id="i-chev-d" />
+          </button>
+        ) : null}
+      </div>
+    </section>
+  )
+}
+
+const prices = (): [PriceFilter, string][] => [
+  ['free', t('Бесплатно')],
+  ['paid', t('Платно')],
+]
+
+const accessKinds = (): [Exclude<SiteAccess, 'all'>, string][] => [
+  ['premium', t('Премиум')],
+  ['free', t('Обычные')],
+]
+
+export function SiteFilters({
+  sec,
+  facets,
+  version,
+  loader,
+  category,
+  access,
+  ruCount = 0,
+  use = null,
+  price = null,
+  side = null,
+  sort,
+  onSort,
+  searching,
+  serverSorts,
+  onPatch,
+  onReset,
+}: {
+  sec: SiteSection
+  facets: SiteFacets | null
+  version: string | null
+  loader: string | null
+  category: string | null
+  /** Только у сборок: премиум-сборки Millida или обычные. Фильтр, а не полоса над карточками (владелец 29.09.2026). */
+  access?: SiteAccess
+  /** Переводов Millida на русский: есть — в колонке группа «Язык». */
+  ruCount?: number
+  /** «Для чего», цена — колонки фильтров сайта (30.09.2026). */
+  use?: string | null
+  price?: PriceFilter | null
+  /** Only mods the server does not need. */
+  side?: SideFilter | null
+  /** Сортировка — выпадающий список вверху панели, как на сайте. */
+  sort?: SiteSort
+  onSort?: (v: SiteSort) => void
+  /** Идёт поиск — в сортировке появляется «По релевантности». */
+  searching?: boolean
+  /** Сортировки, которые знает сервер. */
+  serverSorts?: string[]
+  onPatch: (p: {
+    version?: string | null
+    loader?: string | null
+    category?: string | null
+    access?: SiteAccess
+      use?: string | null
+    price?: PriceFilter | null
+    side?: SideFilter | null
+  }) => void
+  onReset: () => void
+}) {
+  const t = useT()
+  const hide = useCatalogHide()
+  if (!facets) return <FiltersSkeleton />
+  const filled = new Set(facets.versions.filter((v) => v.count >= 12 || v.value === version).map((v) => v.value))
+  const versions: FilterOpt[] = facets.versions.map((v) => ({
+    key: v.value,
+    label: v.value,
+    count: v.count,
+    active: version === v.value,
+    onPick: () => onPatch({ version: version === v.value ? null : v.value }),
+  }))
+  const loaders: FilterOpt[] = sec.loaderAxis
+    ? facets.loaders
+        // Хвост из единиц («canvas 2», «Fabric 1» у шейдеров) — шум: прячем, пока не выбран.
+        .filter((l) => l.count >= 10 || loader === l.value)
+        // Только загрузчики этого раздела: у модов — Fabric, Forge, NeoForge, Quilt, без
+        // «Дата-пак», «Paper» и «Ванильная игра» (владелец 10.10.2026: «фильтры продумай»).
+        .filter((l) => loader === l.value || loaderFitsSection(sec, l.value))
+        .slice(0, 14)
+        .map((l) => {
+        const src = loaderIconSrc(l.value)
+        return {
+          key: l.value,
+          label: capFirst(loaderLabel(l.value)),
+          count: l.count,
+          tone: loaderTone(l.value),
+          icon: src ? <TagGlyph node={<MrIcon src={src} size={12} />} tone={loaderTone(l.value)} /> : null,
+          active: loader === l.value,
+          onPick: () => onPatch({ loader: loader === l.value ? null : l.value }),
+        }
+      })
+    : []
+  const cats: FilterOpt[] = (facets.categories || []).map((c) => {
+    const src = categoryIconSrc(c.value)
+    return {
+      key: c.value,
+      label: categoryLabel(c.value),
+      count: c.count,
+      icon: src ? <TagGlyph node={<MrIcon src={src} size={12} />} /> : null,
+      active: category === c.value,
+      onPick: () => onPatch({ category: category === c.value ? null : c.value }),
+    }
+  })
+  // Переводы студии на русский — строкой фильтра с подсветкой (владелец 12.10.2026: «слева надо выделить»).
+  const langOpts: FilterOpt[] = [
+    {
+      key: 'ru',
+      label: t('На русском'),
+      count: ruCount,
+      icon: <i className="mr-ru-badge">RU</i>,
+      tone: 'var(--m-rarity-rare)',
+      active: access === 'ru',
+      onPick: () => onPatch({ access: access === 'ru' ? 'all' : 'ru' }),
+    },
+  ]
+  const accessOpts: FilterOpt[] = access && sellsPaidPacks()
+    ? accessKinds().map(([id, label]) => ({
+        key: id,
+        label,
+        active: access === id,
+        onPick: () => onPatch({ access: access === id ? 'all' : id }),
+      }))
+    : []
+  const uses: FilterOpt[] = (facets.uses || []).map((u) => ({
+    key: u.value,
+    label: t(u.label),
+    count: u.count,
+    active: use === u.value,
+    onPick: () => onPatch({ use: use === u.value ? null : u.value }),
+  }))
+  const priceOpts: FilterOpt[] = (sellsPaidPacks() ? prices() : []).map(([id, label]) => ({
+    key: id,
+    label,
+    active: price === id,
+    onPick: () => onPatch({ price: price === id ? null : id }),
+  }))
+  const sides: FilterOpt[] =
+    sec.kind === 'mod'
+      ? [
+          {
+            key: 'client',
+            label: t('Только для клиента'),
+            active: side === 'client',
+            onPick: () => onPatch({ side: side === 'client' ? null : 'client' }),
+          },
+        ]
+      : []
+  // Быстрые ключи под списком — четыре самые наполненные версии Java. Версии другого издания нумеруются так же
+  // («26.10», «26.30») — в ключах Java-раздела они путали (владелец: «26.10, 26.30 — что это»).
+  const otherEdition = (v: string) => /^2\d\.(\d+)0(\.\d+)?$/.test(v) && Number(v.split('.')[1]) >= 10
+  const quick = versions
+    .filter((o) => filled.has(o.key) && !otherEdition(o.key))
+    .slice()
+    .sort((x, y) => (y.count ?? 0) - (x.count ?? 0))
+    .slice(0, 4)
+  const hideOpts: FilterOpt[] = SITE_SECTIONS.includes(sec)
+    ? [{ key: 'installed', label: t('Установленное'), active: hide.installed, onPick: () => hide.setInstalled(!hide.installed) }]
+    : []
+  const excludeOpts: FilterOpt[] = (facets.categories || []).map((c) => ({
+    key: c.value,
+    label: categoryLabel(c.value),
+    active: hide.excluded.includes(c.value),
+    onPick: () => hide.toggleExcluded(c.value),
+  }))
+  const anyActive = !!(version || loader || category || use || price || side || (access && access !== 'all'))
+  const tight = uses.length > 0
+  return (
+    <div className="card mr-filters mr-fbox">
+      {sort && onSort ? <SortPicker value={sort} onPick={onSort} searching={!!searching} server={serverSorts || []} /> : null}
+      {anyActive ? (
+        <button type="button" className="mr-reset" data-track="filter_reset" onClick={onReset}>
+          {t('Сбросить')}
+        </button>
+      ) : null}
+      {access && ruCount ? <KeySection title={t('Язык')} name="lang" opts={langOpts} /> : null}
+      {versions.length ? (
+        <section className="mr-fsec">
+          <div className="mr-fsec-t">{t('Версия')}</div>
+          <VersionPicker opts={versions} current={version} quick={quick} />
+        </section>
+      ) : null}
+      {/* «Доступ» — только когда выбран: платных единицы (владелец 30.09.2026, 20:39). */}
+      {(access === 'premium' || access === 'free') && accessOpts.length ? <KeySection title={t('Доступ')} name="access" opts={accessOpts} plain /> : null}
+      <KeySection title={t('Загрузчик')} name="loader" opts={loaders} split={LOADERS_VISIBLE} />
+      <KeySection title={t('Сторона')} name="side" opts={sides} plain />
+      <KeySection title={t('Для чего')} name="use" opts={uses} split={USES_VISIBLE} plain />
+      <KeySection title={t('Категории')} name="category" opts={cats} split={tight ? CATS_VISIBLE_TIGHT : CATS_VISIBLE} plain moreLabel={t('Все категории')} />
+      <KeySection title={t('Скрыть')} name="hide" opts={hideOpts} plain />
+      <KeySection title={t('Без категорий')} name="exclude" opts={[...excludeOpts.filter((o) => o.active), ...excludeOpts.filter((o) => !o.active)]} split={Math.max(2, hide.excluded.length)} plain moreLabel={t('Все категории')} />
+      {access || !priceOpts.length ? null : <KeySection title={t('Цена')} name="price" opts={priceOpts} plain />}
+    </div>
+  )
+}
+
+const MOD_LOADERS = new Set(['fabric', 'forge', 'neoforge', 'quilt', 'legacy-fabric', 'ornithe', 'babric', 'liteloader', 'rift'])
+const PLUGIN_LOADERS = new Set(['paper', 'spigot', 'bukkit', 'purpur', 'folia', 'sponge', 'velocity', 'bungeecord', 'waterfall', 'geyser'])
+const SHADER_LOADERS = new Set(['iris', 'optifine', 'canvas', 'vanilla'])
+
+/** Загрузчик к месту в этом разделе: в «Все» — как у модов (главный вопрос — «под Fabric?»). */
+function loaderFitsSection(sec: Pick<SiteSection, 'kind' | 'slug'>, value: string): boolean {
+  if (sec.kind === 'plugin' || sec.kind === 'serverpack') return PLUGIN_LOADERS.has(value)
+  if (sec.kind === 'shader') return SHADER_LOADERS.has(value)
+  if (sec.kind === 'mod' || sec.kind === 'modpack' || sec.slug === 'all') return MOD_LOADERS.has(value)
+  return true
+}
+
+/** Пока фильтры в пути — та же колонка с настоящими заголовками и полосками вместо строк. */
+function FiltersSkeleton() {
+  const t = useT()
+  const row = (w: number, k: number) => (
+    <span key={k} className="seg mr-key">
+      <span className="skel-text" style={{ width: w + '%' }} />
+    </span>
+  )
+  return (
+    <div className="card mr-filters mr-fbox cat-skel" aria-hidden="true">
+      <section className="mr-fsec">
+        <div className="mr-fsec-t">{t('Версия')}</div>
+        <span className="seg mr-key">
+          <span className="skel-text" style={{ width: '45%' }} />
+        </span>
+      </section>
+      {[
+        [t('Загрузчик'), [52, 44, 60, 38]],
+        [t('Для чего'), [56, 40, 64, 48, 36]],
+        [t('Категории'), [62, 50, 70, 44, 58, 40]],
+      ].map(([title, rows]) => (
+        <section key={title as string} className="mr-fsec">
+          <div className="mr-fsec-t">{title as string}</div>
+          <div className="segs mr-keys">{(rows as number[]).map(row)}</div>
+        </section>
+      ))}
+    </div>
+  )
+}

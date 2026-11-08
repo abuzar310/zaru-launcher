@@ -1,0 +1,31 @@
+import { hasTauri, tauri } from '../ipc/tauri'
+import { openShopAt } from './openShopAt'
+import type { OverlayCard } from '../ipc/commands'
+import { setScreen } from '../state/ui'
+import { openChat, openRoomChat } from '../state/friends'
+import { restoreLauncher } from './window'
+import { t } from '../i18n'
+
+/// A click on an overlay card that the core decided the launcher should answer:
+/// the window is already coming up natively, the webview only has to land on
+/// the conversation the card was about.
+function handle(card: OverlayCard) {
+  restoreLauncher()
+  if (card.open === 'daily') {
+    openShopAt()
+    return
+  }
+  setScreen('friends')
+  if (card.open === 'room' && card.uid) {
+    void openRoomChat(card.uid, card.nick || t('Группа')).catch(() => {})
+    return
+  }
+  if (card.open === 'chat' && card.uid) void openChat(card.uid, card.nick || '').catch(() => {})
+}
+
+export function initOverlayLink() {
+  if (!hasTauri()) return
+  const T = tauri()
+  if (!T) return
+  void T.event.listen<OverlayCard>('overlay-open', (e) => handle(e.payload)).catch(() => {})
+}

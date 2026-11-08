@@ -1,0 +1,140 @@
+// Overlay settings commands (small cards on top of the game): on/off, hotkey, duration.
+// No network. Everything is kept in the launcher settings file.
+use crate::overlay;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayState {
+    pub enabled: bool,
+    pub toasts: bool,
+    pub hotkey: String,
+    pub card_ms: u64,
+}
+
+/// Every field is a read of the settings file: off the UI thread.
+#[tauri::command]
+pub async fn overlay_state() -> Result<OverlayState, String> {
+    super::blocking(|| OverlayState {
+        enabled: overlay::enabled(),
+        toasts: overlay::toasts_enabled(),
+        hotkey: overlay::hotkey(),
+        card_ms: overlay::card_ms(),
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn overlay_set_enabled(app: tauri::AppHandle, on: bool) -> Result<(), String> {
+    crate::engine::set_ui_pref("overlay-enabled".into(), if on { "1".into() } else { "0".into() })?;
+    if on {
+        overlay::show(&app, false)?;
+        overlay::hide(&app);
+    } else {
+        overlay::hide(&app);
+    }
+    overlay::rebind_hotkey(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn overlay_set_hotkey(app: tauri::AppHandle, hotkey: String) -> Result<(), String> {
+    crate::engine::set_ui_pref("overlay-hotkey".into(), hotkey)?;
+    overlay::rebind_hotkey(&app);
+    Ok(())
+}
+
+/// How long a notification card stays on screen. Out-of-range values are pulled
+/// back into the usable range rather than rejected: the card is the only way the
+/// message reaches a player in game, so it must never end up unreadably short.
+#[tauri::command]
+pub async fn overlay_set_card_ms(ms: u64) -> Result<(), String> {
+    super::blocking(move || overlay::set_card_ms(ms)).await?
+}
+
+/// Called by the main window when a message arrives while a game is running:
+/// the overlay stays passive so the click lands in Minecraft, not in the card.
+#[tauri::command]
+pub async fn overlay_notify(app: tauri::AppHandle, payload: serde_json::Value) -> Result<(), String> {
+    if !overlay::enabled() {
+        return Ok(());
+    }
+    overlay::notify(&app, payload).await
+}
+
+#[tauri::command]
+pub fn overlay_set_toasts(app: tauri::AppHandle, on: bool) -> Result<(), String> {
+    crate::engine::set_ui_pref("overlay-toasts".into(), if on { "1".into() } else { "0".into() })?;
+    if !on {
+        overlay::hide(&app);
+    }
+    Ok(())
+}
+
+/// Friend presence and messages while the launcher is not the focused window.
+/// Unlike `overlay_notify` this does not need the in-game overlay: the card is a
+/// desktop toast and must work with no game running at all.
+#[tauri::command]
+pub async fn overlay_toast(app: tauri::AppHandle, payload: serde_json::Value) -> Result<(), String> {
+    if !overlay::toasts_enabled() {
+        return Ok(());
+    }
+    overlay::notify(&app, payload).await
+}
+
+#[tauri::command]
+pub fn overlay_hide(app: tauri::AppHandle) {
+    overlay::hide(&app);
+}
+
+/// Where the passive cards are on screen right now, in CSS pixels relative to
+/// the overlay window. Only these spots take the pointer; everywhere else the
+/// click belongs to the game.
+#[tauri::command]
+pub fn overlay_hit_areas(rects: Vec<[f64; 4]>) {
+    overlay::set_hit_areas(rects.into_iter().filter(|r| r[2] > 0.0 && r[3] > 0.0).take(8).collect());
+}
+
+/// A click on a card: open the conversation over the game, or hand it to the
+/// launcher when no game is running.
+#[tauri::command]
+pub fn overlay_open(
+    app: tauri::AppHandle,
+    payload: serde_json::Value,
+    to_launcher: Option<bool>,
+) -> Result<(), String> {
+    overlay::open_card(&app, payload, to_launcher.unwrap_or(false))
+}
+
+/// The overlay webview says it is listening. Anything queued while it was
+/// starting is only delivered now: an event sent into the gap before this is
+/// lost, and the window would hang on screen with nothing on it.
+#[tauri::command]
+pub fn overlay_ready(app: tauri::AppHandle) {
+    overlay::drain_pending(&app);
+}
+
+/// The overlay webview has painted an empty frame for hide number `seq`, so the
+/// window can go down without leaving that frame behind for the next show.
+#[tauri::command]
+pub fn overlay_cleared(seq: u64) {
+    overlay::cleared(seq);
+}
+
+/// The main window passes friend publications on to the overlay.
+#[tauri::command]
+pub fn realtime_relay(app: tauri::AppHandle, payload: serde_json::Value) {
+    overlay::relay_realtime(&app, payload);
+}
+
+#[derive(serde::Serialize)]
+pub struct RealtimeRelayState {
+    pub relay: bool,
+    pub live: bool,
+}
+
+/// The overlay asks whether the main window relays, before opening a socket of its own.
+#[tauri::command]
+pub fn realtime_relay_state(app: tauri::AppHandle) -> RealtimeRelayState {
+    let (relay, live) = overlay::relay_state(&app);
+    RealtimeRelayState { relay, live }
+}

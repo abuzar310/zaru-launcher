@@ -1,0 +1,3786 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { CSSProperties } from 'react'
+import { Icon } from '../components/Icon'
+import { t, tx, useT } from '../i18n'
+import { PixelField } from '../components/lobby/PixelField'
+import { SKINS_IMPORT_EVENT, SKINS_TAKE_OFF_EVENT, SKINS_UPLOAD_EVENT, useTopBar } from '../state/topbar'
+import { HEAD_FROM_CPU, getAccount, lookOwner, useAccounts } from '../state/accounts'
+import type { Account } from '../state/accounts'
+import { noteCosmeticsSeen } from '../state/newHint'
+import { setScreen, showToast } from '../state/ui'
+import { accKindLabel, plural } from '../lib/format'
+import { onRenderGate, renderLive } from '../lib/renderGate'
+import { hasTauri } from '../ipc/tauri'
+import {
+  deleteTexture,
+  fetchTexture,
+  listTextures,
+  mcTextures,
+  msProfile,
+  msSetCape,
+  msUploadSkin,
+  pickTexture,
+  saveTexture,
+  setLocalSkin,
+  setTextureSlim,
+} from '../ipc/commands'
+import type { MsCape, TextureEntry, TextureKind } from '../ipc/commands'
+import { loadMine3d } from '../lib/mine3d'
+import { headLook } from '../lib/headLook'
+import type { Mine3dModule } from '../lib/mine3d'
+import type { SkinAnimation, SkinViewEngine } from '../vendor/mine3d'
+import { textureSource } from '../lib/textureSource'
+import { detectSlim, detectSlimFromUrl, loadImg } from '../lib/skinArms'
+import { warnHdSkinWithoutPlus } from '../lib/skinLock'
+import { capeById, contentFingerprint, dedupeCapes, textureHash } from '../lib/capes'
+import { SkinBody } from '../components/SkinBody'
+import {
+  addToWardrobe,
+  applyCatalogCape,
+  applyCosmetics,
+  loadPlus,
+  subscribePlus,
+  loadCosmeticCatalog,
+  loadCosmeticOwned,
+  loadWornCosmetics,
+  applyWardrobeItem,
+  claimReward,
+  loadCapeCatalog,
+  loadMojangCapes,
+  loadRewards,
+  loadWardrobe,
+  removeWardrobeItem,
+  setSkinSource,
+  skinSource,
+  uploadTexture,
+} from '../lib/gameProfile'
+import type {
+  CapeCatalogItem,
+  MojangCape,
+  CosmeticItem,
+  PlusStatus,
+  RewardItem,
+  WardrobeItem,
+  WornCosmetic,
+} from '../lib/gameProfile'
+import { refreshGameNick, useGameNick } from '../state/gameNick'
+import { keptLookOutfit, keptLookSkin } from '../lib/lookCache'
+import { lookHint } from '../lib/lookHint'
+import { playerUuid } from '../lib/playerUuid'
+import { splitVariantCode } from '../lib/variantNames'
+import { hasMillidaAccount, LAUNCHER_API, openExt, SUPPORT_URL } from '../lib/api'
+import { track, trackFailure } from '../lib/telemetry'
+import { purchaseFlow } from '../lib/purchaseTrack'
+import { loadMillidaProfile, showLogin } from '../lib/session'
+import { ensureMsAuth } from '../state/msLogin'
+import { apiErrorText } from '../lib/apiError'
+import { buildCosmetic } from '../lib/cosmeticModel'
+import { hidesRegularCape, maskUrls, pieceCover } from '../lib/cosmeticCover'
+import { maskedSkin } from '../lib/maskedSkin'
+import { sectionTakeOff } from '../lib/sectionTakeOff'
+import { CosmeticEmote, emoteClip } from '../lib/cosmeticEmote'
+import { emoteShowMs } from '../lib/lobbyShow'
+import { emoteSequence } from '../lib/emoteSequence'
+import { defaultVariant } from '../lib/cosmeticVariants'
+import { starredFirst, starredIds, toggleStar } from '../state/cosmeticStars'
+import { readAnimations } from '../lib/cosmeticAnimation'
+import { loadShowcase, showcaseSkinUrl, type ShowcaseCard, type ShowcaseKind } from '../lib/skinShowcase'
+import { ShopFeed, ShopOverlays, useShop } from '../components/shop/ShopKit'
+import '../styles/pixel/shop2.css'
+import '../styles/pixel/sets.css'
+import { buyCosmetic, buySet, loadBalance, loadEconomyProgress, loadSets, tierPct, type SetColorwayView, type SetView } from '../lib/rubies'
+import { achievementNote, achievementSources } from '../lib/achievementSource'
+import { usePlus } from '../state/plus'
+import { onRealtime } from '../lib/realtime'
+import { useVariantPreview } from '../lib/variantArt'
+import { uiConfirm } from '../state/confirm'
+import { watchPlusPurchase } from '../state/plusWatch'
+import { PlusCelebration } from '../components/PlusCelebration'
+import { useWearIntent, type SetOffer } from '../state/wearIntent'
+import { ChipRow, SectionBar } from '../components/character/Sections'
+import type { Section } from '../components/character/Sections'
+import { ItemGrid, ItemTile } from '../components/character/ItemTile'
+import { FittingBar } from '../components/character/FittingBar'
+import { nametagSpot } from '../components/character/Nametag'
+import { Outfits } from '../components/character/Outfits'
+import { SetLooks } from '../components/character/SetLooks'
+import {
+  addOutfit,
+  loadOutfits,
+  OUTFITS_LIMIT,
+  removeOutfit,
+  renameOutfit,
+  sameLook,
+  saveOutfits,
+  splitWearable,
+} from '../state/outfits'
+import type { Look, Outfit } from '../state/outfits'
+import {
+  FULL_FILL_Y,
+  FULL_OFFSET_Y,
+  IDLE_SHOW,
+  IDLE_SHOW_FIRST_MAX,
+  IDLE_SHOW_FIRST_MIN,
+  IDLE_SHOW_GAP_MAX,
+  IDLE_SHOW_GAP_MIN,
+  MILLIDA_LIGHT,
+  MODEL_CACHE,
+  TURN_PER_PIXEL,
+  between,
+  cosmeticModel,
+  nickSkinUrl,
+  releaseEngine,
+  tagBox,
+} from '../lib/characterStage'
+import { duoClipName, duoScene } from '../lib/duoEmotes'
+import { DUO_PARTNER_NICK, duoStage, soloSequence } from '../lib/duoStage'
+import '../styles/pixel/character.css'
+import { showReward } from '../components/reward/RewardReveal'
+import { rarityOfPrice } from '../components/shop/rarity'
+import { openPaymentUrl } from '../lib/openPayment'
+import { drawFront, skinCanvas } from '../lib/skinFlat'
+import { noteContextCreated, noteContextLost } from '../lib/gpuLite'
+import { artFit } from '../lib/artFit'
+import { plusPrice } from '../lib/useMoney'
+
+interface CatalogSkin {
+  key: string
+  label: string
+  nick?: string
+  url?: string
+}
+
+const mojangTexture = (hash: string) => 'https://textures.minecraft.net/texture/' + hash
+
+const EARNED_BY = (): Record<string, string> => ({
+  ACHIEVEMENT: t('Достижение'),
+  HOURS: t('Часы в игре'),
+  QUEST: t('Задание'),
+  SEASON: t('Сезон'),
+  PLUS_MONTH: 'PLUS',
+  WELCOME: t('Подарок'),
+  LEGACY: t('Снято с продажи'),
+})
+
+const onSale = (c: CosmeticItem) => c.access === 'PURCHASE' && (c.priceRubies ?? 0) > 0
+
+const earnedNote = (c: CosmeticItem, sources?: Map<string, string>) =>
+  c.access === 'PURCHASE' && !onSale(c)
+    ? (c.channel === 'ACHIEVEMENT' && sources ? achievementNote(sources, c.id, c.baseId) : undefined) ?? EARNED_BY()[c.channel ?? ''] ?? t('Не продаётся')
+    : undefined
+
+
+/** Дата словами: «до 14 октября» читается, «2026-10-14T00:00:00Z» - нет. */
+
+/** «1 рубин», «2 рубина», «5 рубинов» — цену читают, а не считают падежи. */
+function rubyCount(count: number): string {
+  return plural(count, t('{n} рубин', { n: count }), t('{n} рубина', { n: count }), t('{n} рубинов', { n: count }))
+}
+
+/** Сколько вещей раздела видно сразу и сколько добавляет подход к концу ленты. */
+const COSMETICS_FIRST_PAGE = 24
+const COSMETICS_PAGE = 24
+
+/**
+ * Хвост ленты: подход к нему раскрывает следующую порцию. Кнопка «Ещё» стояла
+ * в конце каждой полки, и листать приходилось кликами (владелец 23.09.2026).
+ * Корень наблюдения — панель, если листается она, иначе окно: на узком экране
+ * панель не прокручивается сама. Ключ снаружи пересоздаёт наблюдателя после
+ * каждой порции, иначе хвост, оставшийся в зоне, второй раз не сработает.
+ */
+function LoadMore({ onMore }: { onMore: () => void }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const more = useRef(onMore)
+  more.current = onMore
+  useEffect(() => {
+    const el = ref.current
+    if (!el || typeof IntersectionObserver === 'undefined') return
+    const box = el.closest('.ch-panel') as HTMLElement | null
+    const root = box && /(auto|scroll)/.test(getComputedStyle(box).overflowY) ? box : null
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) more.current()
+      },
+      { root, rootMargin: '0px 0px 600px 0px' },
+    )
+    io.observe(el)
+    return () => io.disconnect()
+  }, [])
+  return <div ref={ref} className="ch-tail" aria-hidden="true" />
+}
+
+
+/** Отдельная «полка» фильтра: не место на теле, а то, что даёт подписка. */
+
+/**
+ * Картинка вещи. У эмоций и эффектов её нет и быть не может: эмоция - движение
+ * тела, эффект - частицы, рисовать там нечего. Поэтому вместо пустой плашки
+ * показываем знак вида вещи, иначе карточка читается как несработавшая
+ * загрузка.
+ */
+/// Сеть в каталоге на семьсот картинок рвётся регулярно: одна не доехавшая
+/// картинка оставляла в сетке пустую рамку до перезахода в раздел. Пробуем
+/// столько раз, сколько имеет смысл ждать, и только потом показываем значок.
+///
+/// CDN под пачкой из сотни превью отвечает 502 с HTML, браузер режет такой
+/// ответ (ERR_BLOCKED_BY_ORB), и вместо вещей стояли значки — «ужасные иконки»
+/// (владелец 23.09.2026). Поэтому попыток больше, пауза растёт вдвое и
+/// разбросана случайно: повторы не бьют в сервер одной волной.
+const ART_RETRIES = 6
+const artRetryDelay = (tries: number) => Math.min(15_000, 600 * 2 ** tries) * (0.6 + Math.random() * 0.8)
+
+function CosmeticArt({ item, height, onGiveUp }: { item: CosmeticItem; height: number; onGiveUp?: () => void }) {
+  // Вещь-расцветка (v3.1): превью своей расцветки, а не базовой.
+  const preview = useVariantPreview(item.preview, item.tintFrom, item.tint)
+  const [shown, setShown] = useState(false)
+  const [fit, setFit] = useState('')
+  const [tries, setTries] = useState(0)
+  const [gaveUp, setGaveUp] = useState(false)
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+
+  useEffect(() => {
+    setShown(false)
+    setTries(0)
+    setGaveUp(false)
+  }, [preview])
+
+  useEffect(() => () => clearTimeout(timer.current), [])
+
+  if (item.preview && !preview && !gaveUp) {
+    // Перекраска ещё идёт: пустое место той же высоты, без мигания базовым цветом.
+    return <span style={{ display: 'block', width: height, height }} />
+  }
+  if (preview && !gaveUp) {
+    return (
+      <img
+        // Новый адрес на каждую попытку: браузер держит неудачу в памяти и по
+        // тому же адресу второй раз в сеть не пойдёт. Перекрашенное (data:) не повторяем.
+        src={tries && !preview.startsWith('data:') ? preview + (preview.includes('?') ? '&' : '?') + 'retry=' + tries : preview}
+        alt=""
+        width={height}
+        height={height}
+        loading="lazy"
+        decoding="async"
+        crossOrigin="anonymous"
+        onLoad={(e) => {
+          setFit(artFit(e.currentTarget))
+          setShown(true)
+        }}
+        onError={() => {
+          if (tries >= ART_RETRIES) {
+            setGaveUp(true)
+            onGiveUp?.()
+            return
+          }
+          // Пауза растёт: сеть после обрыва возвращается не мгновенно, а
+          // семьсот карточек, бьющихся разом, добьют её окончательно.
+          timer.current = setTimeout(() => setTries((n) => n + 1), artRetryDelay(tries))
+        }}
+        style={{
+          maxWidth: '100%',
+          maxHeight: height + 'px',
+          height: 'auto',
+          imageRendering: 'pixelated',
+          // Прячем прозрачностью, а не display: скрытая картинка не попадает в
+          // видимую область, и отложенная загрузка не начинается никогда -
+          // каталог так и стоит пустым.
+          opacity: shown ? 1 : 0,
+          transform: fit || undefined,
+          transition: 'opacity var(--m-t-base)',
+        }}
+      />
+    )
+  }
+  const sign = item.slot === 'EMOTE' ? 'i-smile' : item.slot === 'EFFECT' || item.slot === 'AURA' ? 'i-zap' : 'i-shirt'
+  return (
+    <span className="cosmetic-sign">
+      <Icon id={sign} />
+    </span>
+  )
+}
+
+const OFFICIAL_SKINS: CatalogSkin[] = [
+  { key: 'off-steve', get label() { return t('Стив') }, url: mojangTexture('31f477eb1a7beee631c2ca64d06f8f68fa93a3386d04452ab27f43acdf1b60cb') },
+  { key: 'off-alex', get label() { return t('Алекс') }, url: mojangTexture('46acd06e8483b176e8ea39fc12fe105eb3a2a4970f5100057e9d84d4b60bdfa7') },
+  { key: 'off-ari', get label() { return t('Ари') }, url: mojangTexture('6ac6ca262d67bcfb3dbc924ba8215a18195497c780058a5749de674217721892') },
+  { key: 'off-efe', get label() { return t('Эфе') }, url: mojangTexture('fece7017b1bb13926d1158864b283b8b930271f80a90482f174cca6a17e88236') },
+  { key: 'off-makena', get label() { return t('Макена') }, url: mojangTexture('7cb3ba52ddd5cc82c0b050c3f920f87da36add80165846f479079663805433db') },
+  { key: 'off-noor', get label() { return t('Нур') }, url: mojangTexture('6c160fbd16adbc4bff2409e70180d911002aebcfa811eb6ec3d1040761aea6dd') },
+  { key: 'off-zuri', get label() { return t('Зури') }, url: mojangTexture('eee522611005acf256dbd152e992c60c0bb7978cb0f3127807700e478ad97664') },
+]
+
+
+/**
+ * Разделы гардероба — два уровня, как в Roblox и Essential
+ * (~/Documents/Claude/Работа/Проекты/millida/analysis/2026-09-23_wardrobe-research.md).
+ * Верхний уровень — крупные разделы по телу, внутри — подкатегории чипами.
+ * Девятнадцать вкладок по местам каталога читались как свалка (владелец
+ * 23.09.2026: «дохуя всего и непонятно, как с этим работать»).
+ */
+interface ChipDef {
+  key: string
+  name: string
+  slots: string[]
+}
+
+interface SectionDef {
+  key: string
+  name: string
+  icon: string
+  chips: ChipDef[]
+}
+
+const COSMETIC_SECTIONS = (): SectionDef[] => [
+  {
+    key: 'head',
+    name: t('Голова'),
+    icon: 'i-hat',
+    chips: [
+      { key: 'HAT', name: t('Шляпы'), slots: ['HAT'] },
+      { key: 'HEAD', name: t('Причёски'), slots: ['HEAD'] },
+      { key: 'FACE', name: t('Лицо'), slots: ['FACE'] },
+      { key: 'EARS', name: t('Уши и рога'), slots: ['EARS'] },
+    ],
+  },
+  {
+    key: 'body',
+    name: t('Тело'),
+    icon: 'i-shirt',
+    chips: [
+      { key: 'FULL_BODY', name: t('Костюмы'), slots: ['FULL_BODY'] },
+      { key: 'TOP', name: t('Верх'), slots: ['TOP', 'ACCESSORY'] },
+      { key: 'PANTS', name: t('Низ'), slots: ['PANTS', 'SKIRT', 'WAIST'] },
+      { key: 'SHOES', name: t('Обувь'), slots: ['SHOES', 'FEET'] },
+      { key: 'ARMS', name: t('Руки'), slots: ['ARMS', 'HAND', 'SHOULDERS', 'SHOULDER'] },
+    ],
+  },
+  {
+    key: 'back',
+    name: t('Спина'),
+    icon: 'i-wings',
+    chips: [
+      { key: 'WINGS', name: t('Крылья'), slots: ['WINGS'] },
+      { key: 'BACK', name: t('За спиной'), slots: ['BACK'] },
+    ],
+  },
+  { key: 'pet', name: t('Питомцы'), icon: 'i-paw', chips: [{ key: 'PET', name: t('Питомцы'), slots: ['PET'] }] },
+  // Эмоции и ауры — одно «живое» место: не вещь на теле, а движение и частицы
+  // (у Essential эмоции тоже отдельно от слотов). Так разделов восемь, а не девять.
+  {
+    key: 'emote',
+    name: t('Эмоции'),
+    icon: 'i-smile',
+    chips: [
+      { key: 'EMOTE', name: t('Эмоции'), slots: ['EMOTE'] },
+      { key: 'EFFECT', name: t('Ауры'), slots: ['EFFECT', 'AURA', 'ICON'] },
+    ],
+  },
+]
+
+const KNOWN_SLOTS = new Set(['CAPE', ...COSMETIC_SECTIONS().flatMap((s) => s.chips.flatMap((c) => c.slots))])
+
+/** Разделы с учётом того, что реально есть в каталоге: новое место каталога уходит в «Тело · Другое». */
+function cosmeticSections(slots: string[]): SectionDef[] {
+  // Каталог ещё грузится — показываем все разделы сразу, иначе первые секунды
+  // видны только «Образы, Скины, Плащи» и полоса прыгает (владелец 24.09.2026).
+  if (!slots.length) return COSMETIC_SECTIONS()
+  const unknown = Array.from(new Set(slots.filter((s) => !KNOWN_SLOTS.has(s))))
+  return COSMETIC_SECTIONS().map((sec) => ({
+    ...sec,
+    chips: sec.chips
+      .concat(sec.key === 'body' && unknown.length ? [{ key: 'OTHER', name: t('Другое'), slots: unknown }] : [])
+      .filter((c) => c.slots.some((slot) => slots.includes(slot))),
+  })).filter((sec) => sec.chips.length > 0)
+}
+
+const SKIN_CHIPS = (): { key: 'mine' | ShowcaseKind; name: string }[] => [
+  { key: 'mine', name: t('Мои') },
+  { key: 'top', name: t('Популярные') },
+  { key: 'new', name: t('Новые') },
+  { key: 'random', name: t('Случайные') },
+]
+
+const NICK_RE = /^[A-Za-z0-9_]{3,16}$/
+
+type SkinArms = 'classic' | 'slim'
+
+const SKIN_ARMS = (): [SkinArms, string][] => [
+  ['classic', t('Классическая')],
+  ['slim', t('Узкая')],
+]
+
+/** Сколько живёт «Отменить» после удаления скина: столько же, сколько тост с действием. */
+const SKIN_UNDO_MS = 7000
+
+const rewardProgress = (r: { unit: string; progress: number; goal: number }) =>
+  r.unit === 'seconds'
+    ? t('{n} из {goal} ч', { n: Math.floor(r.progress / 3600), goal: Math.floor(r.goal / 3600) })
+    : t('{n} из {goal}', { n: r.progress, goal: r.goal })
+
+const MILLIDA_SKINS_URL = 'https://millida.net/skins'
+
+const MILLIDA_CAPE = '/capes/millida.png'
+
+
+// Kept as files on disk: localStorage hit the webview quota and lost entries silently.
+type MySkin = TextureEntry
+
+interface CapeOption {
+  id: string
+  name: string
+  url: string
+  sub: string
+  onAccount?: boolean
+  active?: boolean
+  msId?: string
+  accId?: string
+  wardrobeId?: string
+  /// Карточка каталога: плащ надевается по этому идентификатору, PNG на сервер
+  /// не уходит — плащ выдаёт сервер, а не файл на диске.
+  catalogId?: string
+  /// Плащ из каталога Millida, условие которого ещё не выполнено: карточка
+  /// затемнена, надеть нельзя, но видно, что и сколько осталось сделать.
+  locked?: boolean
+  /// Текст условия получения («Наиграть 10 часов»).
+  requirement?: string
+  /// 0..100 — прогресс по условию.
+  progress?: number
+  /// «7 / 10 часов» — человеческий счётчик под полоской.
+  progressLabel?: string
+  rarity?: string
+  /// Плащ за задание лаунчера: код задания, чтобы забрать его из окна условия.
+  rewardCode?: string
+  /// Условие выполнено — плащ можно забрать прямо сейчас.
+  rewardReady?: boolean
+  /// Подсказка, где выполняется условие.
+  hint?: string
+  /// Плащ выдаётся за достижение, а не просто лежит на аккаунте. Такие живут во
+  /// вкладке украшений вместе с остальной косметикой, ради которой играют.
+  earned?: boolean
+}
+
+
+async function migrateStored(kind: TextureKind, key: string): Promise<MySkin[] | null> {
+  let stored: { name?: string; data?: string; slim?: boolean }[] = []
+  const raw = localStorage.getItem(key)
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    stored = Array.isArray(parsed) ? parsed : []
+  } catch {
+    localStorage.removeItem(key)
+    return null
+  }
+  let list: MySkin[] | null = null
+  for (const item of stored.slice(0, 24).reverse()) {
+    if (!item || typeof item.data !== 'string') continue
+    try {
+      list = await saveTexture(kind, item.name || t('Скин'), item.data, !!item.slim)
+    } catch {}
+  }
+  localStorage.removeItem(key)
+  return list
+}
+
+const skinBust = new Map<string, number>()
+
+const skinUrl = (n: string) => {
+  const base = LAUNCHER_API + '/heads/skin/' + encodeURIComponent(n)
+  const v = skinBust.get(n.trim().toLowerCase())
+  return v ? base + '?v=' + v : base
+}
+
+/// Сброс скина проходит на лицензии сразу, а /v2/heads отдаёт прежнюю текстуру:
+
+// Manual arm type wins over autodetect, which misreads skins without transparent areas.
+const VARIANT_KEY = 'm-skin-variant'
+
+function readVariants(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(VARIANT_KEY) || '{}')
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+// Ручной выбор рук больше не учитываем: руки определяются по текстуре
+// (правка владельца 23.09.2026), старые сохранённые выборы игнорируются.
+/** Дольше этого фигура не ждёт надетого, мс: дальше показывается как есть. */
+const DRESS_WAIT_MS = 2500
+
+/** Тот же ли состав надетого: вещи и расцветки, порядок не важен. */
+function sameWorn(a: WornCosmetic[], b: WornCosmetic[]): boolean {
+  const key = (l: WornCosmetic[]) => l.map((w) => w.id + '~' + (w.variant || '')).sort().join(',')
+  return a.length === b.length && key(a) === key(b)
+}
+
+function recallVariant(_key: string): string | null {
+  return null
+}
+
+function rememberVariant(key: string, variant: string) {
+  const map = readVariants()
+  map[key] = variant
+  const keys = Object.keys(map)
+  for (const stale of keys.slice(0, Math.max(0, keys.length - 200))) delete map[stale]
+  try {
+    localStorage.setItem(VARIANT_KEY, JSON.stringify(map))
+  } catch {}
+}
+
+
+// The figure is 32 skin pixels tall, so only a multiple of 32 keeps every pixel
+// the same height on screen; 132 px gave rows of 4 and 5 pixels side by side.
+const FIGURE_CELLS = 32
+const CAPE_CELLS = 16
+const snapPx = (px: number, cells: number) => Math.max(1, Math.round(px / cells)) * cells
+
+function SkinThumb({ url, size: askedSize = 128, slim }: { url: string; size?: number; slim?: boolean }) {
+  const size = snapPx(askedSize, FIGURE_CELLS)
+  const ref = useRef<HTMLCanvasElement>(null)
+  useEffect(() => {
+    let alive = true
+    loadImg(url)
+      .then((img) => {
+        if (!alive) return
+        const cv = ref.current
+        if (!cv) return
+        const g = skinCanvas(cv)
+        if (!g) return
+        cv.width = 16
+        cv.height = 32
+        drawFront(g, img, slim === undefined ? detectSlim(img) : slim)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [url, slim])
+  return (
+    <canvas
+      ref={ref}
+      style={{ width: (size * 16) / 32 + 'px', height: size + 'px', imageRendering: 'pixelated', display: 'block' }}
+    />
+  )
+}
+
+function SkinCardThumb({ url, slim }: { url: string; slim?: boolean }) {
+  return (
+    <SkinBody
+      url={url}
+      model={slim === undefined ? 'auto-detect' : slim ? 'slim' : 'default'}
+      fallback={<SkinThumb url={url} slim={slim} />}
+    />
+  )
+}
+
+function CatalogThumb({ nick, url }: { nick?: string; url?: string }) {
+  return <SkinCardThumb url={url || skinUrl(nick || 'MHF_Steve')} />
+}
+
+interface AccTexture {
+  skin: string
+  cape: string | null
+  slim: boolean
+}
+
+const texCache = new Map<string, { at: number; tex: AccTexture }>()
+const TEX_TTL = 300000
+
+const DEFAULT_SKIN = OFFICIAL_SKINS[0].url as string
+
+/// Текстуры Mojang запрашиваем только для лицензии. Офлайн- и Millida-аккаунт
+/// ищутся по нику, а ник в Mojang принадлежит другому человеку: раньше игрок
+/// видел и применял чужой скин, считая его своим.
+async function loadAccountTexture(a: Account, millida: AccTexture | null): Promise<AccTexture> {
+  if (a.kind === 'microsoft' && hasTauri()) {
+    const key = a.uuid || a.nick
+    const hit = texCache.get(key)
+    if (hit && Date.now() - hit.at < TEX_TTL) return hit.tex
+    try {
+      const t = await mcTextures(key)
+      const tex = { skin: t.skin || DEFAULT_SKIN, cape: t.cape, slim: !!t.slim }
+      texCache.set(key, { at: Date.now(), tex })
+      return tex
+    } catch {}
+  }
+  if (a.kind === 'millida' && millida) return millida
+  return { skin: DEFAULT_SKIN, cape: null, slim: false }
+}
+
+/// Offline and Microsoft accounts keep the skin locally.
+async function headDataUrl(url: string, size = 64): Promise<string> {
+  const img = await loadImg(url)
+  const s = img.width / 64
+  const c = document.createElement('canvas')
+  c.width = size
+  c.height = size
+  const g = skinCanvas(c)
+  if (!g) throw new Error(t('canvas недоступен'))
+  g.imageSmoothingEnabled = false
+  g.drawImage(img, 8 * s, 8 * s, 8 * s, 8 * s, 0, 0, size, size)
+  if (img.height >= img.width) g.drawImage(img, 40 * s, 8 * s, 8 * s, 8 * s, 0, 0, size, size)
+  return c.toDataURL('image/png')
+}
+
+/// Remote textures are CORS-restricted, so re-encode through canvas.
+const PNG_DATA_PREFIX = 'data:image/png;base64,'
+
+const localSkinHash = (file: string) => /-([0-9a-f]{8})\.png$/i.exec(file)?.[1]?.toLowerCase() ?? null
+const wardrobeSkinHash = (url: string) => /-([0-9a-f]{32})\.png(?:[?#].*)?$/i.exec(url)?.[1]?.slice(0, 8).toLowerCase() ?? null
+
+async function toPngBase64(url: string): Promise<string> {
+  if (url.startsWith('data:')) return url.replace(/^data:image\/png;base64,/, '')
+  // Байты уходят на сервер как есть: пережатие через canvas меняет их, а каталог
+  // аккаунта схлопывает повторы по хешу PNG — с новым хешем та же текстура
+  // ложится в него ещё одной записью.
+  const src = await textureSource(url)
+  if (src.startsWith(PNG_DATA_PREFIX)) return src.slice(PNG_DATA_PREFIX.length)
+  const img = await loadImg(url)
+  const canvas = document.createElement('canvas')
+  canvas.width = img.naturalWidth
+  canvas.height = img.naturalHeight
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error(t('canvas недоступен'))
+  ctx.drawImage(img, 0, 0)
+  return canvas.toDataURL('image/png').replace(/^data:image\/png;base64,/, '')
+}
+
+/**
+ * Повтор запроса при обрыве связи. Наш путь до сервера идёт через щит, и он
+ * временами роняет соединение на середине ответа - для игрока это выглядит как
+ * «каталог недоступен», хотя сервер жив и следующая попытка проходит.
+ */
+async function withRetry<T>(run: () => Promise<T>, tries = 3): Promise<T> {
+  let last: unknown
+  for (let at = 0; at < tries; at += 1) {
+    try {
+      return await run()
+    } catch (e) {
+      last = e
+      if (at + 1 < tries) await new Promise((wait) => setTimeout(wait, 400 * (at + 1)))
+    }
+  }
+  throw last
+}
+
+const localMark = (url: string, slim: boolean) => url + '|' + (slim ? 'slim' : 'classic')
+
+// Cape back face: UV (1,1) sized 10x16 on the standard 64x32 cape texture.
+function CapePreview({ url, h: askedH = 64 }: { url: string; h?: number }) {
+  const h = snapPx(askedH, CAPE_CELLS)
+  const ref = useRef<HTMLCanvasElement>(null)
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let alive = true
+    setFailed(false)
+    loadImg(url)
+      .then((img) => {
+        const cv = ref.current
+        if (!alive || !cv) return
+        const g = skinCanvas(cv)
+        if (!g) return
+        const s = img.width / 64
+        cv.width = 10
+        cv.height = 16
+        g.imageSmoothingEnabled = false
+        g.clearRect(0, 0, 10, 16)
+        g.drawImage(img, 1 * s, 1 * s, 10 * s, 16 * s, 0, 0, 10, 16)
+      })
+      .catch(() => {
+        if (alive) setFailed(true)
+      })
+    return () => {
+      alive = false
+    }
+  }, [url])
+  if (failed)
+    return (
+      <span
+        style={{
+          width: (h * 10) / 16 + 'px',
+          height: h + 'px',
+          borderRadius: '4px',
+          display: 'grid',
+          placeItems: 'center',
+          background: 'var(--m-inset)',
+          color: 'var(--m-fg-faint)',
+        }}
+      >
+        <Icon id="i-image" />
+      </span>
+    )
+  return (
+    <canvas
+      ref={ref}
+      style={{ width: (h * 10) / 16 + 'px', height: h + 'px', imageRendering: 'pixelated', display: 'block', borderRadius: '4px' }}
+    />
+  )
+}
+
+/** Первый свой скин — праздник один раз на компьютер. */
+function firstSkinEver(): boolean {
+  try {
+    if (localStorage.getItem('m-first-skin')) return false
+    localStorage.setItem('m-first-skin', '1')
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function Skins({ on }: { on: boolean }) {
+  const t = useT()
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const stageRef = useRef<HTMLDivElement>(null)
+  const viewerRef = useRef<SkinViewEngine | null>(null)
+  const accounts = useAccounts((s) => s.list)
+  const activeId = useAccounts((s) => s.active)
+  const [nick, setNick] = useState(() => (getAccount() || { nick: '' }).nick || 'MHF_Steve')
+  const [skinSrc, setSkinSrc] = useState<string | null>(null)
+  // Последний применённый скин — для «Вернуть» в уведомлении. Выбор скина сразу
+  // применяет его на аккаунт, и случайный клик по каталогу раньше нечем было
+  // откатить (аудит 22.09.2026, docs/audit-2026-09-22/social.md).
+  const appliedRef = useRef<string | null>(null)
+  // Номер последнего выбора скина и очередь запросов к серверу: каждый новый
+  // клик делает прежние устаревшими, и они не доходят до сервера.
+  const skinPick = useRef(0)
+  const skinQueue = useRef<Promise<unknown>>(Promise.resolve())
+  /** Выбор сделан руками: обновление каталога больше не переставляет отметку и фигуру. */
+  const userPicked = useRef(false)
+  const startSkinPick = () => {
+    userPicked.current = true
+    return ++skinPick.current
+  }
+  const queueSkin = (token: number, job: () => Promise<void>): Promise<void> => {
+    const run = skinQueue.current.then(() => (token === skinPick.current ? job() : undefined))
+    skinQueue.current = run.catch(() => {})
+    return run
+  }
+  useEffect(() => {
+    if (appliedRef.current == null && skinSrc) appliedRef.current = skinSrc
+  }, [skinSrc])
+  const [variant, setVariant] = useState('classic')
+  const [cape, setCape] = useState('none')
+  // Раздел гардероба и выбранный в нём чип. Чип помнится за разделом: вернулся
+  // в «Голову» — снова на тех же шляпах.
+  // Гардероб открывается с первого раздела — «Образы» (владелец 24.09.2026).
+  const [section, setSection] = useState('looks')
+  /** Блоки магазина в разделе «Магазин» — то же состояние и покупки, что у экрана магазина. */
+  const shop = useShop(on && section === 'shop')
+  const [chipBy, setChipBy] = useState<Record<string, string>>({})
+  const [own, setOwn] = useState('all')
+  const [catQuery, setCatQuery] = useState('')
+  const [catKind, setCatKind] = useState<ShowcaseKind>('top')
+  const [catCards, setCatCards] = useState<ShowcaseCard[]>([])
+  const [catFailed, setCatFailed] = useState(false)
+  const [fallback, setFallback] = useState(false)
+  const [svReady, setSvReady] = useState(false)
+  const [m3d, setM3d] = useState<Mine3dModule | null>(null)
+  const [engineReady, setEngineReady] = useState(0)
+  const [modelShown, setModelShown] = useState(false)
+  const [viewerAwake, setViewerAwake] = useState(false)
+  const [mySkins, setMySkins] = useState<MySkin[]>([])
+  const [myCapes, setMyCapes] = useState<MySkin[]>([])
+  const [textures, setTextures] = useState<Record<string, AccTexture>>({})
+  // Сброс скина знает правду о текстурах раньше их источников: счётчик заставляет
+  // перечитать текстуры аккаунтов после того, как кеш уже заполнен этой правдой.
+  const [texEpoch] = useState(0)
+  const [wardrobe, setWardrobe] = useState<WardrobeItem[]>([])
+  const wardrobeSkinHashes = new Set(
+    wardrobe.flatMap((w) => {
+      const h = w.kind === 'skin' ? wardrobeSkinHash(w.url) : null
+      return h ? [h] : []
+    }),
+  )
+  const [millidaTex, setMillidaTex] = useState<AccTexture | null>(null)
+  const [rewards, setRewards] = useState<RewardItem[]>([])
+  const [claiming, setClaiming] = useState('')
+  const [activeWardrobe, setActiveWardrobe] = useState<string | null>(null)
+  // Каталог плащей Millida: и открытые, и закрытые — закрытые показываем
+  // затемнёнными с условием, ради них и играют.
+  const [capeCatalog, setCapeCatalog] = useState<CapeCatalogItem[]>([])
+  const [mojangCapes, setMojangCapes] = useState<MojangCape[]>([])
+  // Косметика мода: каталог общий, права — личные, надетое приходит тем же
+  // адресом, каким его видят другие игроки.
+  const [cosmetics, setCosmetics] = useState<CosmeticItem[]>([])
+  const [cosmeticOwned, setCosmeticOwned] = useState<string[]>([])
+  /** Каталог, права и надетое доехали (счётчик загрузок) — можно выполнить «Надеть» извне. */
+  const [cosReady, setCosReady] = useState(0)
+  const wearRefs = useWearIntent((s) => s.refs)
+  const [worn, setWorn] = useState<WornCosmetic[]>([])
+  // Надетое уже известно (служба ответила или взяли образ с прошлого раза): до этого фигуру не
+  // показываем голой (04.11.2026: «в "Мой скин" персонаж при первом рендере голый»).
+  const wornKnown = useRef(false)
+  const [dressReady, setDressReady] = useState(false)
+  // Гардероб службы уже пришёл: скин с прошлого раза его не перебивает.
+  const wardrobeIn = useRef(false)
+  // Каталог уже есть (или не пришёл совсем): без него надетое не во что превратить.
+  const catalogIn = useRef(false)
+
+  const [cosmeticQuery, setCosmeticQuery] = useState('')
+  const [cosmeticsFailed, setCosmeticsFailed] = useState(false)
+  const [wardrobeFailed, setWardrobeFailed] = useState(false)
+  const [plus, setPlus] = useState<PlusStatus | null>(null)
+  const shopTier = usePlus((st) => st.tier)
+  const [plusBusy, setPlusBusy] = useState(false)
+  const [plusJoy, setPlusJoy] = useState(false)
+  const stopPlusWatch = useRef<(() => void) | null>(null)
+  useEffect(() => () => stopPlusWatch.current?.(), [])
+  const endPlusJoy = useCallback(() => setPlusJoy(false), [])
+  /**
+   * Примерка: вещи, надетые на фигуру в окне, но не на игроке. Мерить надо до
+   * покупки и сразу несколько - шляпа с крыльями смотрятся иначе, чем каждая
+   * сама по себе, и решение принимают по всему набору.
+   */
+  const [fitting, setFitting] = useState<CosmeticItem[]>([])
+  /** Наборы магазина (раздел «Образы → Наборы») и набор, который сейчас примеряется. */
+  const [setList, setSetList] = useState<SetView[]>([])
+  const [setOffer, setSetOffer] = useState<SetOffer | null>(null)
+  const [setBusy, setSetBusy] = useState('')
+  const [fitLoading, setFitLoading] = useState<string[]>([])
+  const [variantById, setVariantById] = useState<Record<string, string>>({})
+  const [emoting, setEmoting] = useState(false)
+  const [stars, setStars] = useState<string[]>(() => starredIds())
+  // Какое достижение открывает вещь: из прогресса игрока, одной загрузкой. Нет ответа — общая пометка.
+  const [achSources, setAchSources] = useState<Map<string, string>>(() => new Map())
+  useEffect(() => {
+    let alive = true
+    loadEconomyProgress()
+      .then((p) => alive && setAchSources(achievementSources(p)))
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
+  /**
+   * Сколько вещей раскрыто в каждом разделе. Каталог на семьсот картинок,
+   * выложенный разом, минуту тянет их по сети и всё это время выглядит пустым:
+   * показываем первый экран и раскрываем по просьбе.
+   */
+  const [shownPerSlot, setShownPerSlot] = useState<Record<string, number>>({})
+  const [rubies, setRubies] = useState(0)
+  const [cosmeticBusy, setCosmeticBusy] = useState('')
+  // Все плащи лицензии по аккаунтам: сессионный профиль отдаёт только надетый,
+  // из-за чего «на аккаунте» помечался ровно один плащ.
+  const [msCapes, setMsCapes] = useState<Record<string, MsCape[]>>({})
+  // Свой скин отмечается по имени файла, а не по месту в списке: список
+  // сдвигается при загрузке и удалении, и отметка переезжала на соседний скин
+  // (владелец 24.09.2026: «нажимаю одно — применяет другое»).
+  const [activeMy, setActiveMy] = useState<string | null>(null)
+  const activeMyRef = useRef<string | null>(null)
+  activeMyRef.current = activeMy
+  const mySkinOf = (file: string | null) => (file ? mySkins.find((s) => s.file === file) : undefined)
+  const activeMyHash = activeMy ? localSkinHash(activeMy) : null
+  const capeTouched = useRef(false)
+  const wardrobeVariantRef = useRef(false)
+  // Request sequence: a late autodetect answer must not override a newer choice.
+  const autoSeq = useRef(0)
+  // Чей это вариант рук: переключатель на сцене запоминает выбор за тем же
+  // скином, за которым его помнит автоопределение.
+  const variantKeyRef = useRef('')
+  const [, setTagAt] = useState<{ x: number; y: number } | null>(null)
+
+  useEffect(() => {
+    if (!hasTauri()) return
+    let alive = true
+    const load = async (kind: TextureKind, key: string, apply: (list: MySkin[]) => void) => {
+      try {
+        const migrated = await migrateStored(kind, key)
+        const list = migrated || (await listTextures(kind))
+        if (alive) apply(list)
+      } catch (e) {
+        showToast(t('Не удалось прочитать свои текстуры: {error}', { error: tx(e) }), 'error')
+      }
+    }
+    void load('skins', 'm-my-skins', setMySkins)
+    void load('capes', 'm-my-capes', setMyCapes)
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  // Локальную копию читает мод скинов в игре. Она обновляется только тем, что
+  // делает лаунчер, поэтому скин, надетый на сайте или пришедший из заказа,
+  // оставлял в игре текстуру с прошлого «Применить»: другие игроки видели новую,
+  // сам игрок — старую.
+  const localSkinRef = useRef('')
+  const syncLocalSkin = async (url: string | null, slim: boolean) => {
+    if (!hasTauri() || !url) return
+    const mark = localMark(url, slim)
+    if (localSkinRef.current === mark) return
+    // Плащ не трогаем: null оставляет его как есть, а на этом компьютере может
+    // быть надет плащ, которого на аккаунте нет.
+    await setLocalSkin(await toPngBase64(url), null, slim)
+    localSkinRef.current = mark
+  }
+
+  /// Удалённый скин нельзя ни скопировать, ни оставить в сборке: копия на диске
+  /// стирается вместе с ним, иначе в игре остаётся текстура, которой у игрока
+  /// больше нет, а попытка её обновить падает на пропавшем файле.
+  const dropLocalSkin = async () => {
+    if (!hasTauri()) return
+    localSkinRef.current = ''
+    await setLocalSkin('', null, variant === 'slim').catch(() => {})
+  }
+
+  const refreshWardrobe = async () => {
+    if (!hasMillidaAccount()) return
+    try {
+      const w = await withRetry(loadWardrobe)
+      wardrobeIn.current = true
+      setWardrobe(w.items)
+      setMillidaTex(
+        w.active.skinUrl
+          ? { skin: w.active.skinUrl, cape: w.active.capeUrl, slim: w.active.model === 'slim' }
+          : null,
+      )
+      syncHead(w.active.skinUrl)
+      const cur = w.items.find((i) => i.kind === 'skin' && i.url === w.active.skinUrl)
+      // Пока человек ничего не выбрал, фигура и отметка — как на аккаунте: его
+      // собственный скин, а не скин по нику (там стоял стандартный).
+      if (!userPicked.current) {
+        setActiveWardrobe(cur ? cur.id : null)
+        if (w.active.skinUrl) setSkinSrc(w.active.skinUrl)
+      }
+      await syncLocalSkin(w.active.skinUrl, w.active.model === 'slim').catch((e) =>
+        showToast(t('На этом компьютере скин не обновился — в сборках останется прежний: {error}', { error: tx(e) }), 'error'),
+      )
+      if (!wardrobeVariantRef.current) {
+        wardrobeVariantRef.current = true
+        const key = cur ? 'w:' + cur.id : null
+        const saved = key ? recallVariant(key) : null
+        if (saved || w.active.skinUrl) {
+          autoSeq.current++
+          setVariant(saved || (w.active.model === 'slim' ? 'slim' : 'classic'))
+        }
+      }
+      setWardrobeFailed(false)
+    } catch (e) {
+      setWardrobeFailed(true)
+      console.warn('[skins] wardrobe', e)
+      trackFailure('skins', e, { step: 'wardrobe_load' })
+      showToast(t('Каталог скинов не загрузился'), 'error')
+    }
+  }
+
+  /// Каталог косметики и права на неё. Каталог открыт всем, права — только
+  /// вошедшему, поэтому отказ по правам не должен прятать сам каталог.
+  const refreshCosmetics = async () => {
+    setCosmeticsFailed(false)
+    try {
+      const catalog = await withRetry(loadCosmeticCatalog)
+      catalogIn.current = true
+      setCosmetics(catalog.items || [])
+    } catch {
+      catalogIn.current = true
+      setCosmetics([])
+      // Пустой каталог и не доехавший каталог - разные вещи: во втором случае
+      // человеку нужна кнопка, а не сообщение о том, что вещей нет.
+      setCosmeticsFailed(true)
+      return
+    }
+    if (!hasMillidaAccount()) {
+      setCosReady((n) => n + 1)
+      return
+    }
+    // Права и надетое — разом, а не друг за другом. uuid игрового профиля, а не аккаунта: «кто что
+    // носит» спрашивают по нему, и спрашивается он раз на аккаунт (lib/playerUuid).
+    const [owned, served] = await Promise.allSettled([
+      loadCosmeticOwned(),
+      playerUuid().then((uuid) => (uuid ? loadWornCosmetics(uuid) : [])),
+    ])
+    setCosmeticOwned(owned.status === 'fulfilled' ? owned.value.items || [] : [])
+    if (served.status === 'fulfilled') {
+      const list = served.value
+      // Тот же состав, что уже на фигуре (образ с прошлого раза), — не переодеваем: вещи не мигают.
+      setWorn((now) => (sameWorn(now, list) ? now : list))
+      if (!list.length) setDressReady(true)
+    } else if (!wornKnown.current) {
+      setWorn([])
+      setDressReady(true)
+    }
+    // Служба не ответила — остаётся образ с прошлого раза, а не голая фигура.
+    wornKnown.current = true
+    setCosReady((n) => n + 1)
+  }
+
+  // «Надеть» из сундука, пропуска или магазина (владелец 24.09.2026, 19:56):
+  // своё сразу надевается и сохраняется, чужое встаёт на фигуру примеркой;
+  // гардероб открывается на разделе вещи.
+  useEffect(() => {
+    if (!wearRefs || !cosReady || !cosmetics.length) return
+    const { fit, offer } = useWearIntent.getState()
+    useWearIntent.getState().set(null)
+    const items = wearRefs.flatMap((r) => {
+      const same = cosmetics.filter((c) => c.id === r.code || c.baseId === r.code)
+      const hit = (r.variant && same.find((c) => c.id.endsWith('~' + r.variant))) || same.find((c) => c.id === r.code) || same[0]
+      return hit ? [hit] : []
+    })
+    if (!items.length) return
+    const first = items[0]!
+    if (first.slot === 'CAPE') pickSection('cape')
+    else {
+      const sec = sections.find((x) => x.chips.some((c) => c.slots.includes(first.slot)))
+      const chip = sec?.chips.find((c) => c.slots.includes(first.slot))
+      if (sec && chip) {
+        setChipBy((now) => ({ ...now, [sec.key]: chip.key }))
+        pickSection(sec.key)
+      }
+    }
+    // «Примерить набор»: на фигуру встаёт всё, даже своё, и рядом «Докупить набор».
+    const mine = fit ? [] : items.filter((c) => !cosmeticLocked(c))
+    const other = fit ? items : items.filter((c) => cosmeticLocked(c))
+    if (fit) setSetOffer(offer)
+    if (other.length) setFitting((now) => now.filter((c) => !other.some((o) => o.slot === c.slot)).concat(other))
+    if (!mine.length) return
+    const next = worn
+      .filter((w) => !mine.some((c) => c.slot === w.slot))
+      .concat(mine.map((c) => ({ id: c.id, slot: c.slot, variant: variantOf(c)?.name })))
+    setCosmeticBusy('fitting')
+    // Своё — сразу на фигуру, не дожидаясь службы (04.11.2026: «надевание набора очень долгое»);
+    // служба отказала — снимаем обратно и говорим почему.
+    const before = worn
+    // Примерка на тех же местах уходит вместе с надеванием и возвращается, если служба откажет.
+    const tried = fitting.filter((c) => mine.some((m) => m.slot === c.slot))
+    setWorn(next)
+    setFitting((now) => now.filter((c) => !mine.some((m) => m.slot === c.slot)))
+    applyCosmetics(next)
+      .then(() => showToast(t('Надето — видят игроки с Millida'), 'ok'))
+      .catch((e) => {
+        setWorn((now) => (now === next ? before : now))
+        setFitting((now) => now.concat(tried.filter((c) => !now.some((x) => x.slot === c.slot))))
+        trackFailure('skins', e, { step: 'cosmetic_wear' })
+        showToast(apiErrorText(e, t('Не удалось надеть')), 'error')
+      })
+      .finally(() => setCosmeticBusy(''))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wearRefs, cosReady, cosmetics])
+
+  /// Надеть или снять: набор перезаписывается целиком, поэтому здесь и
+  /// собирается новый список — сервер не знает про «сними одну».
+  /** Вещь закрыта: платная и права на неё пока нет. */
+  const cosmeticLocked = (item: CosmeticItem) =>
+    item.access !== 'FREE' && !cosmeticOwned.includes(item.id)
+
+  const shownIn = (slot: string) => shownPerSlot[slot] ?? COSMETICS_FIRST_PAGE
+
+  const showMoreIn = (slot: string) =>
+    setShownPerSlot((now) => ({ ...now, [slot]: (now[slot] ?? COSMETICS_FIRST_PAGE) + COSMETICS_PAGE }))
+
+  const refreshPlus = () => loadPlus().then(setPlus).catch(() => setPlus(null))
+
+  const refreshRubies = () => loadBalance().then((b) => setRubies(b.balance)).catch(() => setRubies(0))
+
+  /** Выбранный цвет вещи и его картинка: по умолчанию тот же, что на картинке. */
+  const variantOf = (item: CosmeticItem) => {
+    const list = item.variants ?? []
+    if (!list.length) return null
+    const picked = variantById[item.id]
+    return list.find((v) => v.name === picked) ?? defaultVariant(list)
+  }
+
+  const textureOf = (item: CosmeticItem) => variantOf(item)?.texture ?? item.texture
+  const glowOf = (item: CosmeticItem) => variantOf(item)?.emissive ?? item.emissive
+
+  // Примеряемое вытесняет надетое на том же месте: на голове не может быть
+  // двух шляп, и показывать обе - врать о том, как это будет выглядеть.
+  const dressed = useMemo(() => {
+    const busySlots = new Set(fitting.map((c) => c.slot))
+    return worn
+      .filter((w) => !busySlots.has(w.slot))
+      .map((w) => cosmetics.find((c) => c.id === w.id))
+      .concat(fitting)
+      .filter((c): c is CosmeticItem => Boolean(c))
+  }, [worn, fitting, cosmetics])
+  const skinMasks = useMemo(
+    () => maskUrls(dressed, variant === 'slim', emoting ? dressed.find((c) => c.slot === 'EMOTE') : undefined).join(' '),
+    [dressed, variant, emoting],
+  )
+  const capeCovered = useMemo(() => hidesRegularCape(dressed), [dressed])
+
+  /** Надеть вещь на фигуру в окне или снять её оттуда. Покупка тут ни при чём. */
+  const tryOn = (item: CosmeticItem) => {
+    setFitting((now) =>
+      now.some((c) => c.id === item.id)
+        ? now.filter((c) => c.id !== item.id)
+        : now.filter((c) => c.slot !== item.slot).concat(item),
+    )
+  }
+
+  /**
+   * Сет помнится между заходами: собрал, ушёл копить — вернулся и докупил
+   * (владелец 24.09.2026). Храним только id, вещи берём из свежего каталога:
+   * цена и доступ могли поменяться. Своё и исчезнувшее из каталога отпадает.
+   */
+  const fitKey = 'm-fitset:' + (activeId || 'guest')
+  const fitRestored = useRef('')
+  useEffect(() => {
+    if (!cosmetics.length || fitRestored.current === fitKey) return
+    fitRestored.current = fitKey
+    let ids: string[] = []
+    try {
+      const raw = JSON.parse(localStorage.getItem(fitKey) || '[]')
+      if (Array.isArray(raw)) ids = raw.filter((x): x is string => typeof x === 'string')
+    } catch {}
+    const bySlot = new Map<string, CosmeticItem>()
+    for (const id of ids) {
+      const item = cosmetics.find((c) => c.id === id)
+      if (item && item.access !== 'FREE' && !cosmeticOwned.includes(item.id)) bySlot.set(item.slot, item)
+    }
+    // Примерка, пришедшая снаружи (набор, «Примерить»), уже на фигуре — её не затираем.
+    setFitting((now) => (now.length ? now : Array.from(bySlot.values())))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cosmetics, fitKey])
+  useEffect(() => {
+    if (fitRestored.current !== fitKey) return
+    try {
+      localStorage.setItem(fitKey, JSON.stringify(fitting.map((c) => c.id)))
+    } catch {}
+  }, [fitting, fitKey])
+
+  /** Что из примеренного придётся купить и сколько это стоит. */
+  const fittingBill = fitting.filter((c) => cosmeticLocked(c) && onSale(c))
+  const fittingTotal = fittingBill.reduce((sum, c) => sum + (c.priceRubies ?? 0), 0)
+
+  /**
+   * Купить весь сет разом — и сразу надеть. Покупаем по одной вещи: сервер
+   * списывает и выдаёт право одной проводкой, и частичная неудача не должна
+   * отменять уже купленное.
+   *
+   * Купленное считается своим сразу, не дожидаясь списка прав: раньше вещь
+   * после покупки оставалась «закрытой» до ответа /cosmetics/owned, и «Надеть»
+   * молча ничего не делало (владелец 24.09.2026).
+   */
+  const buyFitting = async () => {
+    const bill = fittingBill
+    if (!bill.length || cosmeticBusy) return
+    const total = bill.reduce((sum, c) => sum + (c.priceRubies ?? 0), 0)
+    // Воронка покупки сета в гардеробе: id — вещь или число вещей сета.
+    const result = purchaseFlow('item', bill.length > 1 ? 'set:' + bill.length : bill[0].id, total, 'rubies')
+    const ok = await uiConfirm(
+      bill.length > 1
+        ? t('Сет из {n} вещей за {price}. Купить и надеть?', { n: bill.length, price: rubyCount(total) })
+        : t('«{name}» за {price}. Купить и надеть?', { name: bill[0].name, price: rubyCount(total) }),
+      { title: t('Покупка'), confirmLabel: t('Купить'), cancelLabel: t('Не сейчас'), danger: false },
+    )
+    if (!ok) return result(false, 'cancel')
+    setCosmeticBusy('fitting')
+    const failed: string[] = []
+    const bought: CosmeticItem[] = []
+    for (const item of bill) {
+      try {
+        await buyCosmetic(item.id)
+        bought.push(item)
+      } catch (e) {
+        failed.push(item.name + (e ? ' (' + apiErrorText(e, t('отказ')) + ')' : ''))
+      }
+    }
+    const got = bought.map((c) => c.id)
+    setCosmeticOwned((now) => Array.from(new Set(now.concat(got))))
+    const owned = await loadCosmeticOwned().catch(() => null)
+    if (owned) setCosmeticOwned(Array.from(new Set(owned.items.concat(got))))
+    await refreshRubies()
+    result(bought.length > 0, bought.length ? undefined : 'error')
+    if (failed.length) showToast(t('Не удалось купить: {items}', { items: failed.join(', ') }), 'error')
+    if (!bought.length) {
+      setCosmeticBusy('')
+      return
+    }
+    // Купленное — сразу на игрока. Примерка этих вещей закончилась.
+    const next = worn
+      .filter((w) => !bought.some((c) => c.slot === w.slot))
+      .concat(bought.map((c) => ({ id: c.id, slot: c.slot, variant: variantOf(c)?.name })))
+    let wore = true
+    try {
+      await applyCosmetics(next)
+      setWorn(next)
+      setFitting((now) => now.filter((c) => !got.includes(c.id)))
+    } catch (e) {
+      wore = false
+      showToast(apiErrorText(e, t('Куплено, но не наделось — нажми «Надеть»')), 'error')
+    } finally {
+      setCosmeticBusy('')
+    }
+    showReward({
+      items: bought.map((c) => ({ name: c.name, preview: c.preview, rarity: rarityOfPrice(c.priceRubies || 0) })),
+      kicker: bought.length > 1 ? (bought.length < 5 ? t('{n} вещи', { n: bought.length }) : t('{n} вещей', { n: bought.length })) : t('Твоя вещь'),
+      title: bought.length > 1 ? t('Сет собран') : undefined,
+      sub: wore ? t('Уже на тебе') : undefined,
+      // Надеть заново — если сервер не принял набор с первого раза.
+      onWear: wore ? undefined : () => wearFittingRef.current(),
+    })
+  }
+
+  /**
+   * Нажатие на вещь — сборка сета. Надетое снимается. Своё надевается сразу и
+   * сохраняется на аккаунте. Чужое встаёт на фигуру примеркой и попадает в
+   * панель «Сет»; повторный клик убирает его оттуда.
+   */
+  const cardAction = (item: CosmeticItem) => {
+    if (worn.some((w) => w.id === item.id)) {
+      void toggleCosmetic(item)
+      return
+    }
+    if (fitting.some((c) => c.id === item.id) || cosmeticLocked(item)) {
+      tryOn(item)
+      return
+    }
+    void toggleCosmetic(item)
+  }
+
+  /** Надеть всё примеренное, что уже открыто (например, после оформления PLUS). */
+  const wearFittingRef = useRef<() => void>(() => {})
+  const wearFitting = async () => {
+    const ready = fitting.filter((c) => !cosmeticLocked(c))
+    if (!ready.length) return
+    const next = worn.filter((w) => !ready.some((c) => c.slot === w.slot)).concat(
+      ready.map((c) => ({
+        id: c.id,
+        slot: c.slot,
+        variant: variantOf(c)?.name,
+      })),
+    )
+    setCosmeticBusy('fitting')
+    try {
+      await applyCosmetics(next)
+      setWorn(next)
+      setFitting((now) => now.filter((c) => !ready.some((r) => r.id === c.id)))
+      showToast(t('Надето — видят игроки с Millida'), 'ok')
+    } catch (e) {
+      showToast(apiErrorText(e, t('Не удалось надеть')), 'error')
+    } finally {
+      setCosmeticBusy('')
+    }
+  }
+  wearFittingRef.current = () => void wearFitting()
+
+  /**
+   * Оформление подписки. Платит человек на странице шлюза, поэтому лаунчер
+   * открывает её и ждёт: подписка станет действующей, когда придут деньги, а не
+   * когда закрылось окно браузера.
+   */
+  const startPlus = async () => {
+    setPlusBusy(true)
+    // Исход — настоящая оплата (её ловит опрос) или ошибка.
+    const result = purchaseFlow('plus', 'plus_wardrobe')
+    try {
+      const started = await subscribePlus()
+      openPaymentUrl(started.paymentUrl)
+      showToast(t('Оплата открыта в браузере. Набор откроется сразу после оплаты'))
+      stopPlusWatch.current?.()
+      stopPlusWatch.current = watchPlusPurchase(plus ?? null, (status) => {
+        result(true)
+        setPlus(status)
+        setPlusJoy(true)
+        void refreshCosmetics()
+      })
+    } catch (e) {
+      result(false, 'error', e)
+      showToast(apiErrorText(e, t('Не удалось оформить подписку')), 'error')
+    } finally {
+      setPlusBusy(false)
+    }
+  }
+
+  const toggleCosmetic = async (item: CosmeticItem) => {
+    if (cosmeticBusy) return
+    if (cosmeticLocked(item)) {
+      showToast(t('Эта вещь ещё не открыта'))
+      return
+    }
+    const already = worn.some((w) => w.id === item.id)
+    const next = worn.filter((w) => w.slot !== item.slot && w.id !== item.id)
+    if (!already) {
+      next.push({ id: item.id, slot: item.slot, variant: variantOf(item)?.name })
+    }
+    setCosmeticBusy(item.id)
+    try {
+      await applyCosmetics(next)
+      setWorn(next)
+      // Своё надетое вытесняет примерку на том же месте.
+      if (!already) setFitting((now) => now.filter((c) => c.slot !== item.slot))
+      showToast(already ? t('Снято') : t(t('Надето — видят игроки с Millida')))
+    } catch (e) {
+      showToast(apiErrorText(e, t('Не удалось изменить косметику')), 'error')
+    } finally {
+      setCosmeticBusy('')
+    }
+  }
+
+  /**
+   * Плитка «Снять»: место на теле пустеет на аккаунте тем же запросом, каким
+   * надевают, — набор целиком без вещей этого места. Примерка в том же месте
+   * тоже уходит, иначе фигура продолжала бы показывать снятое.
+   */
+
+  // «Снять» и «Снять всё» (правка владельца 23.09.2026, 22:00: кнопок снять
+  // нигде не было). Набор уходит на аккаунт тем же запросом, что и «надеть».
+  const takeOffSlots = async (slots: string[]) => {
+    if (cosmeticBusy) return
+    setFitting((now) => now.filter((c) => !slots.includes(c.slot)))
+    if (!worn.some((w) => slots.includes(w.slot))) return
+    const next = worn.filter((w) => !slots.includes(w.slot))
+    setCosmeticBusy('off')
+    try {
+      await applyCosmetics(next)
+      setWorn(next)
+      showToast(t('Снято'))
+    } catch (e) {
+      showToast(apiErrorText(e, t('Не удалось снять')), 'error')
+    } finally {
+      setCosmeticBusy('')
+    }
+  }
+
+  const refreshRewards = async () => {
+    if (!hasMillidaAccount()) return
+    try {
+      const r = await loadRewards()
+      setRewards(r.items)
+    } catch (e) {
+      console.warn('[skins] rewards', e)
+      showToast(t('Награды не загрузились'), 'error')
+    }
+  }
+
+  // Каталог украшений нужен сразу: слева стоят слоты со счётчиками, и пустые
+  // счётчики читались бы как «у нас ничего нет». Раньше он ехал по клику на
+  // вкладку «Украшения», которой больше нет.
+  useEffect(() => {
+    void refreshWardrobe()
+    void refreshRewards()
+    void refreshCosmetics()
+    void refreshPlus()
+    void refreshRubies()
+    noteCosmeticsSeen()
+  }, [])
+
+  // Первый кадр — в том, во что игрок одет, пока служба не ответила: только что надетое здесь же
+  // (lib/lookHint) или образ, который запомнило лобби (lib/lookCache). Ответ службы потом сверяет.
+  useEffect(() => {
+    if (!hasMillidaAccount()) return
+    let alive = true
+    const hint = lookHint(lookOwner())
+    void Promise.all([keptLookSkin(nick), keptLookOutfit<{ item: CosmeticItem }>(nick)]).then(([kept, outfit]) => {
+      if (!alive) return
+      if (!userPicked.current && !wardrobeIn.current) {
+        const applied = hint?.texture
+        const skin = applied?.skinUrl ? { url: applied.skinUrl, slim: applied.model === 'slim' } : kept ? { url: kept.skin, slim: kept.slim } : null
+        if (skin) {
+          setSkinSrc(skin.url)
+          setVariant(skin.slim ? 'slim' : 'classic')
+        }
+      }
+      if (wornKnown.current) return
+      const fromOutfit = outfit.map(({ item }): WornCosmetic => {
+        const { variant } = splitVariantCode(item.id)
+        return variant ? { id: item.id, slot: item.slot, variant } : { id: item.id, slot: item.slot }
+      })
+      const seed = hint?.worn ?? (fromOutfit.length ? fromOutfit : null)
+      if (!seed) return
+      wornKnown.current = true
+      setWorn(seed)
+      if (!seed.length) setDressReady(true)
+    })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  // Сторож: служба и образ с прошлого раза молчат — через DRESS_WAIT_MS показываем фигуру как есть.
+  useEffect(() => {
+    if (!modelShown || dressReady) return
+    const t = window.setTimeout(() => setDressReady(true), DRESS_WAIT_MS)
+    return () => window.clearTimeout(t)
+  }, [modelShown, dressReady])
+
+  useEffect(
+    () =>
+      onRealtime('account', () => {
+        if (!hasMillidaAccount()) return
+        void refreshPlus()
+        void refreshRubies()
+        void loadCosmeticOwned()
+          .then((owned) => setCosmeticOwned(owned.items || []))
+          .catch(() => undefined)
+      }),
+    [],
+  )
+
+  // Каталог аккаунта запрашивается один раз при открытии экрана, а вход к тому
+  // моменту мог ещё не подхватиться: запрос тогда не уходил вовсе, и каталог
+  // показывался пустым, хотя на сервере он есть. Перезапрашиваем, как только
+  // аккаунт Millida появился.
+  const millidaSignedIn = accounts.some((a) => a.kind === 'millida')
+  useEffect(() => {
+    if (!millidaSignedIn) return
+    void refreshWardrobe()
+    void refreshRewards()
+  }, [millidaSignedIn])
+
+  /** Выдать плащ за задание прямо из окна условия. */
+  const takeCape = async (c: CapeOption) => {
+    const reward = rewards.find((r) => r.code === c.rewardCode)
+    if (!reward) return
+    setCapeInfo(null)
+    await takeReward(reward)
+  }
+
+  const takeReward = async (r: RewardItem) => {
+    setClaiming(r.code)
+    try {
+      await claimReward(r.code)
+      await refreshRewards()
+      await refreshWardrobe()
+      setSection('cape')
+      setChipBy((now) => ({ ...now, cape: 'all' }))
+      showReward({
+        items: [{ name: r.title, icon: 'cape', art: r.capeUrl ? <CapePreview url={r.capeUrl} h={180} /> : undefined }],
+        tone: 'var(--m-rarity-legendary)',
+        kicker: t('Новый плащ'),
+        title: r.title,
+        sub: t('Уже в гардеробе'),
+      })
+    } catch (e) {
+      showToast(t('Не удалось забрать награду: {error}', { error: tx(e) }), 'error')
+    } finally {
+      setClaiming('')
+    }
+  }
+
+  // Каталог плащей: без аккаунта Millida его некому персонализировать
+  // (прогресс и «открыт/закрыт» считает сервер по текущему пользователю).
+  useEffect(() => {
+    if (!hasMillidaAccount()) return
+    let alive = true
+    loadCapeCatalog()
+      .then((list) => {
+        if (alive && Array.isArray(list)) setCapeCatalog(list)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  /// Плащи Mojang приходят с сервера, а не из кода лаунчера: новые плащи
+  /// появляются без выпуска новой версии.
+  useEffect(() => {
+    let alive = true
+    loadMojangCapes()
+      .then((list) => {
+        if (alive && Array.isArray(list.items)) setMojangCapes(list.items)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const gameNick = useGameNick()
+  useEffect(() => {
+    void refreshGameNick()
+  }, [])
+
+  // Разовый переезд локальной библиотеки в аккаунт: сервер сам схлопывает
+  // повторы по содержимому PNG, поэтому дублей каталог не наберёт.
+  // Только скины: плащи в каталог аккаунта больше не загружаются — они выдаются
+  // каталогом Millida и лицензией Mojang.
+  const syncedRef = useRef(false)
+  useEffect(() => {
+    if (syncedRef.current || !hasMillidaAccount()) return
+    if (!mySkins.length) return
+    syncedRef.current = true
+    void (async () => {
+      const KEY = 'm-wardrobe-synced'
+      let done: string[] = []
+      try {
+        const raw = JSON.parse(localStorage.getItem(KEY) || '[]')
+        done = Array.isArray(raw) ? raw : []
+      } catch {}
+      const pending = mySkins
+        .map((s) => ({ kind: 'skin' as const, item: s, tag: 's:' + s.file }))
+        .filter((p) => !done.includes(p.tag))
+      if (!pending.length) return
+      for (const p of pending) {
+        try {
+          await addToWardrobe({
+            kind: p.kind,
+            name: p.item.name,
+            pngBase64: await toPngBase64(p.item.data),
+            slim: p.item.slim,
+          })
+          done.push(p.tag)
+        } catch {}
+      }
+      localStorage.setItem(KEY, JSON.stringify(done.slice(-200)))
+      await refreshWardrobe()
+    })()
+  }, [mySkins])
+
+  const autoVariant = (url: string, key: string) => {
+    variantKeyRef.current = key
+    const seq = ++autoSeq.current
+    const saved = recallVariant(key)
+    if (saved) {
+      setVariant(saved)
+      return
+    }
+    detectSlimFromUrl(url)
+      .then((slim) => {
+        if (seq === autoSeq.current) setVariant(slim ? 'slim' : 'classic')
+      })
+      .catch(() => {})
+  }
+
+  const chooseVariant = (key: string, next: string, manual: boolean) => {
+    variantKeyRef.current = key
+    autoSeq.current++
+    setVariant(next)
+    if (manual) rememberVariant(key, next)
+  }
+
+  const redetectedRef = useRef(false)
+  useEffect(() => {
+    if (redetectedRef.current || !mySkins.length) return
+    redetectedRef.current = true
+    const stored = mySkins
+    void Promise.all(
+      stored.map((s) =>
+        s.slimManual
+          ? Promise.resolve(s)
+          : detectSlimFromUrl(s.data)
+              .then((slim) => ({ ...s, slim }))
+              .catch(() => s),
+      ),
+    ).then(async (next) => {
+      if (next.every((s, i) => s.slim === stored[i].slim)) return
+      setMySkins(next)
+      for (const fresh of next) {
+        const was = stored.find((x) => x.file === fresh.file)
+        if (was && was.slim !== fresh.slim)
+          await setTextureSlim('skins', fresh.file, fresh.slim, false).catch(() => [])
+      }
+      const active = next.find((s) => s.file === activeMyRef.current)
+      if (active) setVariant(active.slim ? 'slim' : 'classic')
+    })
+  }, [mySkins])
+
+  // Reset the preview only on account switch: reacting to `textures` reverted a just-applied skin.
+  const lastAccRef = useRef<string | null>(null)
+  useEffect(() => {
+    const a = getAccount()
+    if (!a || !a.nick) return
+    if (lastAccRef.current === activeId) return
+    lastAccRef.current = activeId
+    capeTouched.current = false
+    userPicked.current = false
+    skinPick.current++
+    setNick(a.nick)
+    const t = textures[a.id]
+    setSkinSrc(t ? t.skin : null)
+    const saved = recallVariant('n:' + a.nick)
+    if (saved) setVariant(saved)
+    else if (t) setVariant(t.slim ? 'slim' : 'classic')
+    else autoVariant(skinUrl(a.nick), 'n:' + a.nick)
+  }, [activeId, textures])
+
+  /**
+   * Каталог скинов - витрина millida.net, а не свой список внутри лаунчера.
+   * Поиск по нику остаётся отдельным ходом: витрина показывает опубликованные
+   * профили, а по нику берётся скин любого игрока Minecraft.
+   */
+  const loadCatalog = async (kind: ShowcaseKind) => {
+    setCatFailed(false)
+    try {
+      setCatCards(await withRetry(() => loadShowcase(kind)))
+    } catch {
+      setCatCards([])
+      setCatFailed(true)
+    }
+  }
+
+  useEffect(() => {
+    void loadCatalog(catKind)
+  }, [catKind])
+
+  const catFound = useMemo(() => {
+    const needle = catQuery.trim().toLowerCase()
+    if (!needle) return catCards
+    return catCards.filter((c) => c.name.toLowerCase().includes(needle))
+  }, [catCards, catQuery])
+
+  const capeSources = useMemo<CapeOption[]>(
+    () => {
+      const mojangByHash = new Map(mojangCapes.map((c) => [textureHash(c.url), c]))
+      const licensed: CapeOption[] = []
+      const licensedHashes = new Set<string>()
+      for (const a of accounts) {
+        for (const c of msCapes[a.id] || []) {
+          if (!c.url) continue
+          licensedHashes.add(textureHash(c.url))
+          licensed.push({
+            id: 'ms:' + a.id + ':' + c.id,
+            name: c.alias || mojangByHash.get(textureHash(c.url))?.name || t('Плащ'),
+            url: c.url,
+            sub: c.active ? t('Надет на {nick}', { nick: a.nick }) : t('На аккаунте {nick}', { nick: a.nick }),
+            onAccount: true,
+            active: c.active,
+            msId: c.id,
+            accId: a.id,
+          })
+        }
+      }
+      const accCapes = accounts
+        .filter((a) => textures[a.id] && textures[a.id].cape && !msCapes[a.id])
+        .map((a) => ({ nick: a.nick, kind: a.kind, id: a.id, url: textures[a.id].cape as string, hash: textureHash(textures[a.id].cape) }))
+      const accHashes = new Set(accCapes.map((c) => c.hash).filter(Boolean))
+      const stored: CapeOption[] = wardrobe
+        .filter((i) => i.kind === 'cape')
+        .map((i) => ({ id: 'w:' + i.id, name: i.name, url: i.url, sub: t('В каталоге Millida'), wardrobeId: i.id }))
+      // Плащ на аккаунт Millida ставит сервер по идентификатору карточки
+      // (catalogId), файл туда не уходит: список открытых плащей — серверный.
+      const official: CapeOption[] = mojangCapes
+        .filter((c) => !licensedHashes.has(textureHash(c.url)))
+        .map((c) => ({
+          id: c.id,
+          catalogId: c.id,
+          name: c.name,
+          url: c.url,
+          sub: t('Дизайн Mojang'),
+          onAccount: accHashes.has(textureHash(c.url)),
+        }))
+      const acc: CapeOption[] = accCapes
+        .filter((c) => !mojangByHash.has(c.hash))
+        .map((c) => ({
+          id: 'acc:' + c.id,
+          name: c.nick,
+          url: c.url,
+          sub: t('На аккаунте {nick}', { nick: accKindLabel(c.kind) }),
+          onAccount: true,
+        }))
+      const design: CapeOption[] = [
+        { id: 'millida', catalogId: 'design:millida', name: 'Millida', url: MILLIDA_CAPE, sub: t('Плащ лаунчера') },
+      ]
+      // Повторы между каталогом Millida, гардеробом аккаунта и списком Mojang
+      // схлопывает dedupeCapes: у него один набор правил на все источники.
+      const catalog: CapeOption[] = capeCatalog
+        .filter((c) => c.url)
+        .map((c) => {
+          const locked = c.unlocked === false
+          const target = c.progressTarget || 0
+          const cur = c.progressCurrent || 0
+          return {
+            id: 'cat:' + c.id,
+            catalogId: c.id,
+            name: c.name,
+            url: c.url,
+            sub: locked ? c.requirement || t('Пока закрыт') : c.rarity ? t('Каталог Millida · {rarity}', { rarity: c.rarity }) : t('Каталог Millida'),
+            locked,
+            requirement: c.requirement,
+            rarity: c.rarity,
+            progress: locked ? Math.max(0, Math.min(100, Math.round(c.progress || 0))) : undefined,
+            progressLabel:
+              locked && target ? cur + ' / ' + target + (c.progressUnit ? ' ' + c.progressUnit : '') : undefined,
+            earned: true,
+          }
+        })
+      // Ранее загруженные свои плащи. Новые загрузить нельзя, но старые надеть — да.
+      const mine: CapeOption[] = myCapes.map((c, i) => ({
+        id: 'my:' + i,
+        name: c.name,
+        url: c.data,
+        sub: t('Загружено ранее'),
+      }))
+      // Плащи за задания - те же плащи: отдельным списком снизу они выглядели
+      // повтором, и у них были свои кнопки вместо общего правила «нажал на
+      // закрытый плащ - увидел условие».
+      const earned: CapeOption[] = rewards
+        .filter((r) => !r.claimed)
+        .map((r) => ({
+          id: 'reward:' + r.code,
+          name: r.title,
+          url: r.capeUrl || '',
+          sub: r.task,
+          locked: true,
+          requirement: r.task,
+          hint: r.hint,
+          rewardCode: r.code,
+          rewardReady: r.done,
+          earned: true,
+          progress: Math.max(0, Math.min(100, Math.round((r.progress / (r.goal || 1)) * 100))),
+          progressLabel: rewardProgress(r),
+        }))
+      const open = catalog.filter((c) => !c.locked)
+      const shut = catalog.filter((c) => c.locked)
+      return licensed
+        .concat(stored)
+        .concat(open)
+        .concat(acc)
+        .concat(design)
+        .concat(mine)
+        .concat(official)
+        .concat(earned)
+        .concat(shut)
+    },
+    [accounts, textures, myCapes, msCapes, wardrobe, capeCatalog, rewards, mojangCapes, t],
+  )
+
+  // Отпечатки текстур: один и тот же плащ приезжает из каталога Millida и из
+  // гардероба аккаунта по разным адресам без хеша Mojang в них, и опознать его
+  // можно только по самим байтам. Картинки уже читаются для превью, так что
+  // повторного скачивания здесь нет.
+  const [capeContent, setCapeContent] = useState<Record<string, string>>({})
+  useEffect(() => {
+    const missing = Array.from(new Set(capeSources.map((c) => c.url))).filter((u) => u && !(u in capeContent))
+    if (!missing.length) return
+    let alive = true
+    void Promise.all(
+      missing.map((u) =>
+        textureSource(u).then(
+          (src) => [u, contentFingerprint(src)] as const,
+          () => [u, ''] as const,
+        ),
+      ),
+    ).then((pairs) => {
+      if (alive) setCapeContent((prev) => ({ ...prev, ...Object.fromEntries(pairs) }))
+    })
+    return () => {
+      alive = false
+    }
+  }, [capeSources, capeContent])
+
+  const capes = useMemo<CapeOption[]>(
+    () => dedupeCapes(capeSources, (u) => capeContent[u] || undefined),
+    [capeSources, capeContent],
+  )
+
+  /**
+   * Плащ за достижение живёт среди украшений: ради него играют, и стоять он
+   * должен рядом с остальным, что надевают на себя. Плащ, просто лежащий на
+   * аккаунте, - часть скина, и остаётся во вкладке скинов.
+   */
+  const earnedCapes = useMemo(() => capes.filter((c) => c.earned), [capes])
+  const ownCapes = useMemo(() => capes.filter((c) => !c.earned), [capes])
+
+  useEffect(() => {
+    let alive = true
+    Promise.all(accounts.map((a) => loadAccountTexture(a, millidaTex).then((t) => [a.id, t] as const))).then((pairs) => {
+      if (alive) setTextures(Object.fromEntries(pairs))
+    })
+    return () => {
+      alive = false
+    }
+  }, [accounts, millidaTex, texEpoch])
+
+  useEffect(() => {
+    if (!hasTauri()) return
+    let alive = true
+    void (async () => {
+      const pairs: [string, MsCape[]][] = []
+      for (const a of accounts) {
+        if (a.kind !== 'microsoft') continue
+        const ms = await ensureMsAuth(a)
+        if (!ms) continue
+        try {
+          const p = await msProfile(a.id)
+          pairs.push([a.id, p.capes || []])
+        } catch {}
+      }
+      if (alive && pairs.length) setMsCapes(Object.fromEntries(pairs))
+    })()
+    return () => {
+      alive = false
+    }
+  }, [accounts])
+
+  useEffect(() => {
+    if (capeTouched.current) return
+    const a = getAccount()
+    if (!a) return
+    const worn = capes.find((c) => c.accId === a.id && c.active)
+    if (worn) {
+      setCape(worn.id)
+      return
+    }
+    const t = textures[a.id]
+    const url = t ? t.cape : null
+    if (!url) return
+    const h = textureHash(url)
+    const print = capeContent[url]
+    const same = capes.find((c) =>
+      h ? textureHash(c.url) === h : c.url === url || (!!print && capeContent[c.url] === print),
+    )
+    if (same) setCape(same.id)
+  }, [capes, textures, activeId, capeContent])
+
+  useEffect(() => {
+    const card = capeById(capes, cape)
+    if (card && card.id !== cape) setCape(card.id)
+  }, [capes, cape])
+
+  const chooseCape = (id: string) => {
+    capeTouched.current = true
+    setCape(id)
+  }
+
+  // Capes are matched by texture hash, but Mojang only accepts the cape id from the profile.
+  const capeTarget = (c: CapeOption): { accId: string; msId: string } | null => {
+    if (c.accId && c.msId) return { accId: c.accId, msId: c.msId }
+    const h = textureHash(c.url)
+    if (!h) return null
+    for (const a of accounts) {
+      const hit = (msCapes[a.id] || []).find((x) => textureHash(x.url) === h)
+      if (hit) return { accId: a.id, msId: hit.id }
+    }
+    return null
+  }
+
+  const switchLicensedCape = async (accId: string, msId: string): Promise<boolean> => {
+    const acc = accounts.find((a) => a.id === accId)
+    if (!acc || acc.kind !== 'microsoft' || !hasTauri()) return false
+    const own = msCapes[accId] || []
+    if ((own.find((c) => c.active)?.id || '') === msId) return false
+    const ms = await ensureMsAuth(acc)
+    if (!ms) throw new Error(t('вход в аккаунт {nick} устарел', { nick: acc.nick }))
+    await msSetCape(ms.id, msId)
+    setMsCapes({ ...msCapes, [accId]: own.map((c) => ({ ...c, active: c.id === msId })) })
+    texCache.delete(acc.uuid || acc.nick)
+    return true
+  }
+
+  const pickCapeOption = (c: CapeOption) => {
+    // Закрытый плащ надеть нельзя, но по нему и нажимают за тем, чтобы узнать
+    // условие: тост уносил ответ раньше, чем его успевали прочитать.
+    if (c.locked) {
+      setCapeInfo(c)
+      return
+    }
+    chooseCape(c.id)
+    const target = capeTarget(c)
+    void Promise.allSettled([
+      wearOnMillida(c),
+      target ? switchLicensedCape(target.accId, target.msId) : Promise.resolve(false),
+    ]).then(([millida, license]) => {
+      if (millida.status === 'rejected')
+        showToast(apiErrorText(millida.reason, t('Плащ не надет — попробуй ещё раз')), 'error')
+      if (license.status === 'rejected') showToast(t('Плащ лицензии не переключился: {error}', { error: tx(license.reason) }), 'error')
+      if (license.status === 'fulfilled' && license.value) showToast(t('Плащ «{name}» надет на лицензию', { name: c.name }))
+      else if (millida.status === 'fulfilled' && millida.value) showToast(t('Плащ «{name}» надет', { name: c.name }))
+      else if (millida.status === 'fulfilled' && license.status === 'fulfilled') showToast(t('Плащ: {name}', { name: c.name }))
+    })
+  }
+
+  const wearOnMillida = async (c: CapeOption): Promise<boolean> => {
+    if (!hasMillidaAccount()) return false
+    if (c.wardrobeId) await applyWardrobeItem(c.wardrobeId)
+    else if (c.catalogId) await applyCatalogCape(c.catalogId)
+    else return false
+    await refreshWardrobe()
+    return true
+  }
+
+  const takeOffCape = () => {
+    chooseCape('none')
+    if (!hasMillidaAccount()) {
+      showToast(t('Плащ снят'))
+      return
+    }
+    void uploadTexture('cape', null)
+      .then(() => refreshWardrobe())
+      .then(() => showToast(t('Плащ снят')))
+      .catch((e) => {
+        trackFailure('skins', e, { step: 'cape_remove' })
+        showToast(apiErrorText(e, t('Плащ не снялся — попробуй ещё раз')), 'error')
+      })
+  }
+
+  const fitViewer = () => {
+    const engine = viewerRef.current
+    const stage = stageRef.current
+    if (!engine || !stage) return
+    try {
+      const w = stage.clientWidth || 300
+      const h = stage.clientHeight || 430
+      engine.setSize(w, h)
+      // Фон-сцена за холстом повторяет его место и размер.
+      const host = stage.parentElement
+      host?.style.setProperty('--stage-top', stage.offsetTop + 'px')
+      host?.style.setProperty('--stage-h', stage.offsetHeight + 'px')
+      // Кадр — по одному телу, вещи его не двигают; ник — над самой высокой вещью.
+      // Размер фигуры всегда один, при любых вещах (владелец 22:35).
+      const r = engine.fitPlayerToFrame({ fillY: FULL_FILL_Y, offsetY: FULL_OFFSET_Y })
+      if (r) setTagAt(nametagSpot(tagBox(r), w, h))
+    } catch {}
+  }
+
+  useEffect(() => {
+    if (!on || m3d) return
+    let alive = true
+    loadMine3d()
+      .then((mod) => {
+        if (!alive) return
+        setM3d(mod)
+        setSvReady(true)
+      })
+      .catch(() => {
+        if (alive) setFallback(true)
+      })
+    return () => {
+      alive = false
+    }
+  }, [on, m3d])
+
+  // Номер холста: контекст WebGL отобрали — сцена собирается заново на новом
+  // холсте, а не остаётся пустой или плоской 2D-заглушкой.
+  const [glEpoch, setGlEpoch] = useState(0)
+  const glTries = useRef(0)
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!m3d || !canvas) return
+    const onLost = (ev: Event) => {
+      ev.preventDefault()
+      // Второй потерянный контекст за сеанс — лёгкая графика в лобби и превью.
+      noteContextLost()
+      setModelShown(false)
+      setGlEpoch((n) => n + 1)
+    }
+    canvas.addEventListener('webglcontextlost', onLost)
+    let engine: SkinViewEngine
+    try {
+      // Камеру вокруг фигуры не возим: в гардеробе крутят самого персонажа, и
+      // две системы вращения на один холст дают рывки друг об друга.
+      noteContextCreated()
+      engine = new m3d.SkinViewEngine(canvas, {
+        autoResize: false,
+        autoDetectModel: false,
+        transparent: true,
+        enableControls: false,
+      })
+    } catch {
+      canvas.removeEventListener('webglcontextlost', onLost)
+      // Контекст бывает занят соседней сценой: две попытки, потом заглушка.
+      if (glTries.current < 2) {
+        glTries.current++
+        const retry = setTimeout(() => setGlEpoch((n) => n + 1), 1500)
+        return () => clearTimeout(retry)
+      }
+      setFallback(true)
+      return
+    }
+    glTries.current = 0
+    engine.applyLightSettings(MILLIDA_LIGHT)
+    engine.setContactShadowVisible(true)
+    // Взгляд за мышкой — головой, корпус стоит; пока фигуру крутят — нет
+    // (владелец 24.09.2026). Общая логика с лобби — src/lib/headLook.ts.
+    engine.setCursorFollow(false)
+    engine.setPoseHook(headLook(() => dragFrom.current !== null))
+    viewerRef.current = engine
+    setEngineReady(glEpoch + 1)
+    setFallback(false)
+    fitViewer()
+    engine.start()
+    return () => {
+      canvas.removeEventListener('webglcontextlost', onLost)
+      viewerRef.current = null
+      setEngineReady(0)
+      // Сцена пересоздаётся при каждом заходе: без явного отказа от контекста
+      // WebGL они копятся, и WKWebView начинает терять скин на фигуре.
+      releaseEngine(engine)
+    }
+  }, [m3d, glEpoch])
+
+  useEffect(() => {
+    const engine = viewerRef.current
+    if (!engine) return
+    let alive = true
+    const masks = skinMasks ? skinMasks.split(' ') : []
+    void textureSource(skinSrc || skinUrl(nick))
+      .then((src) =>
+        maskedSkin(src, masks, variant === 'slim').catch((e: unknown) => {
+          console.warn('[skins] skin under the outfit was not cut', e)
+          return src
+        }),
+      )
+      .then((src) => {
+        if (!alive) return
+        engine
+          .setSkin(src)
+          .then(() => {
+            if (!alive) return
+            fitViewer()
+            requestAnimationFrame(() => requestAnimationFrame(() => setModelShown(true)))
+          })
+          .catch((e) => {
+            // Текстура не прочиталась: фигура остаётся в прежнем скине, но не
+            // пропадает, и человек видит, почему скин не сменился.
+            console.warn('[skins] setSkin', e)
+            if (!alive) return
+            setModelShown(true)
+            showToast(t('Скин не прочитался — проверь, что это PNG 64×64'), 'error')
+          })
+      })
+    return () => {
+      alive = false
+    }
+  }, [nick, skinSrc, skinMasks, variant, engineReady])
+
+  useEffect(() => {
+    const engine = viewerRef.current
+    if (!engine || !m3d) return
+    engine.setModelType(variant === 'slim' ? m3d.SkinModelType.Slim : m3d.SkinModelType.Classic)
+    fitViewer()
+  }, [variant, m3d, engineReady])
+
+  /**
+   * Надетое видно прямо на фигуре. Геометрию просим только для надетого:
+   * сервер отдаёт её под потолок на сутки, и тянуть весь каталог ради
+   * витрины нельзя.
+   */
+  useEffect(() => {
+    const engine = viewerRef.current
+    // Движок мог остаться от прошлой версии кода при горячей перезагрузке: у
+    // такого объекта новых методов нет, и вызов молча снёс бы весь экран.
+    if (!engine || !engineReady || typeof engine.clearCosmetics !== 'function') return
+    let alive = true
+    let emoteDone: ReturnType<typeof setTimeout> | undefined
+    engine.clearCosmetics()
+    const partnerReady = typeof engine.setPartner === 'function'
+    if (partnerReady) void engine.setPartner(null)
+    const shown = dressed
+      // Эмоции рисовать нечего: у них нет ни картинки, ни кубов - только клип,
+      // который двигает самого игрока. Модель им всё равно нужна.
+      .filter((c): c is CosmeticItem => Boolean(c && c.model && (textureOf(c) || c.slot === 'EMOTE')))
+    setFitLoading(shown.filter((item) => !MODEL_CACHE.has(item.model as string)).map((item) => item.id))
+    void Promise.all(shown.map((item) => cosmeticModel(item.model as string).then((file) => ({ item, file })))).then(
+      (loaded) => {
+        if (!alive) return
+        setFitLoading([])
+        const lost = loaded.filter((got) => !got.file).map((got) => got.item.name)
+        if (lost.length) {
+          // Молчаливая пустота на фигуре читается как «примерка не работает».
+          // Лучше честно сказать, что вещь не приехала, чем оставить гадать.
+          showToast(t('Не удалось показать на фигуре: {items}', { items: lost.join(', ') }), 'error')
+        }
+        // Эмоция двигает самого игрока, а не вещь: её клип идёт вместо покоя.
+        const emote = loaded.find((got) => got.item.slot === 'EMOTE' && got.file?.animations)
+        const emoteClips = emote?.file ? readAnimations(emote.file.animations) : {}
+        // Вступление, потом петля - как в игре и у Essential: один клип из
+        // каталога обрывал эмоцию на вступлении.
+        const chosen = emote?.file ? emoteClip(emoteClips, emote.item.animation) : null
+        // A paired emote plays each half alone and without the model's skeleton,
+        // as the mod does: the other clips in its file belong to other scenes.
+        const duo = duoScene(emote?.item.id)
+        const sequence = duo ? soloSequence(chosen) : emote?.file ? emoteSequence(emoteClips, chosen) : null
+        const playing = sequence ? new CosmeticEmote(sequence, duo ? undefined : emote?.file?.geometry) : null
+        if (playing && sequence) {
+          engine.setAnimation(playing as unknown as SkinAnimation)
+          engine.setCursorFollow(false)
+          setEmoting(true)
+          // An endless loop reads as a stuck figure shaking its head: the tried-on emote plays
+          // long enough to be seen, then the figure hands back to its rest and occasional shows.
+          emoteDone = setTimeout(
+            () => {
+              if (!alive) return
+              for (const piece of emoteProps) piece.object.parent?.remove(piece.object)
+              if (partnerReady) void engine.setPartner(null)
+              setEmoting(false)
+            },
+            emoteShowMs(sequence.intro?.length ?? 0, sequence.main.length),
+          )
+        } else {
+          setEmoting(false)
+        }
+        const partnerSequence = duo && playing ? soloSequence(emoteClips[duoClipName(duo, 'b')] ?? null) : null
+        if (duo && playing && sequence && partnerSequence && partnerReady) {
+          const partner = new CosmeticEmote(partnerSequence)
+          void textureSource(nickSkinUrl(DUO_PARTNER_NICK))
+            .then((src) =>
+              alive
+                ? engine.setPartner({
+                    skin: src,
+                    slim: false,
+                    animation: partner as unknown as SkinAnimation,
+                    stage: () => {
+                      const stage = duoStage(duo, sequence.timeAt(playing.progress))
+                      return { main: stage.a, partner: stage.b }
+                    },
+                  })
+                : undefined,
+            )
+            .then(() => {
+              if (alive) fitViewer()
+            })
+            .catch((e: unknown) => {
+              console.warn('[skins] duo partner', e)
+              if (alive) showToast(t('Второй участник эмоции не загрузился — видна только твоя половина'), 'error')
+            })
+        }
+        const emoteProps: { object: { parent: { remove(o: unknown): void } | null } }[] = []
+        for (const got of loaded) {
+          if (!got.file) continue
+          const skin = textureOf(got.item)
+          if (!skin) continue
+          const geometry = variant === 'slim' && got.file.geometrySlim ? got.file.geometrySlim : got.file.geometry
+          try {
+            for (const piece of buildCosmetic(
+              geometry,
+              skin,
+              got.item.slot,
+              got.file.animations,
+              got.item.animation,
+              got === emote && playing && sequence ? { sequence, clock: () => playing.progress } : undefined,
+              pieceCover(dressed, got.item),
+              glowOf(got.item),
+            )) {
+              engine.attachCosmetic(piece.anchor, piece.object)
+              if (got === emote) emoteProps.push(piece as unknown as (typeof emoteProps)[number])
+            }
+          } catch {
+            // Кривая модель не должна гасить весь экран: вещь просто не
+            // покажется на фигуре, картинка в каталоге у неё остаётся.
+          }
+        }
+        // Кадр движок держит по телу — примерка персонажа не сдвигает; пересчёт
+        // нужен только нику, чтобы встать над новой шляпой.
+        fitViewer()
+        // Надетое известно и уже на фигуре — её можно показать (гость вещей не носит).
+        if ((wornKnown.current && catalogIn.current) || !hasMillidaAccount()) setDressReady(true)
+      },
+    )
+    return () => {
+      alive = false
+      clearTimeout(emoteDone)
+      setFitLoading([])
+      engine.clearCosmetics()
+      if (partnerReady) void engine.setPartner(null)
+    }
+  }, [dressed, variant, variantById, engineReady])
+
+  useEffect(() => {
+    const engine = viewerRef.current
+    if (!engine) return
+    const c = capeById(capes, cape)
+    if (!c || capeCovered) {
+      engine.clearCape()
+      return
+    }
+    let alive = true
+    void textureSource(c.url).then((src) => {
+      if (alive)
+        engine
+          .setCape(src)
+          .then(() => {
+            if (alive) fitViewer()
+          })
+          .catch(() => {})
+    })
+    return () => {
+      alive = false
+    }
+  }, [cape, capes, capeCovered, engineReady])
+
+  /// Автопоказ: покой — это idle, изредка персонаж проигрывает один из клипов и
+  /// возвращается в покой. Порядок берётся из перемешанного мешка, а пауза —
+  /// случайная: ровный цикл глаз заучивает за пару кругов. Таймер живёт внутри
+  /// эффекта, поэтому двойное монтирование StrictMode не оставляет второй.
+  useEffect(() => {
+    const engine = viewerRef.current
+    if (!engine || !m3d || emoting) return
+    const rest = () => {
+      const e = viewerRef.current
+      if (!e) return
+      e.setAnimation(m3d.createSkinAnimation('idle'))
+    }
+    engine.setPresentationMode('full')
+    rest()
+    if (!viewerAwake) return
+    if (typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches) return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let bag: number[] = []
+    let last = -1
+    const nextClip = () => {
+      if (!bag.length) {
+        bag = IDLE_SHOW.map((_, i) => i)
+        for (let i = bag.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1))
+          const t = bag[i]
+          bag[i] = bag[j]
+          bag[j] = t
+        }
+        // Стык двух мешков — единственное место, где клип может повториться подряд
+        if (bag[bag.length - 1] === last) {
+          const t = bag[bag.length - 1]
+          bag[bag.length - 1] = bag[0]
+          bag[0] = t
+        }
+      }
+      last = bag.pop() as number
+      return IDLE_SHOW[last]
+    }
+    const toRest = () => {
+      rest()
+      timer = setTimeout(toShow, between(IDLE_SHOW_GAP_MIN, IDLE_SHOW_GAP_MAX))
+    }
+    const toShow = () => {
+      const e = viewerRef.current
+      if (!e) return
+      const clip = nextClip()
+      e.setCursorFollow(false)
+      e.setAnimation(m3d.createSkinAnimation(clip.id))
+      timer = setTimeout(toRest, clip.ms)
+    }
+    timer = setTimeout(toShow, between(IDLE_SHOW_FIRST_MIN, IDLE_SHOW_FIRST_MAX))
+    return () => clearTimeout(timer)
+  }, [m3d, engineReady, viewerAwake, emoting])
+
+  useEffect(() => {
+    if (!engineReady) return
+    const stage = stageRef.current
+    if (!stage) return
+    fitViewer()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => fitViewer())
+    ro.observe(stage)
+    return () => ro.disconnect()
+  }, [engineReady, on])
+
+  useEffect(() => {
+    if (!engineReady) return
+    const setPaused = (v: boolean) => {
+      const engine = viewerRef.current
+      if (!engine) return
+      if (v) engine.stop()
+      else engine.start()
+      setViewerAwake(!v)
+    }
+    // Игра поверх или окно в трее — 3D стоит (lib/renderGate). Окно без фокуса
+    // — живёт: человек смотрит на гардероб, а курсор в другой программе
+    // (владелец 06.10.2026: «персонажи должны двигаться сами»).
+    const sync = () => setPaused(document.hidden || !on || !renderLive())
+    document.addEventListener('visibilitychange', sync)
+    const offGate = onRenderGate(sync)
+    sync()
+    return () => {
+      document.removeEventListener('visibilitychange', sync)
+      offGate()
+    }
+  }, [engineReady, on])
+
+  /**
+   * Фигуру крутят мышью: вещь со спины иначе не разглядеть, а половина
+   * косметики именно там - крылья, ранцы, плащи. Пока тянут, взгляд за курсором
+   * отключается, иначе голова дёргается вслед за движением, которым вращают.
+   */
+  const dragFrom = useRef<{ x: number; yaw: number } | null>(null)
+
+  const startTurn = (e: { clientX: number; button?: number; currentTarget: Element; pointerId?: number }) => {
+    const engine = viewerRef.current
+    if (!engine || (e.button ?? 0) !== 0) return
+    dragFrom.current = { x: e.clientX, yaw: engine.playerYaw }
+    if (e.pointerId !== undefined) {
+      try {
+        ;(e.currentTarget as Element & { setPointerCapture(id: number): void }).setPointerCapture(e.pointerId)
+      } catch {}
+    }
+  }
+
+  const endTurn = () => {
+    dragFrom.current = null
+  }
+
+  const turnOrAim = (e: { clientX: number; clientY: number }) => {
+    const engine = viewerRef.current
+    const held = dragFrom.current
+    if (engine && held) {
+      engine.setPlayerYaw(held.yaw + (e.clientX - held.x) * TURN_PER_PIXEL)
+    }
+  }
+
+  /** Колесо приближает фигуру: мелкая вещь на поясе иначе не видна. */
+  /**
+   * Приближение колесом. Шаг считается от того, насколько крутнули, а не
+   * фиксированные восемь процентов на любое движение: с фиксированным шагом
+   * размашистый жест двигал фигуру ровно настолько же, насколько едва заметный,
+   * и приближение выглядело сломанным.
+   *
+   * Колесо сообщает прокрутку в разных единицах: пиксели, строки, страницы.
+   * Строку и страницу приводим к пикселям, иначе на трекпаде и в части браузеров
+   * один и тот же жест даёт разный шаг.
+   */
+  // Upload, Import and Remove all live in the top bar of the screen.
+  const pickSkinRef = useRef<() => void>(() => {})
+  const takeOffAllRef = useRef<() => void>(() => {})
+  useEffect(() => {
+    const up = () => pickSkinRef.current()
+    const off = () => takeOffAllRef.current()
+    const imp = () => {
+      setSection('skin')
+      setImportOpen(true)
+    }
+    window.addEventListener(SKINS_UPLOAD_EVENT, up)
+    window.addEventListener(SKINS_IMPORT_EVENT, imp)
+    window.addEventListener(SKINS_TAKE_OFF_EVENT, off)
+    return () => {
+      window.removeEventListener(SKINS_UPLOAD_EVENT, up)
+      window.removeEventListener(SKINS_IMPORT_EVENT, imp)
+      window.removeEventListener(SKINS_TAKE_OFF_EVENT, off)
+      useTopBar.getState().setSkinsWorn(false)
+    }
+  }, [])
+
+  const zoomStage = (e: { deltaY: number; deltaMode?: number; preventDefault(): void }) => {
+    const engine = viewerRef.current
+    if (!engine) return
+    e.preventDefault()
+    const mode = e.deltaMode ?? 0
+    const pixels = e.deltaY * (mode === 1 ? 16 : mode === 2 ? 400 : 1)
+    // Потолок на одно событие: у страницы прокрутки шаг иначе перепрыгивает
+    // весь допустимый разбег за одно движение.
+    const step = Math.exp(-Math.max(-600, Math.min(600, pixels)) * 0.0016)
+    engine.setZoom(Math.max(0.45, Math.min(2.4, engine.getZoom() * step)))
+    const stage = stageRef.current
+    const m = engine.measurePlayerFrame()
+    if (m && stage) setTagAt(nametagSpot(m.ndc, stage.clientWidth, stage.clientHeight))
+  }
+
+  const [uploadOpen, setUploadOpen] = useState(false)
+  // No preset: a pre-selected "classic" skipped the texture check and saved Alex skins with wide arms.
+  const [uploadArms, setUploadArms] = useState<SkinArms | null>(null)
+
+  // Native dialog: HTML <input type=file> aborts WKWebView on macOS (runOpenPanel).
+  const pickSkin = (model?: SkinArms) => {
+    if (!hasTauri()) {
+      showToast(t('Загрузка скина доступна в приложении'), 'error')
+      return
+    }
+    void pickTexture()
+      .then(async (p) => {
+        if (!p) return
+        setUploadOpen(false)
+        setUploadArms(null)
+        await acceptSkin(p.name, p.data, model)
+      })
+      .catch((e) => {
+        trackFailure('skins', e, { step: 'skin_pick' })
+        showToast(t('Не удалось загрузить: {error}', { error: tx(e) }), 'error')
+      })
+  }
+  pickSkinRef.current = pickSkin
+
+  // Загрузки своих плащей больше нет: плащ можно только получить — с лицензии
+  // Mojang или в каталоге Millida. Ранее загруженные плащи остаются в списке
+  // (группа «Загружено ранее»), но новых добавить нельзя.
+
+  /// Общий приём импортированной текстуры: кладём в локальную библиотеку, в
+  /// каталог аккаунта и сразу показываем в превью.
+  const acceptSkin = async (name: string, data: string, model?: SkinArms) => {
+    // Загрузка — тоже выбор: обновление каталога по ходу не должно вернуть на
+    // фигуру прежний скин аккаунта.
+    startSkinPick()
+    if (hasMillidaAccount()) await warnHdSkinWithoutPlus(data)
+    const first = !mySkins.length && firstSkinEver()
+    let slim = model === 'slim'
+    if (!model) {
+      try {
+        slim = await detectSlimFromUrl(data)
+      } catch {}
+    }
+    let next = await saveTexture('skins', name.replace(/\.png$/i, ''), data, slim)
+    if (model && next[0]) next = await setTextureSlim('skins', next[0].file, slim, true)
+    setMySkins(next)
+    setSkinSrc(data)
+    setActiveMy(next[0]?.file ?? null)
+    setActiveWardrobe(null)
+    chooseVariant(next[0] ? 'm:' + next[0].file : 'n:' + nick, slim ? 'slim' : 'classic', !!model)
+    if (hasMillidaAccount()) {
+      try {
+        await addToWardrobe({ kind: 'skin', name: name.replace(/\.png$/i, ''), pngBase64: await toPngBase64(data), slim })
+        await refreshWardrobe()
+        // Обновление каталога подсвечивает скин, надетый на аккаунте, а надет
+        // там пока прежний: без этого «Применить» уходило под его именем.
+        setActiveWardrobe(null)
+        setActiveMy(next[0]?.file ?? null)
+      } catch (e) {
+        showToast(t('В каталог аккаунта не сохранилось: {error}', { error: tx(e) }), 'error')
+      }
+    }
+    const title = name.replace(/\.png$/i, '')
+    const arms = slim ? t('Тонкие руки') : t('Классические руки')
+    if (first)
+      showReward({
+        items: [{ name: title, art: <SkinBody url={data} model={slim ? 'slim' : 'default'} height={200} fallback={<SkinThumb url={data} slim={slim} />} /> }],
+        tone: 'var(--m-accent)',
+        kicker: t('Первый свой скин'),
+        title,
+        sub: arms,
+      })
+    else showReward({ level: 'small', items: [{ name: title, icon: 'ws-skin' }], title: t('Скин «{name}» загружен', { name: title }), sub: arms })
+  }
+
+  const [importOpen, setImportOpen] = useState(false)
+  const [importUrl, setImportUrl] = useState('')
+  const [importing, setImporting] = useState(false)
+
+  const importByUrl = async () => {
+    const url = importUrl.trim()
+    if (!url) return
+    if (!hasTauri()) {
+      showToast(t('Импорт по ссылке доступен в приложении'), 'error')
+      return
+    }
+    setImporting(true)
+    try {
+      const data = await fetchTexture(url)
+      const name = decodeURIComponent(url.split('/').pop() || t('Скин по ссылке')).slice(0, 40)
+      await acceptSkin(name, data)
+      setImportUrl('')
+      setImportOpen(false)
+    } catch (e) {
+      showToast(t('Не удалось забрать скин: {error}', { error: tx(e) }), 'error')
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const importByNick = async () => {
+    const player = importUrl.trim()
+    if (!NICK_RE.test(player)) {
+      showToast(t('Ник — 3–16 символов: буквы, цифры и подчёркивание'), 'error')
+      return
+    }
+    if (!hasTauri()) {
+      showToast(t('Импорт игрока доступен в приложении'), 'error')
+      return
+    }
+    setImporting(true)
+    try {
+      const tex = await mcTextures(player)
+      if (!tex.skin) throw new Error(t('у игрока стандартный скин'))
+      const data = await fetchTexture(tex.skin)
+      await acceptSkin(player, data)
+      setImportUrl('')
+      setImportOpen(false)
+    } catch (e) {
+      showToast(t('Не удалось забрать скин игрока: {error}', { error: tx(e) }), 'error')
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  // Стояла рядом с «Применить» и срабатывала с первого промаха: сброс уносит и
+  // скин на лицензии Microsoft, вернуть его лаунчер уже не может.
+  const useWardrobeSkin = (item: WardrobeItem): Promise<void> => {
+    setSkinSrc(item.url)
+    setActiveWardrobe(item.id)
+    setActiveMy(null)
+    chooseVariant('w:' + item.id, recallVariant('w:' + item.id) || (item.model === 'slim' ? 'slim' : 'classic'), false)
+    const token = startSkinPick()
+    const stale = () => token !== skinPick.current
+    return queueSkin(token, async () => {
+      try {
+        await applyWardrobeItem(item.id)
+        appliedRef.current = item.url
+        if (!stale()) showToast(t('Скин «{name}» надет', { name: item.name }))
+      } catch (e) {
+        if (!stale()) showToast(t('Не удалось надеть скин: {error}', { error: tx(e) }), 'error')
+        return
+      }
+      if (stale()) return
+      try {
+        await syncLocalSkin(item.url, item.model === 'slim')
+      } catch (e) {
+        showToast(t('На этом компьютере скин не обновился — в сборках останется прежний: {error}', { error: tx(e) }), 'error')
+      }
+    })
+  }
+
+  /**
+   * Удаление скина — один клик и «Отменить» в тосте. Карточка пропадает
+   * сразу, а сам файл или запись на сервере стираются, только когда тост
+   * ушёл: окно подтверждения на каждую карточку раздражало (владелец 23.09.2026).
+   */
+  const removeWardrobeSkin = (item: WardrobeItem) => {
+    const at = wardrobe.findIndex((i) => i.id === item.id)
+    setWardrobe((cur) => cur.filter((i) => i.id !== item.id))
+    if (activeWardrobe === item.id) setActiveWardrobe(null)
+    const commit = setTimeout(() => {
+      void removeWardrobeItem(item.id).catch((e) => {
+        showToast(apiErrorText(e, t('Скин не удалился')), 'error')
+        void refreshWardrobe()
+      })
+    }, SKIN_UNDO_MS)
+    showToast(t('Скин «{name}» удалён', { name: item.name }), undefined, undefined, {
+      label: t('Отменить'),
+      run: () => {
+        clearTimeout(commit)
+        setWardrobe((cur) => (cur.some((i) => i.id === item.id) ? cur : [...cur.slice(0, at), item, ...cur.slice(at)]))
+      },
+    })
+  }
+
+  const removeMySkin = (i: number) => {
+    const target = mySkins[i]
+    if (!target) return
+    const wasActive = activeMy === target.file
+    setMySkins((cur) => cur.filter((s) => s.file !== target.file))
+    if (wasActive) {
+      setActiveMy(null)
+      setSkinSrc('')
+    }
+    const commit = setTimeout(() => {
+      if (wasActive) void dropLocalSkin()
+      void deleteTexture('skins', target.file)
+        .then(setMySkins)
+        .catch((e) => showToast(t('Не удалось удалить: {error}', { error: tx(e) }), 'error'))
+    }, SKIN_UNDO_MS)
+    showToast(t('Скин «{name}» удалён', { name: target.name }), undefined, undefined, {
+      label: t('Отменить'),
+      run: () => {
+        clearTimeout(commit)
+        setMySkins((cur) => (cur.some((s) => s.file === target.file) ? cur : [...cur.slice(0, i), target, ...cur.slice(i)]))
+      },
+    })
+  }
+  const removeMyCape = (i: number) => {
+    const target = myCapes[i]
+    if (!target) return
+    setMyCapes(myCapes.filter((_, x) => x !== i))
+    if (cape === 'my:' + i) chooseCape('none')
+    void deleteTexture('capes', target.file)
+      .then(setMyCapes)
+      .catch((e) => showToast(t('Не удалось удалить: {error}', { error: tx(e) }), 'error'))
+  }
+
+  const selectCatalog = (it: CatalogSkin) => {
+    const texture = it.url || skinUrl(it.nick || 'MHF_Steve')
+    if (it.nick) setNick(it.nick)
+    // Текстура запоминается целиком: «применить» обязано отправить именно тот
+    // скин, который человек видит в превью, а не подставлять его по нику.
+    setSkinSrc(texture)
+    setActiveMy(null)
+    setActiveWardrobe(null)
+    autoVariant(texture, it.url ? 's:' + it.url : 'n:' + (it.nick || 'MHF_Steve'))
+    void applyToMillida(texture)
+  }
+
+  const readyRewards = rewards.filter((r) => r.done && !r.claimed).length
+
+
+  // Каталог из семисот вещей одним списком не читается: режем по разделу и
+  // чипу. Поиск — по всему каталогу сразу, как в Roblox: ищут вещь, а не место.
+  const cosmeticQueryNorm = cosmeticQuery.trim().toLowerCase()
+
+  const sections = useMemo(() => cosmeticSections(cosmetics.map((c) => c.slot)), [cosmetics, t])
+
+  const sectionDef = sections.find((s) => s.key === section)
+  const chipKey = chipBy[section] ?? (sectionDef ? sectionDef.chips[0].key : section === 'skin' ? 'mine' : 'all')
+  const chipDef = sectionDef ? sectionDef.chips.find((c) => c.key === chipKey) ?? sectionDef.chips[0] : undefined
+
+  const ownOk = (c: CosmeticItem) => {
+    if (own === 'all') return true
+    return !(c.access !== 'FREE' && !cosmeticOwned.includes(c.id))
+  }
+
+  /** Вещи на экране: результаты поиска или содержимое чипа (у плащей — косметические плащи). */
+  const shelf = useMemo(() => {
+    let list: CosmeticItem[]
+    if (cosmeticQueryNorm) list = cosmetics.filter((c) => c.name.toLowerCase().includes(cosmeticQueryNorm))
+    else if (section === 'cape') list = chipKey === 'all' ? cosmetics.filter((c) => c.slot === 'CAPE') : []
+    else if (chipDef) list = cosmetics.filter((c) => chipDef.slots.includes(c.slot))
+    else list = []
+    // Отмеченное звёздочкой идёт первым: из сотни вещей подписки человек носит
+    // десяток, и искать их каждый раз заново - работа, а не удовольствие.
+    return starredFirst(list.filter(ownOk), (item) => item.id, stars)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cosmetics, cosmeticQueryNorm, section, chipKey, chipDef, own, cosmeticOwned, stars])
+
+  const shelfKey = cosmeticQueryNorm ? 'q:' + cosmeticQueryNorm : section + ':' + chipKey
+
+  // Условие задания живёт в окне, а не на карточке: на карточке оно
+  // занимало три строки и повторялось в подсказке кнопки.
+  const [capeInfo, setCapeInfo] = useState<CapeOption | null>(null)
+
+  const use3d = svReady && !fallback
+  const currentCape = capeById(capes, cape)
+
+  // Remove all: the cape and every worn or tried-on item, the same way a section's Remove does.
+  takeOffAllRef.current = () => {
+    if (cosmeticBusy) return
+    if (currentCape) takeOffCape()
+    void takeOffSlots([...new Set([...worn, ...fitting].map((c) => c.slot))])
+  }
+  const canTakeOff = !cosmeticBusy && (worn.length > 0 || fitting.length > 0 || !!currentCape)
+  useEffect(() => {
+    useTopBar.getState().setSkinsWorn(canTakeOff)
+  }, [canTakeOff])
+
+  const skinTitle = (): string => {
+    const stored = activeWardrobe ? wardrobe.find((i) => i.id === activeWardrobe) : null
+    if (stored) return stored.name
+    const my = mySkinOf(activeMy)
+    if (my) return my.name
+    return t('Скин {nick}', { nick })
+  }
+
+  const refreshHead = async (texture: string) => {
+    const cur = getAccount()
+    if (!cur) return
+    try {
+      const head = await headDataUrl(texture)
+      const st = useAccounts.getState()
+      st.save(st.list.map((x) => (x.id === cur.id ? { ...x, avatar: head, avatarFrom: HEAD_FROM_CPU + texture } : x)))
+    } catch {}
+  }
+
+  /**
+   * Лицо в углу берётся из сохранённой картинки, а её рисовали один раз - при
+   * «Применить скин». Скин же меняется и мимо этой кнопки: на сайте, на другой
+   * машине, при сбросе. Тогда в углу оставалось прежнее лицо, а иногда и вовсе
+   * чужое, и человек решал, что скин у него сбросили (жалоба 16.09.2026).
+   *
+   * Поэтому лицо перерисовывается всякий раз, когда скин аккаунта оказался не
+   * тем, из которого оно нарисовано, - и только тогда: рисование стоит дорого.
+   */
+  const syncHead = (skinUrl: string | null) => {
+    const cur = getAccount()
+    if (!cur || !skinUrl) return
+    if (cur.avatar && cur.avatarFrom === HEAD_FROM_CPU + skinUrl) return
+    void refreshHead(skinUrl)
+  }
+
+  /// Cape must be switched on Mojang itself, otherwise online sessions keep the old one.
+  const applyLicensedCape = async (): Promise<boolean> => {
+    if (!hasTauri()) return false
+    const target = currentCape ? capeTarget(currentCape) : null
+    if (target) return switchLicensedCape(target.accId, target.msId)
+    if (currentCape) return false
+    const acc = getAccount()
+    if (!acc || acc.kind !== 'microsoft') return false
+    const own = msCapes[acc.id] || []
+    if (!own.some((c) => c.active)) return false
+    const ms = await ensureMsAuth(acc)
+    if (!ms) return false
+    await msSetCape(ms.id, '')
+    setMsCapes({ ...msCapes, [acc.id]: own.map((c) => ({ ...c, active: false })) })
+    texCache.delete(acc.uuid || acc.nick)
+    return true
+  }
+
+  /**
+   * Выбор скина и есть применение. Кнопки «Применить» больше нет: она стояла
+   * между «я выбрал» и «готово» и ничего к выбору не добавляла - человек и так
+   * нажал на тот скин, который хочет.
+   */
+  const pickAndApply = (texture: string, after?: () => void) => {
+    setSkinSrc(texture)
+    after?.()
+    void applyToMillida(texture)
+  }
+
+  /**
+   * Применение скина идёт очередью, и побеждает последний клик. Раньше два
+   * быстрых выбора отправлялись параллельно: первый доезжал до сервера позже
+   * второго, и на аккаунте оставался не тот скин, что на фигуре.
+   */
+  const applyToMillida = (picked?: string, arms?: string): Promise<void> => {
+    const texture = picked ?? skinSrc
+    if (!texture) {
+      showToast(t('Сначала выбери скин — свой, из каталога или из аккаунта'), 'error')
+      return Promise.resolve()
+    }
+    const token = startSkinPick()
+    return queueSkin(token, () => applyToMillidaNow(token, texture, arms))
+  }
+
+  const applyToMillidaNow = async (token: number, texture: string, arms?: string) => {
+    const stale = () => token !== skinPick.current
+    // Руки — по самой текстуре (переключателя больше нет): состояние variant
+    // могло ещё не догнать только что выбранный скин.
+    const slimArms = arms ? arms === 'slim' : await detectSlimFromUrl(texture).catch(() => variant === 'slim')
+    if (stale()) return
+    const prev = appliedRef.current
+    const undo =
+      prev && prev !== texture
+        ? {
+            label: t('Вернуть'),
+            run: () => {
+              setSkinSrc(prev)
+              setActiveMy(null)
+              setActiveWardrobe(null)
+              void applyToMillida(prev)
+            },
+          }
+        : undefined
+    try {
+      const skin = await toPngBase64(texture).catch(() => {
+        throw new Error(t('картинка скина не читается — выбери его заново'))
+      })
+      const capePng = currentCape
+        ? await toPngBase64(currentCape.url).catch(() => {
+            throw new Error(t('плащ «{name}» не скачался — выбери другой', { name: currentCape.name }))
+          })
+        : null
+      if (stale()) return
+      if (hasTauri())
+        await setLocalSkin(skin, capePng ?? '', slimArms).catch((e) => {
+          throw new Error(t('скин не сохранился на этом компьютере: {error}', { error: tx(e) }))
+        })
+      const acc = getAccount()
+      let licensed = false
+      let capeLocalOnly = ''
+      try {
+        licensed = await applyLicensedCape()
+      } catch (e) {
+        trackFailure('skins', e, { step: 'license_cape' })
+        showToast(t('Плащ лицензии не переключился: {error}', { error: tx(e) }), 'error')
+      }
+      // Скин на лицензию уходит независимо от аккаунта Millida: раньше он был
+      // привязан к загрузке в каталог, и без входа в Millida на аккаунте
+      // менялся только плащ — скин оставался прежним.
+      if (acc && acc.kind === 'microsoft' && hasTauri()) {
+        const ms = await ensureMsAuth(acc)
+        if (ms) {
+          try {
+            await msUploadSkin(ms.id, skin, slimArms)
+            texCache.delete(acc.uuid || acc.nick)
+            licensed = true
+          } catch (e) {
+            trackFailure('skins', e, { step: 'license_skin' })
+            showToast(t('На лицензию скин не уехал: {error}', { error: tx(e) }), 'error')
+          }
+        }
+      }
+      if (hasMillidaAccount()) {
+        if (skinSource() !== 'millida') setSkinSource('millida')
+        if (stale()) return
+        const applied = await uploadTexture('skin', skin, slimArms, skinTitle()).catch((e) => {
+          throw new Error(
+            licensed
+              ? t('скин не сохранился в аккаунте Millida ({error}) — на лицензии он уже применён', { error: apiErrorText(e, t('Millida не приняла скин')) })
+              : t('скин не сохранился в аккаунте Millida ({error})', { error: apiErrorText(e, t('Millida не приняла скин')) }),
+          )
+        })
+        if (!applied || !applied.skinUrl) throw new Error(t('сервер не сохранил скин'))
+        // Пока ехали, выбрали другой скин: он уже стоит в очереди следом и
+        // перезапишет этот. Карточки и тосты — его забота.
+        if (stale()) return
+        // Локальная копия только что записана этими же байтами: помечаем её,
+        // чтобы обновление каталога не качало тот же скин ещё раз.
+        if (hasTauri()) localSkinRef.current = localMark(applied.skinUrl, slimArms)
+        // Плащ из каталога аккаунта надевается по id: повторная заливка того же
+        // PNG заводит в каталоге вторую карточку той же текстуры.
+        // Плащ на аккаунт ставится только по идентификатору: из каталога
+        // аккаунта или из каталога Millida. Заливка PNG плащом больше не
+        // считается — иначе плащ выдавал себе кто угодно запросом мимо лаунчера.
+        if (!currentCape) {
+          if (capeTouched.current) await uploadTexture('cape', null)
+        } else if (currentCape.wardrobeId) await applyWardrobeItem(currentCape.wardrobeId)
+        else if (currentCape.catalogId) await applyCatalogCape(currentCape.catalogId)
+        else capeLocalOnly = currentCape.name
+        await loadMillidaProfile().catch(() => {})
+        await refreshHead(texture)
+        await refreshWardrobe()
+        await refreshRewards()
+        if (capeLocalOnly)
+          showToast(
+            t('Плащ «{name}» виден только на этом компьютере: на аккаунт ставятся плащи из каталога', { name: capeLocalOnly }),
+          )
+        appliedRef.current = texture
+        showToast(
+          licensed
+            ? t('Скин применён — сохранён в каталоге Millida и на лицензии')
+            : t('Скин применён и сохранён в каталоге Millida'),
+          undefined,
+          undefined,
+          undo,
+        )
+      } else {
+        await refreshHead(texture)
+        appliedRef.current = texture
+        showToast(
+          licensed
+            ? t('Скин применён на лицензии Microsoft')
+            : t('Скин применён — увидишь его в игре на модовых сборках после запуска'),
+          undefined,
+          undefined,
+          undo,
+        )
+      }
+      track('skin_apply', {
+        cape: currentCape ? currentCape.name : 'нет',
+        variant,
+        account: hasMillidaAccount() ? 'millida' : 'local',
+        licensed,
+      })
+    } catch (e) {
+      if (!stale()) trackFailure('skins', e, { step: 'apply' })
+      if (!stale()) showToast(apiErrorText(e, t('Не удалось применить скин')), 'error')
+    }
+  }
+
+  // ---- образы ----
+  // Образ — весь набор разом: скин с руками, плащ и косметика. Хранится в
+  // памяти лаунчера за аккаунтом (src/state/outfits.ts), надевается теми же
+  // функциями, что и отдельные вещи на этом экране.
+  const [outfits, setOutfits] = useState<Outfit[]>(() => loadOutfits(activeId || ''))
+  const [outfitBusy, setOutfitBusy] = useState<string | null>(null)
+  useEffect(() => setOutfits(loadOutfits(activeId || '')), [activeId])
+  const keepOutfits = (next: Outfit[]) => {
+    setOutfits(next)
+    saveOutfits(activeId || '', next)
+  }
+
+  // Скин образа — тот, что на фигуре. Карточка гардероба запоминается, только
+  // если это она и есть: до первого выбора фигура показывает скин по нику, а
+  // карточка аккаунта уже отмечена активной.
+  const currentLook = (): Look => ({
+    skin: {
+      url: skinSrc || skinUrl(nick),
+      slim: variant === 'slim',
+      wardrobeId:
+        activeWardrobe && wardrobe.some((i) => i.id === activeWardrobe && i.url === (skinSrc || skinUrl(nick)))
+          ? activeWardrobe
+          : undefined,
+      myFile: mySkinOf(activeMy)?.file,
+    },
+    cape,
+    cosmetics: worn.map((w) => ({ id: w.id, slot: w.slot, variant: w.variant })),
+  })
+  const activeOutfit = outfits.find((o) => sameLook(o, currentLook()))?.id ?? null
+
+  const saveOutfit = () => {
+    const same = outfits.find((o) => o.id === activeOutfit)
+    if (same) {
+      // Тот же набор — ведём переодеться: новый образ из тех же вещей не нужен.
+      showToast(t('Это «{name}». Надень другое — и сохрани', { name: same.name }))
+      pickSection('skin')
+      return
+    }
+    if (outfits.length >= OUTFITS_LIMIT) {
+      showToast(t('Больше {n} образов не сохранить', { n: OUTFITS_LIMIT }), 'error')
+      return
+    }
+    const next = addOutfit(outfits, currentLook())
+    keepOutfits(next)
+    showReward({
+      level: 'mid',
+      items: [{ name: t('Образ'), art: figureArt(64) }],
+      title: t('Образ сохранён'),
+      sub: '«' + next[next.length - 1].name + '»',
+    })
+  }
+
+  const dropOutfit = (o: Outfit) => {
+    const before = outfits
+    keepOutfits(removeOutfit(outfits, o.id))
+    // Удаление без окна подтверждения, но с откатом: образ собирали руками.
+    showToast(t('Образ «{name}» удалён', { name: o.name }), undefined, undefined, {
+      label: t('Вернуть'),
+      run: () => keepOutfits(before),
+    })
+  }
+
+  const reloadSets = () => loadSets().then((r) => setSetList(r.sets)).catch(() => setSetList([]))
+  useEffect(() => {
+    if (section === 'looks' && hasMillidaAccount()) void reloadSets()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [section, cosReady])
+  // Примерка кончилась — «Докупить набор» тоже.
+  useEffect(() => {
+    if (!fitting.length) setSetOffer(null)
+  }, [fitting.length])
+
+  /**
+   * Набор из магазина одним нажатием: все свои вещи расцветки встают на игрока
+   * (вытесняя вещи в тех же слотах), одним applyCosmetics, как образ. Чего не
+   * хватает — примеркой на фигуре с кнопкой «Докупить набор».
+   */
+  const wearSet = async (set: SetView, way: SetColorwayView) => {
+    if (cosmeticBusy || setBusy) return
+    const find = (list: SetColorwayView['items']) =>
+      list.map((x) => cosmetics.find((c) => c.id === x.item.code)).filter((c): c is CosmeticItem => !!c)
+    const mine = find(way.items.filter((x) => x.owned))
+    const missing = find(way.items.filter((x) => !x.owned))
+    if (!mine.length) return
+    const next = worn
+      .filter((w) => !mine.some((c) => c.slot === w.slot))
+      .concat(mine.map((c) => ({ id: c.id, slot: c.slot, variant: variantOf(c)?.name })))
+    setSetBusy(set.id)
+    try {
+      await applyCosmetics(next)
+      setWorn(next)
+      setFitting((now) => now.filter((c) => !mine.some((m) => m.slot === c.slot) && !missing.some((m) => m.slot === c.slot)).concat(missing))
+      setSetOffer(missing.length && way.price > 0 ? { setId: set.id, colorway: way.name, title: set.title, price: way.price } : null)
+      if (missing.length) showToast(t('«{name}» надет: {n} из {total}', { name: set.title, n: mine.length, total: way.items.length }), 'ok')
+      else showReward({ level: 'small', items: [{ name: set.title, icon: 'looks' }], title: t('«{name}» надет', { name: set.title }) })
+    } catch (e) {
+      trackFailure('skins', e, { step: 'set_wear' })
+      showToast(apiErrorText(e, t('Набор надет не целиком')), 'error')
+    } finally {
+      setSetBusy('')
+    }
+  }
+
+  /** «Докупить набор»: платишь за недостающее, потом весь набор сразу на игроке. */
+  const buySetOffer = async () => {
+    const offer = setOffer
+    if (!offer || cosmeticBusy) return
+    const set = setList.find((x) => x.id === offer.setId)
+    const way = set?.colorways.find((c) => c.name === offer.colorway)
+    const price = way?.price ?? offer.price
+    if (price <= 0) return
+    const result = purchaseFlow('bundle', offer.setId + (offer.colorway ? '~' + offer.colorway : ''), price, 'rubies')
+    if (price > rubies) {
+      result(false, 'insufficient')
+      showToast(t('Не хватает {price}', { price: rubyCount(price - rubies) }), 'error')
+      return setScreen('rubies')
+    }
+    const ok = await uiConfirm(t('«{name}» за {price}. Купить и надеть?', { name: offer.title, price: rubyCount(price) }), {
+      title: t('Докупить набор'),
+      confirmLabel: t('Купить'),
+      cancelLabel: t('Не сейчас'),
+      danger: false,
+    })
+    if (!ok) return result(false, 'cancel')
+    setCosmeticBusy('fitting')
+    try {
+      const res = await buySet(offer.setId, offer.colorway, price)
+      result(true)
+      const got = res.granted.map((g) => g.code)
+      setCosmeticOwned((now) => Array.from(new Set(now.concat(got))))
+      const owned = await loadCosmeticOwned().catch(() => null)
+      if (owned) setCosmeticOwned(Array.from(new Set(owned.items.concat(got))))
+      setRubies(res.balance)
+      const all = (way?.items ?? [])
+        .map((x) => cosmetics.find((c) => c.id === x.item.code))
+        .filter((c): c is CosmeticItem => !!c)
+      const next = worn
+        .filter((w) => !all.some((c) => c.slot === w.slot))
+        .concat(all.map((c) => ({ id: c.id, slot: c.slot, variant: variantOf(c)?.name })))
+      try {
+        await applyCosmetics(next)
+        setWorn(next)
+        setFitting([])
+      } catch (e) {
+        showToast(apiErrorText(e, t('Куплено, но не наделось — нажми на набор')), 'error')
+      }
+      setSetOffer(null)
+      void reloadSets()
+      showReward({
+        items: res.granted.map((g) => ({ name: g.name, preview: g.preview, rarity: g.rarity })),
+        kicker: offer.title,
+      })
+    } catch (e) {
+      result(false, 'error', e)
+      showToast(apiErrorText(e, t('Не удалось купить набор')), 'error')
+      void reloadSets()
+    } finally {
+      setCosmeticBusy('')
+    }
+  }
+
+  /**
+   * Надеть образ. Порядок важен: сначала скин — applyToMillida заново ставит
+   * на аккаунт плащ, выбранный до нажатия, и плащ образа должен лечь после
+   * него. То, что уже надето, не трогаем: лишний запрос — лишний тост.
+   */
+  const wearOutfit = async (o: Outfit) => {
+    if (outfitBusy || cosmeticBusy) return
+    const now = currentLook()
+    const arms = o.skin.slim ? 'slim' : 'classic'
+    let skipped = 0
+    setOutfitBusy(o.id)
+    try {
+      if (now.skin.url !== o.skin.url || now.skin.slim !== o.skin.slim) {
+        const item = o.skin.wardrobeId
+          ? wardrobe.find((i) => i.id === o.skin.wardrobeId && i.kind === 'skin')
+          : undefined
+        if (item && (item.model === 'slim') === o.skin.slim) {
+          await useWardrobeSkin(item)
+          chooseVariant('w:' + item.id, arms, false)
+        } else {
+          const my = o.skin.myFile ? mySkins.findIndex((s) => s.file === o.skin.myFile) : -1
+          const url = my >= 0 ? mySkins[my].data : o.skin.url
+          setSkinSrc(url)
+          setActiveMy(my >= 0 ? mySkins[my].file : null)
+          setActiveWardrobe(null)
+          chooseVariant(my >= 0 ? 'm:' + mySkins[my].file : 's:' + url, arms, false)
+          await applyToMillida(url, arms)
+        }
+      }
+
+      if (o.cape !== now.cape) {
+        if (o.cape === 'none') {
+          chooseCape('none')
+          if (hasMillidaAccount()) await uploadTexture('cape', null).then(() => refreshWardrobe())
+        } else {
+          const c = capes.find((x) => x.id === o.cape)
+          if (!c || c.locked) skipped++
+          else {
+            chooseCape(c.id)
+            const target = capeTarget(c)
+            const [millida, license] = await Promise.allSettled([
+              wearOnMillida(c),
+              target ? switchLicensedCape(target.accId, target.msId) : Promise.resolve(false),
+            ])
+            if (millida.status === 'rejected') throw millida.reason
+            if (license.status === 'rejected') showToast(t('Плащ лицензии не переключился: {error}', { error: tx(license.reason) }), 'error')
+          }
+        }
+      }
+
+      // Закрытое — снятое с подписки или непокупленное — пропускаем: сервер
+      // отказал бы всему набору из-за одной вещи.
+      const { wear, skipped: locked } = splitWearable(o.cosmetics, (id) => {
+        const item = cosmetics.find((c) => c.id === id)
+        return !!item && !cosmeticLocked(item)
+      })
+      skipped += locked.length
+      const same =
+        wear.length === worn.length && wear.every((w) => worn.some((x) => x.id === w.id && x.variant === w.variant))
+      if (!same) {
+        await applyCosmetics(wear)
+        setWorn(wear)
+        setFitting([])
+      }
+
+      if (skipped) showToast(t('«{name}» надет, закрытых вещей пропущено: {n}', { name: o.name, n: skipped }))
+      else showReward({ level: 'small', items: [{ name: o.name, icon: 'looks' }], title: t('«{name}» надет', { name: o.name }) })
+    } catch (e) {
+      trackFailure('skins', e, { step: 'outfit' })
+      showToast(apiErrorText(e, t('Образ надет не целиком')), 'error')
+    } finally {
+      setOutfitBusy(null)
+    }
+  }
+
+  /**
+   * Карточка образа: фигура под своим углом и вещи образа миниатюрами. Одна и
+   * та же фигура в одной позе на всех карточках читалась как ряд копий
+   * (владелец 24.09.2026: «образы выглядят однотипно»).
+   */
+  const OUTFIT_YAW = [-0.9, 0.7, -0.35, 1.0, -0.6, 0.35]
+  const OUTFIT_TONE = [
+    'var(--m-rarity-rare)',
+    'var(--m-rarity-epic)',
+    'var(--m-rarity-legendary)',
+    'var(--m-accent)',
+    'var(--m-ruby)',
+    'var(--m-rarity-uncommon)',
+  ]
+  const outfitArt = (o: Outfit) => {
+    // По месту в ряду, а не по id: соседние карточки гарантированно разного цвета.
+    const at = Math.max(0, outfits.findIndex((x) => x.id === o.id))
+    const yaw = OUTFIT_YAW[at % OUTFIT_YAW.length] as number
+    const tone = OUTFIT_TONE[at % OUTFIT_TONE.length] as string
+    const items = o.cosmetics
+      .map((c) => cosmetics.find((x) => x.id === c.id))
+      .filter((c): c is CosmeticItem => !!c)
+    const capeUrl = o.cape !== 'none' ? capes.find((c) => c.id === o.cape)?.url : undefined
+    return (
+      <span className="ch-look-art" style={{ '--look-tone': tone } as CSSProperties}>
+        <SkinBody
+          url={o.skin.url}
+          model={o.skin.slim ? 'slim' : 'default'}
+          height={120}
+          yaw={yaw}
+          fallback={<SkinThumb url={o.skin.url} slim={o.skin.slim} />}
+        />
+        {items.length || capeUrl ? (
+          <span className="ch-look-items">
+            {capeUrl ? (
+              <span className="ch-look-item">
+                <CapePreview url={capeUrl} h={26} />
+              </span>
+            ) : null}
+            {items.slice(0, capeUrl ? 3 : 4).map((it) => (
+              <span key={it.id} className="ch-look-item">
+                <CosmeticArt item={it} height={30} />
+              </span>
+            ))}
+          </span>
+        ) : null}
+      </span>
+    )
+  }
+
+  // ---- разделы, чипы, полоса «Надето» ----
+
+  const figureArt = (h: number) => (
+    <SkinBody
+      url={skinSrc || skinUrl(nick)}
+      model={variant === 'slim' ? 'slim' : 'default'}
+      height={h}
+      fallback={<SkinThumb url={skinSrc || skinUrl(nick)} size={32} slim={variant === 'slim'} />}
+    />
+  )
+  /* Разделы — одноцветными значками, как в Essential Mod (владелец 23.09.2026,
+     «возьми с Essential для кнопок разделов косметики»). Картинки вещей в
+     кнопках раздела сливались в пёструю полосу. */
+  const sectionList: Section[] = [
+    { key: 'looks', name: t('Образы'), icon: 'ws-looks' },
+    // Магазин рядом с вещами (06.10.2026, «один в один»): те же блоки, что в магазине.
+    ...(hasMillidaAccount() ? [{ key: 'shop', name: t('Магазин'), icon: 'ws-shop' }] : []),
+    { key: 'skin', name: t('Скины'), icon: 'ws-skin' },
+    { key: 'cape', name: t('Плащи'), icon: 'ws-cape', alert: readyRewards > 0 },
+    ...sections.map((sec) => ({ key: sec.key, name: sec.name, icon: 'ws-' + sec.key })),
+  ]
+
+  const pickSection = (key: string) => {
+    setSection(key)
+    setCosmeticQuery('')
+  }
+
+
+  const pickChip = (key: string) => {
+    setChipBy((now) => ({ ...now, [section]: key }))
+    if (section === 'skin' && key !== 'mine') {
+      const kind = key as ShowcaseKind
+      if (catKind === kind && chipKey === key) void loadCatalog(kind)
+      else setCatKind(kind)
+    }
+  }
+
+  const chipList =
+    section === 'skin'
+      ? SKIN_CHIPS().map((c) => ({ key: c.key, name: c.name }))
+      : section === 'cape'
+        ? earnedCapes.length
+          ? [
+              { key: 'all', name: t('Все'), count: ownCapes.length + cosmetics.filter((c) => c.slot === 'CAPE').length },
+              { key: 'quest', name: t('За задания'), count: earnedCapes.length },
+            ]
+          : []
+        : sectionDef
+          ? sectionDef.chips.map((c) => ({
+              key: c.key,
+              name: c.name,
+              count: cosmetics.filter((x) => c.slots.includes(x.slot)).length,
+            }))
+          : []
+
+  const ownFilter = (
+    <div className="segs ch-own">
+      {(
+        [
+          ['all', t('Все')],
+          ['mine', t('Мои')],
+        ] as [string, string][]
+      ).map(([key, label]) => (
+        <button key={key} className={'seg' + (own === key ? ' on' : '')} data-track={'wardrobe_own_' + key} onClick={() => setOwn(key)}>
+          {label}
+        </button>
+      ))}
+    </div>
+  )
+
+  const cosmeticTile = (c: CosmeticItem) => {
+    const locked = cosmeticLocked(c)
+    // Магазин v2: подписчику — цена со скидкой и старая зачёркнутая, остальным — полная цена (строка «С PLUS N» снята).
+    const base = locked && onSale(c) ? c.priceRubies! : undefined
+    const pct = tierPct(shopTier)
+    const shown = base && pct ? Math.max(10, Math.round((base * (100 - pct)) / 100 / 10) * 10) : base
+    return (
+      <ItemTile
+        key={c.id}
+        art={<CosmeticArt item={c} height={128} />}
+        name={c.name}
+        rarity={(c as CosmeticItem & { rarity?: string }).rarity}
+        locked={locked}
+        plus={locked && c.access === 'PLUS'}
+        priceRubies={shown}
+        priceWas={pct ? base : undefined}
+        note={locked ? earnedNote(c, achSources) : undefined}
+        on={worn.some((w) => w.id === c.id)}
+        trying={fitting.some((f) => f.id === c.id)}
+        loading={fitLoading.includes(c.id) || cosmeticBusy === c.id}
+        track={worn.some((w) => w.id === c.id) ? 'item_take_off' : locked ? 'item_try_on' : 'item_wear'}
+        kind="item"
+        itemId={c.id}
+        onClick={() => cardAction(c)}
+        star={{ on: stars.includes(c.id), toggle: () => setStars(toggleStar(c.id)) }}
+      />
+    )
+  }
+
+  /** Плащ аккаунта: нажатие на надетый снимает его — так же, как у косметики. */
+  const capeTile = (c: CapeOption) => {
+    const my = c.id.startsWith('my:')
+    return (
+      <ItemTile
+        key={c.id}
+        art={<CapePreview url={c.url} h={128} />}
+        name={c.name}
+        note={c.locked ? (c.rewardReady ? t('Можно забрать') : c.requirement || t('Пока закрыт')) : undefined}
+        rarity={c.rarity}
+        locked={c.locked}
+        on={c.id === cape}
+        track={c.id === cape && !c.locked ? 'cape_take_off' : 'cape_pick'}
+        kind="cape"
+        itemId={my ? 'my' : c.id}
+        onClick={() => (c.id === cape && !c.locked ? takeOffCape() : pickCapeOption(c))}
+        onRemove={my ? () => removeMyCape(Number(c.id.slice(3))) : undefined}
+      />
+    )
+  }
+
+  /**
+   * Плитки «Открыть с PLUS» больше нет: PLUS не даёт вещей, это только платная
+   * строка бонуса (решение владельца 24.09.2026, 18:22). Вещи бывшего набора —
+   * в магазине за рубины.
+   */
+  const plusTile =
+    false && !plus?.active && own === 'all' && shelf.some((c) => c.access === 'PLUS' && cosmeticLocked(c)) ? (
+      <ItemTile
+        key="plus"
+        action
+        art={
+          <span className="ch-plus-art">
+            <Icon id="i-star" />
+          </span>
+        }
+        name={plusBusy ? t('Открываем…') : t('Открыть с PLUS')}
+        status={t('{price} в месяц', { price: plusPrice('PLUS') ?? '' })}
+        track="plus_subscribe"
+        onClick={plusBusy ? undefined : () => void startPlus()}
+      />
+    ) : null
+
+  const shownShelf = shelf.slice(0, shownIn(shelfKey))
+  const shelfTail =
+    shelf.length > shownShelf.length ? (
+      <LoadMore key={shelfKey + ':' + shownShelf.length} onMore={() => showMoreIn(shelfKey)} />
+    ) : null
+
+  const capesShown = (list: CapeOption[]) =>
+    list
+      .filter((c) => (own === 'mine' ? !c.locked : true))
+      .filter((c) => !cosmeticQueryNorm || c.name.toLowerCase().includes(cosmeticQueryNorm))
+
+  const searchBox = (placeholder: string, value: string, set: (v: string) => void, onEnter?: () => void) => (
+    <div className="input sm ch-search">
+      <Icon id="i-search" />
+      <input
+        placeholder={placeholder}
+        value={value}
+        onChange={(e) => set(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') onEnter?.()
+        }}
+      />
+      {value ? (
+        <button className="ch-search-x" aria-label={t('Очистить')} data-track="search_clear" onClick={() => set('')}>
+          <Icon id="i-x" />
+        </button>
+      ) : null}
+    </div>
+  )
+
+  const catalogBroken =
+    cosmetics.length === 0 ? (
+      <div className="load-again">
+        <span>{cosmeticsFailed ? t('Каталог не загрузился') : t('Каталог пока пуст')}</span>
+        <button className="btn sm secondary" onClick={() => void refreshCosmetics()}>
+          <Icon id="i-restart" />
+          {t('Повторить')}
+        </button>
+      </div>
+    ) : null
+
+  const nothing = <div className="ch-nothing">{t('Ничего не нашлось')}</div>
+
+  const skinPanel = (
+    <>
+      {importOpen ? (
+        <div className="ch-import">
+          <div className="input sm">
+            <Icon id="i-link" />
+            <input
+              placeholder={t('Ссылка на PNG или ник игрока…')}
+              value={importUrl}
+              autoFocus
+              onChange={(e) => setImportUrl(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key !== 'Enter') return
+                if (NICK_RE.test(importUrl.trim())) void importByNick()
+                else void importByUrl()
+              }}
+            />
+          </div>
+          <button className="btn sm ghost" onClick={() => setImportOpen(false)}>
+            {t('Отмена')}
+          </button>
+          <button
+            className="btn sm primary"
+            disabled={importing || !importUrl.trim()}
+            onClick={() => (NICK_RE.test(importUrl.trim()) ? void importByNick() : void importByUrl())}
+          >
+            {importing ? t('Забираем…') : t('Забрать')}
+          </button>
+        </div>
+      ) : null}
+
+      {chipKey === 'mine' ? (
+        <>
+          {hasMillidaAccount() ? null : (
+            <div className="ch-warn">
+              <Icon id="i-lock" />
+              <span>{t('Скины только на этом компьютере')}</span>
+              <button className="btn sm secondary" onClick={() => showLogin()}>
+                <Icon id="i-login" />
+                {t('Войти')}
+              </button>
+            </div>
+          )}
+          {uploadOpen ? (
+            <div className="ch-import">
+              <div className="segs">
+                {SKIN_ARMS().map(([key, label]) => (
+                  <button
+                    key={key}
+                    className={'seg' + (uploadArms === key ? ' on' : '')}
+                    data-track={'skin_upload_arms_' + key}
+                    onClick={() => setUploadArms(key)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <button className="btn sm ghost" onClick={() => setUploadOpen(false)}>
+                {t('Отмена')}
+              </button>
+              <button className="btn sm primary" data-track="skin_upload_pick" onClick={() => pickSkin(uploadArms ?? undefined)}>
+                <Icon id="i-upload" />
+                {t('Выбрать PNG')}
+              </button>
+            </div>
+          ) : null}
+          <ItemGrid>
+            {mySkins.map((sk, i) => {
+              const h = localSkinHash(sk.file)
+              if (h && wardrobeSkinHashes.has(h)) return null
+              return (
+              <ItemTile
+                key={'my:' + sk.file}
+                art={<SkinCardThumb url={sk.data} slim={sk.slim} />}
+                name={sk.name}
+                note={sk.slim ? t('Тонкие руки') : t('Классические руки')}
+                on={activeMy === sk.file}
+                onClick={() => {
+                  if (hasMillidaAccount()) void warnHdSkinWithoutPlus(sk.data)
+                  chooseVariant('m:' + sk.file, sk.slim ? 'slim' : 'classic', false)
+                  pickAndApply(sk.data, () => {
+                    setActiveMy(sk.file)
+                    setActiveWardrobe(null)
+                  })
+                }}
+                onRemove={() => removeMySkin(i)}
+              />
+              )
+            })}
+            {wardrobe
+              .filter((i) => i.kind === 'skin')
+              .map((item) => (
+                <ItemTile
+                  key={item.id}
+                  art={<SkinCardThumb url={item.url} slim={item.model === 'slim'} />}
+                  name={item.name}
+                  note={item.model === 'slim' ? t('Тонкие руки') : t('Классические руки')}
+                  on={
+                    activeWardrobe === item.id ||
+                    (!!activeMyHash && activeMyHash === wardrobeSkinHash(item.url))
+                  }
+                  onClick={() => {
+                    if (item.source !== 'order') void warnHdSkinWithoutPlus(item.url)
+                    void useWardrobeSkin(item)
+                  }}
+                  onRemove={() => removeWardrobeSkin(item)}
+                />
+              ))}
+            {accounts.map((a) => (
+              <ItemTile
+                key={a.id}
+                art={
+                  <SkinCardThumb
+                    url={textures[a.id] ? textures[a.id].skin : skinUrl(a.nick)}
+                    slim={textures[a.id] ? textures[a.id].slim : undefined}
+                  />
+                }
+                name={a.nick}
+                note={t('Скин аккаунта')}
+                mark={a.id === activeId ? <Icon id="i-user" /> : undefined}
+                onClick={() => {
+                  const t = textures[a.id]
+                  setNick(a.nick)
+                  setSkinSrc(t ? t.skin : null)
+                  setActiveMy(null)
+                  setActiveWardrobe(null)
+                  const savedVariant = recallVariant('n:' + a.nick)
+                  if (savedVariant) chooseVariant('n:' + a.nick, savedVariant, false)
+                  else if (t) chooseVariant('n:' + a.nick, t.slim ? 'slim' : 'classic', false)
+                  else autoVariant(skinUrl(a.nick), 'n:' + a.nick)
+                  void applyToMillida(t ? t.skin : skinUrl(a.nick))
+                  if (t && t.cape) {
+                    const wornCape = capes.find((c) => textureHash(c.url) === textureHash(t.cape))
+                    chooseCape(wornCape ? wornCape.id : 'acc:' + a.id)
+                  }
+                }}
+              />
+            ))}
+            <ItemTile
+              action
+              art={
+                <span className="ch-plus-art brush">
+                  <Icon id="i-upload" />
+                </span>
+              }
+              name={t('Загрузить скин')}
+              status="PNG"
+              track="skin_upload_tile"
+              onClick={() => setUploadOpen(true)}
+            />
+            <ItemTile
+              action
+              art={
+                <span className="ch-plus-art brush">
+                  <Icon id="i-brush" />
+                </span>
+              }
+              name={t('Заказать свой скин')}
+              status="millida.net"
+              track="skin_order"
+              onClick={() => {
+                track('store_open', { where: 'skins_order' })
+                openExt(MILLIDA_SKINS_URL)
+              }}
+            />
+          </ItemGrid>
+          {wardrobeFailed && hasMillidaAccount() ? (
+            <div className="load-again">
+              <span>{t('Каталог не загрузился')}</span>
+              <button className="btn sm secondary" onClick={() => void refreshWardrobe()}>
+                <Icon id="i-restart" />
+                {t('Повторить')}
+              </button>
+            </div>
+          ) : null}
+        </>
+      ) : catFailed ? (
+        <div className="load-again">
+          <span>{t('Каталог не загрузился')}</span>
+          <button className="btn sm secondary" onClick={() => void loadCatalog(catKind)}>
+            <Icon id="i-restart" />
+            {t('Повторить')}
+          </button>
+        </div>
+      ) : catFound.length || NICK_RE.test(catQuery.trim()) ? (
+        <ItemGrid>
+          {NICK_RE.test(catQuery.trim()) ? (
+            <ItemTile
+              art={<CatalogThumb nick={catQuery.trim()} />}
+              name={catQuery.trim()}
+              note={t('Скин игрока')}
+              onClick={() => selectCatalog({ key: '', nick: catQuery.trim(), label: catQuery.trim() })}
+            />
+          ) : null}
+          {catFound.map((c) => {
+            const url = c.textureId ? showcaseSkinUrl(c.textureId) : ''
+            return (
+              <ItemTile
+                key={c.name}
+                art={<CatalogThumb nick={c.name} url={url} />}
+                name={c.name}
+                onClick={() => selectCatalog({ key: c.name, nick: c.name, label: c.name, url })}
+              />
+            )
+          })}
+        </ItemGrid>
+      ) : (
+        <div className="ch-nothing">{catQuery.trim() ? t('Ничего не нашли') : t('Каталог пока пуст')}</div>
+      )}
+    </>
+  )
+
+  const capePanel =
+    chipKey === 'quest' && !cosmeticQueryNorm ? (
+      <ItemGrid>{capesShown(earnedCapes).map(capeTile)}</ItemGrid>
+    ) : (
+      <>
+        {capesShown(ownCapes).length || shownShelf.length ? (
+          <ItemGrid>
+            {capesShown(ownCapes).map(capeTile)}
+            {shownShelf.map(cosmeticTile)}
+          </ItemGrid>
+        ) : (
+          nothing
+        )}
+        {shelfTail}
+      </>
+    )
+
+  const cosmeticPanel = catalogBroken || (
+    <>
+      {shelf.length ? (
+        <ItemGrid>
+          {plusTile}
+          {shownShelf.map(cosmeticTile)}
+        </ItemGrid>
+      ) : (
+        nothing
+      )}
+      {shelfTail}
+    </>
+  )
+
+  const sectionName = sectionList.find((s) => s.key === section)?.name ?? t('Гардероб')
+
+  return (
+    <section className={'screen' + (on ? ' on' : '')} id="s-skins">
+      <div className={'ch-grid' + (section === 'shop' ? ' is-shop' : '')}>
+        <div className="ch-center">
+          {/* Фон сцены — та же цветная сцена, что в лобби (правка 22:35): за
+              сценой, а не внутри, чтобы не мешать 3D-холсту. */}
+          <div className="ch-stage-bg" aria-hidden="true">
+            <PixelField on={on} />
+          </div>
+          <div
+            className="ch-stage"
+            id="skinStage"
+            ref={stageRef}
+            onPointerDown={startTurn}
+            onPointerUp={endTurn}
+            onPointerCancel={endTurn}
+            onPointerMove={turnOrAim}
+            onWheel={zoomStage}
+            onPointerLeave={endTurn}
+            onDoubleClick={() => {
+              viewerRef.current?.setPlayerYaw(0)
+              viewerRef.current?.setZoom(1)
+            }}
+          >
+            <div className="skin-aura" aria-hidden="true"></div>
+            <canvas
+              key={glEpoch}
+              id="skinCanvas"
+              ref={canvasRef}
+              style={{
+                imageRendering: 'auto',
+                display: use3d ? undefined : 'none',
+                opacity: modelShown && dressReady ? 1 : 0,
+                transition: 'opacity var(--m-t-base)',
+              }}
+            ></canvas>
+            {use3d && !(modelShown && dressReady) ? <span className="skin-loader" aria-label={t('Загружаем модель')}></span> : null}
+            {fitLoading.length ? (
+              <span className="stage-note" aria-live="polite">
+                <span className="stage-spin" aria-hidden="true"></span>
+                {t('Надеваем…')}
+              </span>
+            ) : null}
+            {!use3d && fallback ? (
+              <div style={{ display: 'grid', placeItems: 'center', height: '100%' }}>
+                <SkinThumb url={skinSrc || skinUrl(nick)} size={288} slim={variant === 'slim'} />
+              </div>
+            ) : !use3d ? (
+              <span className="skin-loader" aria-label={t('Загружаем модель')}></span>
+            ) : null}
+          </div>
+
+          <FittingBar
+            pieces={fitting.map((item) => {
+              const locked = cosmeticLocked(item)
+              return {
+                id: item.id,
+                name: item.name,
+                art: <CosmeticArt item={item} height={54} />,
+                price: locked && onSale(item) ? item.priceRubies : undefined,
+                note: locked ? earnedNote(item, achSources) : undefined,
+                plus: locked && item.access === 'PLUS',
+                loading: fitLoading.includes(item.id),
+                tones: item.variants,
+                tone: variantOf(item)?.name,
+              }
+            })}
+            total={fittingTotal}
+            rubies={rubies}
+            busy={cosmeticBusy === 'fitting'}
+            canWear={fitting.some((c) => !cosmeticLocked(c))}
+            needLogin={!hasMillidaAccount()}
+            onPick={(id) => {
+              const item = fitting.find((c) => c.id === id)
+              if (!item) return
+              if (item.slot === 'CAPE') {
+                pickSection('cape')
+                return
+              }
+              const sec = sections.find((x) => x.chips.some((c) => c.slots.includes(item.slot)))
+              const chip = sec?.chips.find((c) => c.slots.includes(item.slot))
+              if (!sec || !chip) return
+              setChipBy((now) => ({ ...now, [sec.key]: chip.key }))
+              pickSection(sec.key)
+            }}
+            onTone={(id, tone) => setVariantById((now) => ({ ...now, [id]: tone }))}
+            onClear={() => setFitting([])}
+            onBuy={() => (!hasMillidaAccount() ? showLogin() : void buyFitting())}
+            onTopUp={() => setScreen('rubies')}
+            onWear={() => void wearFitting()}
+            offer={
+              setOffer
+                ? {
+                    price: setList.find((x) => x.id === setOffer.setId)?.colorways.find((c) => c.name === setOffer.colorway)?.price ?? setOffer.price,
+                    onBuy: () => (!hasMillidaAccount() ? showLogin() : void buySetOffer()),
+                  }
+                : undefined
+            }
+            onPlus={
+              !plus?.active && fitting.some((c) => c.access === 'PLUS' && cosmeticLocked(c))
+                ? () => void startPlus()
+                : undefined
+            }
+          />
+
+        </div>
+
+        <div className="ch-panel">
+          <SectionBar sections={sectionList} active={section} onPick={pickSection} />
+
+          {gameNick.conflict ? (
+            <div className="ch-warn">
+              <Icon id="i-alert" />
+              <span>
+                {t('В игре ты')} <b>{gameNick.name}</b> {t('— ник занят')}
+              </span>
+              <button className="btn sm secondary" onClick={() => openExt(SUPPORT_URL)}>
+                {t('Поддержка')}
+              </button>
+            </div>
+          ) : null}
+
+          {section === 'shop' ? null : (
+          <div className="ch-bar">
+            {chipList.length > 1 ? (
+              <ChipRow chips={chipList} active={chipKey} onPick={pickChip} />
+            ) : (
+              <h3 className="ch-bar-title">{sectionName}</h3>
+            )}
+            {/* Одна раскладка во всех разделах (владелец 24.09.2026, 19:34): чипы
+                слева, справа «Снять» (если в разделе что-то надето) и «Все/Мои».
+                Поиска по вещам нет; Remove all is in the top bar, next to Import. */}
+            {(() => {
+              const off = sectionTakeOff(
+                section,
+                (sections.find((x) => x.key === section)?.chips ?? []).flatMap((c) => c.slots),
+                worn,
+                !!currentCape,
+              )
+              const cosmetic = section !== 'skin' && section !== 'looks'
+              if (!off && !cosmetic) return null
+              return (
+                <div className="ch-tools">
+                  {off ? (
+                    <button
+                      className="btn sm secondary"
+                      disabled={!!cosmeticBusy}
+                      data-track="take_off_section"
+                      onClick={() => {
+                        if (off.accountCape) takeOffCape()
+                        void takeOffSlots(off.slots)
+                      }}
+                    >
+                      <Icon id="i-x" /> {t('Снять')}
+                    </button>
+                  ) : null}
+                  {cosmetic ? ownFilter : null}
+                </div>
+              )
+            })()}
+          </div>
+          )}
+
+          {section === 'skin' && chipKey !== 'mine' ? (
+            <div className="ch-bar">
+              {searchBox(t('Ник или название…'), catQuery, setCatQuery, () => {
+                if (NICK_RE.test(catQuery.trim()))
+                  selectCatalog({ key: '', nick: catQuery.trim(), label: catQuery.trim() })
+              })}
+            </div>
+          ) : null}
+
+          {plusJoy ? <PlusCelebration items={plus?.items ?? 100} onDone={endPlusJoy} /> : null}
+
+          {section === 'skin' ? (
+            skinPanel
+          ) : section === 'looks' ? (
+            <>
+            <SetLooks sets={setList} busy={setBusy} onWear={(st, w) => void wearSet(st, w)} />
+            {setList.some((x) => x.colorways.some((c) => c.have > 0)) ? <h3 className="ch-bar-title ch-sub">{t('Мои')}</h3> : null}
+            <Outfits
+              list={outfits}
+              activeId={activeOutfit}
+              busyId={outfitBusy}
+              art={outfitArt}
+              currentArt={figureArt(112)}
+              onSave={saveOutfit}
+              onWear={(o) => void wearOutfit(o)}
+              onRename={(id, name) => keepOutfits(renameOutfit(outfits, id, name))}
+              onRemove={dropOutfit}
+            />
+            </>
+          ) : section === 'shop' ? (
+            <div className="ch-shop">
+              <ShopFeed s={shop} chip />
+            </div>
+          ) : section === 'cape' ? (
+            capePanel
+          ) : (
+            cosmeticPanel
+          )}
+        </div>
+      </div>
+
+      <ShopOverlays s={shop} />
+
+      {capeInfo ? (
+        <div className="modal-bg open vis" onClick={() => setCapeInfo(null)}>
+          <div className="modal mw-xs" onClick={(e) => e.stopPropagation()}>
+            <h3>{capeInfo.name}</h3>
+            <div className="cape-info-art">
+              <CapePreview url={capeInfo.url} h={120} />
+            </div>
+            <div className="sub">{capeInfo.requirement || t('Плащ каталога Millida')}</div>
+            {capeInfo.progress !== undefined ? (
+              <>
+                <span className="cape-prog" style={{ marginTop: '14px' }}>
+                  <span className="cape-prog-bar" style={{ width: capeInfo.progress + '%' }}></span>
+                </span>
+                <div className="cape-prog-txt">{capeInfo.progressLabel || capeInfo.progress + ' %'}</div>
+              </>
+            ) : null}
+            {capeInfo.hint ? (
+              <div className="sub" style={{ marginTop: '10px' }}>
+                {capeInfo.hint}
+              </div>
+            ) : null}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '18px' }}>
+              <button className="btn md secondary" onClick={() => setCapeInfo(null)}>
+                {t('Закрыть')}
+              </button>
+              {capeInfo.rewardCode && capeInfo.rewardReady ? (
+                <button
+                  className="btn md primary"
+                  disabled={claiming === capeInfo.rewardCode}
+                  onClick={() => void takeCape(capeInfo)}
+                >
+                  {claiming === capeInfo.rewardCode ? t('Выдаём…') : t('Забрать')}
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </section>
+  )
+}

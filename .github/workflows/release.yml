@@ -1,0 +1,744 @@
+# Published to millida/launcher as release.yml. The sync deploy key cannot
+# create or change workflow files, so edits here must be pushed to the public
+# repository once by an account that can.
+#
+# Every official installer is built here, on GitHub-hosted runners, from the
+# tagged commit. Updater signatures are added after the fact by the publisher,
+# who first checks these files against their build provenance. The only secret
+# is the SignPath token: Windows files are Authenticode-signed by SignPath
+# Foundation from artifacts this workflow uploads.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+    # A cache saved on a tag is visible to that tag alone, so main fills the caches
+    # tag builds read. Every main run builds the newest release tag: main itself
+    # moves only with stable releases and would leave the caches on old code.
+    branches: [main]
+  # The scheduled run also catches a toolchain update between releases.
+  schedule:
+    - cron: "23 */6 * * *"
+  # warm.yml calls this right after a release build: a workflow cannot listen to
+  # its own runs, and the jobs keep seeing the caller's workflow_run event.
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version stamped into a trial build, nothing is published
+        required: true
+        default: "0.0.1"
+      signing_policy:
+        description: SignPath signing policy for the trial build, empty to skip signing
+        required: false
+        default: test-signing
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The images the Linux and Windows legs build in. Only main writes them; a
+  # release tag pulls what the last main build pushed.
+  linux-image:
+    name: Build image (${{ matrix.image }})
+    if: github.repository == 'millida/launcher' && github.ref == 'refs/heads/main' && github.event_name != 'workflow_run'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: launcher-linux-build:22.04-x64
+            os: ubuntu-latest
+            file: linux-build.Dockerfile
+          - image: launcher-linux-build:22.04-arm64
+            os: ubuntu-24.04-arm
+            file: linux-build.Dockerfile
+          - image: launcher-xwin-build:24.04
+            os: ubuntu-latest
+            file: xwin-build.Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to the registry
+        env:
+          TOKEN: ${{ github.token }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: .github/docker/${{ matrix.file }}
+          push: true
+          tags: ghcr.io/millida/${{ matrix.image }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=registry,ref=ghcr.io/millida/${{ matrix.image }}
+          cache-to: type=inline
+
+  build:
+    name: ${{ matrix.label }}
+    needs: linux-image
+    if: >-
+      ${{ !cancelled()
+      && github.repository == 'millida/launcher'
+      && contains(fromJSON('["success", "skipped"]'), needs.linux-image.result)
+      && (github.event_name != 'workflow_run' || (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v'))) }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: read
+    # An optional target that fails leaves its players on the previous version
+    # instead of holding back everyone else; the release job checks that every
+    # required target uploaded its bundles.
+    continue-on-error: ${{ matrix.optional == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Cross-compiled on Linux with cargo-xwin: the same MSVC CRT and Windows
+          # SDK libraries, clang-cl and lld-link instead of the MSVC tools. The app
+          # crate compiles twice as fast as on a Windows runner.
+          - label: Windows x64
+            platform: windows
+            os: ubuntu-latest
+            container: ghcr.io/millida/launcher-xwin-build:24.04
+            base: xwin
+            runner_args: --runner cargo-xwin
+            target: x86_64-pc-windows-msvc
+            updater_key: windows-x86_64
+            updater_dir: nsis
+            updater_pattern: "*-setup.exe"
+            updater_extra: ""
+          - label: Linux x64
+            platform: linux
+            os: ubuntu-latest
+            # AppImage bundles GLib, GTK and WebKit from the build machine, so the
+            # oldest supported base decides which systems the launcher starts on.
+            container: ghcr.io/millida/launcher-linux-build:22.04-x64
+            base: ubuntu:22.04
+            target: x86_64-unknown-linux-gnu
+            updater_key: linux-x86_64
+            updater_dir: appimage
+            updater_pattern: "*.AppImage"
+            updater_extra: "deb:*.deb:linux-x86_64-deb rpm:*.rpm:linux-x86_64-rpm"
+          - label: Linux arm64
+            platform: linux
+            # Native arm64 runner, free for public repositories; the same old
+            # base image as x64 for the same glibc reason.
+            os: ubuntu-24.04-arm
+            container: ghcr.io/millida/launcher-linux-build:22.04-arm64
+            base: ubuntu:22.04
+            target: aarch64-unknown-linux-gnu
+            updater_key: linux-aarch64
+            updater_dir: appimage
+            updater_pattern: "*.AppImage"
+            updater_extra: "deb:*.deb:linux-aarch64-deb rpm:*.rpm:linux-aarch64-rpm"
+            optional: true
+    container:
+      image: ${{ matrix.container }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    env:
+      SIGNING_POLICY: ${{ inputs.signing_policy || vars.SIGNPATH_SIGNING_POLICY }}
+      # Not SIGN: linuxdeploy-plugin-appimage treats any SIGN value as a request
+      # to GPG-sign the AppImage and fails without a key.
+      WINDOWS_SIGNING: ${{ matrix.platform == 'windows' && github.ref != 'refs/heads/main' && (inputs.signing_policy || vars.SIGNPATH_SIGNING_POLICY) != '' }}
+      RELEASE_DIR: src-tauri/target/${{ matrix.target }}/release
+    steps:
+      # The image already has all of it and this takes seconds; a package added
+      # here before main rebuilt the image is installed on the spot.
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          packages="\
+            ca-certificates \
+            curl \
+            git \
+            unzip \
+            xz-utils \
+            pkg-config \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev \
+            libasound2-dev \
+            libssl-dev \
+            build-essential \
+            file \
+            wget \
+            xdg-utils \
+            desktop-file-utils \
+            binutils \
+            libgstreamer1.0-0 \
+            libgstreamer-plugins-base1.0-0 \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-libav \
+            gstreamer1.0-gl \
+            gstreamer1.0-pulseaudio \
+            gstreamer1.0-alsa"
+          apt-get install -y $packages || { apt-get update && apt-get install -y $packages; }
+
+      - name: Pick the newest release tag
+        id: source
+        if: github.ref == 'refs/heads/main' && github.event_name != 'workflow_dispatch'
+        shell: bash
+        env:
+          BUILT_TAG: ${{ github.event.workflow_run.head_branch }}
+          BUILT_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -eu
+          remote="https://github.com/$GITHUB_REPOSITORY"
+          if [ -n "${BUILT_TAG:-}" ]; then
+            # Only a release tag that still points at the commit that was built:
+            # a branch can share the name, and a tag can move after the build.
+            [[ "$BUILT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$BUILT_TAG is not a release tag"; exit 1; }
+            tagged=$(git ls-remote "$remote" "refs/tags/$BUILT_TAG^{}" "refs/tags/$BUILT_TAG" | sort -k2 -r | head -n 1 | cut -f1)
+            [ "$tagged" = "$BUILT_SHA" ] || { echo "::error::$BUILT_TAG points at ${tagged:-nothing}, the build was $BUILT_SHA"; exit 1; }
+            ref=$BUILT_SHA
+          else
+            ref=$(git ls-remote --tags --refs "$remote" 'v*' | sed 's|.*refs/tags/||' | sort -V | tail -n 1)
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.ref }}
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.4.0"
+
+      - run: bun install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # A cache saved on a tag is visible only to that same tag, so only main saves;
+      # every release tag restores what the last main build left. The prefix keeps
+      # entries written by other workflows on main out of the signed build, and every
+      # action that runs on main is pinned to a commit.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          prefix-key: release-v1
+          workspaces: src-tauri -> target
+          key: ${{ matrix.target }}-${{ matrix.base }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # rust-cache keeps dependencies only. The app crate is compiled incrementally
+      # (Cargo.toml) from the state the last main build left, so a release
+      # recompiles what changed since then.
+      - name: Restore incremental state
+        uses: actions/cache/restore@v4
+        with:
+          path: src-tauri/target/${{ matrix.target }}/release/incremental
+          key: release-v1-incremental-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: release-v1-incremental-${{ matrix.target }}-
+
+      - name: Set version from the tag
+        if: github.ref != 'refs/heads/main'
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: bash .github/scripts/set-version.sh "${VERSION_INPUT:-${GITHUB_REF_NAME#v}}"
+
+      - name: Build and bundle
+        if: env.WINDOWS_SIGNING != 'true' && matrix.platform != 'linux'
+        shell: bash
+        env:
+          # linuxdeploy and appimagetool mount themselves through FUSE, which a
+          # container does not have.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          # Recent toolchains default C code to x86-64-v3; ring's curve25519 then
+          # crashes with SIGILL on every CPU before Haswell.
+          CFLAGS_x86_64_unknown_linux_gnu: -march=x86-64 -mtune=generic
+          CXXFLAGS_x86_64_unknown_linux_gnu: -march=x86-64 -mtune=generic
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64
+        # Types are checked by CI on the commit this tag is cut from. The toolchain
+        # actions set CARGO_INCREMENTAL=0 and the profile alone did not bring it back;
+        # Cargo applies it to workspace crates only, so dependencies stay as cached.
+        run: |
+          export CARGO_INCREMENTAL=1
+          bun run tauri build ${{ matrix.runner_args }} --target ${{ matrix.target }} --config '{"build":{"beforeBuildCommand":"bun run build:web:release"}}'
+
+      # The three packages are packed side by side. The bundler stamps the package
+      # type into the binary in place and restores it after each package, so rpm and
+      # deb are packed from their own copies in separate target dirs.
+      - name: Build and bundle (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          # linuxdeploy and appimagetool mount themselves through FUSE, which a
+          # container does not have.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          # Recent toolchains default C code to x86-64-v3; ring's curve25519 then
+          # crashes with SIGILL on every CPU before Haswell.
+          CFLAGS_x86_64_unknown_linux_gnu: -march=x86-64 -mtune=generic
+          CXXFLAGS_x86_64_unknown_linux_gnu: -march=x86-64 -mtune=generic
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64
+        run: |
+          set -eu
+          export CARGO_INCREMENTAL=1
+          bun run tauri build --no-bundle --target "$TARGET" --config '{"build":{"beforeBuildCommand":"bun run build:web:release"}}'
+          bundle_aside() {
+            local dir="$RUNNER_TEMP/$1-target"
+            mkdir -p "$dir/$TARGET/release"
+            cp "$RELEASE_DIR/millida-launcher" "$dir/$TARGET/release/"
+            CARGO_TARGET_DIR="$dir" bun run tauri bundle --bundles "$1" --target "$TARGET" > "$RUNNER_TEMP/$1.log" 2>&1
+          }
+          pids=()
+          for kind in rpm deb; do
+            bundle_aside "$kind" &
+            pids+=("$kind:$!")
+          done
+          bun run tauri bundle --bundles appimage --target "$TARGET"
+          for entry in "${pids[@]}"; do
+            kind="${entry%%:*}"
+            status=0
+            wait "${entry#*:}" || status=$?
+            cat "$RUNNER_TEMP/$kind.log"
+            if [ "$status" != 0 ]; then
+              echo "::error::$kind bundling failed with status $status"
+              exit 1
+            fi
+            mkdir -p "$RELEASE_DIR/bundle/$kind"
+            cp "$RUNNER_TEMP/$kind-target/$TARGET/release/bundle/$kind/"*."$kind" "$RELEASE_DIR/bundle/$kind/"
+          done
+          ls -l "$RELEASE_DIR"/bundle/*/
+
+      # Signed Windows build: the app exe is signed before it goes into the
+      # installer, then the installer itself. Tauri stamps the bundle type into
+      # the exe while bundling, which would break a signature made earlier, so
+      # the stamp is applied here first and the bundler finds nothing to patch.
+      - name: Build
+        if: env.WINDOWS_SIGNING == 'true'
+        shell: bash
+        run: |
+          export CARGO_INCREMENTAL=1
+          bun run tauri build ${{ matrix.runner_args }} --no-bundle --target ${{ matrix.target }} --config '{"build":{"beforeBuildCommand":"bun run build:web:release"}}'
+
+      - name: Stage the app for signing
+        if: env.WINDOWS_SIGNING == 'true'
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p unsigned/app
+          node .github/scripts/mark-bundle-type.mjs "$RELEASE_DIR" nsis > marked.txt
+          while read -r name; do cp "$RELEASE_DIR/$name" unsigned/app/; done < marked.txt
+          ls -l unsigned/app
+
+      - name: Upload the unsigned app
+        if: env.WINDOWS_SIGNING == 'true'
+        id: unsigned-app
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned-app
+          retention-days: 1
+          if-no-files-found: error
+          path: unsigned/app
+
+      - name: Sign the app
+        if: env.WINDOWS_SIGNING == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ env.SIGNING_POLICY }}
+          artifact-configuration-slug: app
+          github-artifact-id: ${{ steps.unsigned-app.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 7200
+          output-artifact-directory: signed/app
+
+      - name: Put the signed app in place
+        if: env.WINDOWS_SIGNING == 'true'
+        shell: bash
+        run: |
+          set -eu
+          for f in unsigned/app/*.exe; do
+            name=$(basename "$f")
+            built=$(node .github/scripts/pe-digest.mjs "$f" | cut -d' ' -f1)
+            signed=$(node .github/scripts/pe-digest.mjs "signed/app/$name" | cut -d' ' -f1)
+            if [ -z "$built" ] || [ "$built" != "$signed" ]; then
+              echo "::error::signed $name is not the file that was built"
+              exit 1
+            fi
+            cp "signed/app/$name" "$RELEASE_DIR/$name"
+          done
+
+      - name: Bundle
+        if: env.WINDOWS_SIGNING == 'true'
+        shell: bash
+        run: bun run tauri bundle --bundles nsis --target ${{ matrix.target }}
+
+      - name: Stage the installer for signing
+        if: env.WINDOWS_SIGNING == 'true'
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p unsigned/installer
+          cp "$RELEASE_DIR"/bundle/nsis/*-setup.exe unsigned/installer/
+          ls -l unsigned/installer
+
+      - name: Upload the unsigned installer
+        if: env.WINDOWS_SIGNING == 'true'
+        id: unsigned-installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned-installer
+          retention-days: 1
+          if-no-files-found: error
+          path: unsigned/installer
+
+      - name: Sign the installer
+        if: env.WINDOWS_SIGNING == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ env.SIGNING_POLICY }}
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 7200
+          output-artifact-directory: signed/installer
+
+      - name: Put the signed installer in place
+        if: env.WINDOWS_SIGNING == 'true'
+        shell: bash
+        run: |
+          set -eu
+          for f in unsigned/installer/*.exe; do
+            name=$(basename "$f")
+            built=$(node .github/scripts/pe-digest.mjs "$f" | cut -d' ' -f1)
+            signed=$(node .github/scripts/pe-digest.mjs "signed/installer/$name" | cut -d' ' -f1)
+            if [ -z "$built" ] || [ "$built" != "$signed" ]; then
+              echo "::error::signed $name is not the file that was built"
+              exit 1
+            fi
+            cp "signed/installer/$name" "$RELEASE_DIR/bundle/nsis/$name"
+          done
+
+      - name: Check signatures
+        if: env.WINDOWS_SIGNING == 'true'
+        shell: bash
+        run: |
+          set -eu
+          files=("$RELEASE_DIR"/bundle/nsis/*-setup.exe)
+          for f in unsigned/app/*.exe; do files+=("$RELEASE_DIR/$(basename "$f")"); done
+          for f in "${files[@]}"; do
+            if ! osslsigncode extract-signature -in "$f" -out "$RUNNER_TEMP/signature.der" > /dev/null; then
+              echo "::error::$(basename "$f") carries no signature"
+              exit 1
+            fi
+            if [ "$SIGNING_POLICY" = "release-signing" ]; then
+              osslsigncode verify -in "$f" -CAfile /etc/ssl/certs/ca-certificates.crt
+            fi
+            echo "$(basename "$f"): signed"
+          done
+
+      # curve25519.c has no runtime dispatch, so BMI2 or AVX2 in its object file
+      # means the build drifted past baseline x86-64.
+      - name: Verify baseline instruction set
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -eu
+          obj=$(find "src-tauri/target/${{ matrix.target }}/release/build" -name '*-curve25519.o' | head -n1)
+          if [ -z "$obj" ]; then
+            echo "::error::curve25519 object file not found, the instruction set cannot be checked"
+            exit 1
+          fi
+          if objdump -d "$obj" | grep -qE '\b(mulx|shlx|shrx|sarx|rorx|bzhi|pdep|pext)\b|%ymm|%zmm'; then
+            echo "::error::$obj uses instructions above baseline x86-64"
+            exit 1
+          fi
+
+      - name: Collect bundles
+        if: github.ref != 'refs/heads/main'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          UPDATER_KEY: ${{ matrix.updater_key }}
+          UPDATER_DIR: ${{ matrix.updater_dir }}
+          UPDATER_PATTERN: ${{ matrix.updater_pattern }}
+          UPDATER_EXTRA: ${{ matrix.updater_extra }}
+        run: bash .github/scripts/collect-bundles.sh
+
+      - uses: actions/upload-artifact@v4
+        if: github.ref != 'refs/heads/main'
+        with:
+          name: bundle-${{ matrix.target }}
+          retention-days: 3
+          if-no-files-found: error
+          path: upload/${{ matrix.target }}
+
+      - name: Save incremental state
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: src-tauri/target/${{ matrix.target }}/release/incremental
+          key: release-v1-incremental-${{ matrix.target }}-${{ github.run_id }}
+
+  # Every main build saves a new incremental state per target under its run id;
+  # only the newest is kept, or they would push the dependency caches out of the
+  # 10 GB limit.
+  prune-caches:
+    name: Drop older incremental states
+    needs: [build, macos]
+    if: ${{ !cancelled() && github.repository == 'millida/launcher' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Keep the newest state per target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh cache list -R "$GITHUB_REPOSITORY" --key release-v1-incremental- --limit 100 --json id,key,createdAt \
+            --jq 'group_by(.key | sub("-[0-9]+$"; "")) | map(sort_by(.createdAt) | reverse | .[1:]) | flatten | .[] | "\(.id) \(.key)"' |
+            while read -r id key; do
+              echo "Удаляю $key"
+              gh cache delete "$id" -R "$GITHUB_REPOSITORY"
+            done
+
+  macos:
+    name: ${{ matrix.label }}
+    if: >-
+      ${{ github.repository == 'millida/launcher'
+      && contains(fromJSON('["push", "schedule", "workflow_run"]'), github.event_name)
+      && (github.event_name != 'workflow_run' || (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v'))) }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS Apple Silicon
+            target: aarch64-apple-darwin
+            updater_key: darwin-aarch64
+          - label: macOS Intel
+            target: x86_64-apple-darwin
+            updater_key: darwin-x86_64
+    steps:
+      - name: Pick the newest release tag
+        id: source
+        if: github.ref == 'refs/heads/main'
+        env:
+          BUILT_TAG: ${{ github.event.workflow_run.head_branch }}
+          BUILT_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -eu
+          remote="https://github.com/$GITHUB_REPOSITORY"
+          if [ -n "${BUILT_TAG:-}" ]; then
+            # Only a release tag that still points at the commit that was built:
+            # a branch can share the name, and a tag can move after the build.
+            [[ "$BUILT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$BUILT_TAG is not a release tag"; exit 1; }
+            tagged=$(git ls-remote "$remote" "refs/tags/$BUILT_TAG^{}" "refs/tags/$BUILT_TAG" | sort -k2 -r | head -n 1 | cut -f1)
+            [ "$tagged" = "$BUILT_SHA" ] || { echo "::error::$BUILT_TAG points at ${tagged:-nothing}, the build was $BUILT_SHA"; exit 1; }
+            ref=$BUILT_SHA
+          else
+            ref=$(git ls-remote --tags --refs "$remote" 'v*' | sed 's|.*refs/tags/||' | sort -V | tail -n 1)
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.ref }}
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # The toolchain image is built from the Dockerfile in this repository and
+      # only kept in the Actions cache, so anyone can rebuild the exact same one.
+      - name: Build toolchain image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: .github/docker/macos-cross.Dockerfile
+          tags: macos-cross:local
+          load: true
+          cache-from: type=gha,scope=macos-cross
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=macos-cross,mode=max' || '' }}
+
+      # Saved only on main, like the Rust cache of the other targets: a tag reads
+      # only its own entries, and 1.5 GB per tag pushes the other targets' caches
+      # out of the 10 GB limit. The incremental state has a cache of its own below.
+      - name: Restore cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .cross-cache/cargo/registry
+            .cross-cache/cargo/git
+            .cross-cache/target
+            !.cross-cache/target/*/release/incremental
+            !.cross-cache/target/*/release/bundle
+          key: macos-${{ matrix.target }}-${{ hashFiles('src-tauri/Cargo.lock', '.github/docker/macos-cross.Dockerfile') }}
+          restore-keys: macos-${{ matrix.target }}-
+
+      # The dependency cache above is saved once per Cargo.lock; the incremental
+      # state of the app crate changes with every build and is kept apart.
+      - name: Restore incremental state
+        uses: actions/cache/restore@v4
+        with:
+          path: .cross-cache/target/${{ matrix.target }}/release/incremental
+          key: release-v1-incremental-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: release-v1-incremental-${{ matrix.target }}-
+
+      - name: Set version from the tag
+        if: github.ref != 'refs/heads/main'
+        run: bash .github/scripts/set-version.sh "${GITHUB_REF_NAME#v}"
+
+      # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml: the image ships a minimal
+      # profile without clippy and rustfmt, and installing them into an image
+      # layer fails on overlayfs.
+      - name: Build and bundle
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          cache="$PWD/.cross-cache"
+          mkdir -p "$cache/cargo" "$cache/home" "$cache/target"
+          rm -rf src-tauri/target
+          ln -s "$cache/target" src-tauri/target
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD:$PWD" -w "$PWD" \
+            -e CARGO_HOME="$cache/cargo" \
+            -e HOME="$cache/home" \
+            -e TARGET \
+            -e RUSTUP_TOOLCHAIN=stable \
+            macos-cross:local \
+            bash -euo pipefail -c '
+              rm -rf "src-tauri/target/$TARGET/release/bundle"
+              bun install --frozen-lockfile
+              bun run build:web:release
+              cargo build --release --manifest-path src-tauri/Cargo.toml --target "$TARGET" --features tauri/custom-protocol
+              bun scripts/macos-bundle.mjs --target="$TARGET"
+            '
+
+      - name: Save cargo cache
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cross-cache/cargo/registry
+            .cross-cache/cargo/git
+            .cross-cache/target
+            !.cross-cache/target/*/release/incremental
+            !.cross-cache/target/*/release/bundle
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+      - name: Save incremental state
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: .cross-cache/target/${{ matrix.target }}/release/incremental
+          key: release-v1-incremental-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Collect bundles
+        if: github.ref != 'refs/heads/main'
+        env:
+          TARGET: ${{ matrix.target }}
+          UPDATER_KEY: ${{ matrix.updater_key }}
+          UPDATER_DIR: macos
+          UPDATER_PATTERN: "*.app.tar.gz"
+          UPDATER_EXTRA: ""
+        run: bash .github/scripts/collect-bundles.sh
+
+      - uses: actions/upload-artifact@v4
+        if: github.ref != 'refs/heads/main'
+        with:
+          name: bundle-${{ matrix.target }}
+          retention-days: 3
+          if-no-files-found: error
+          path: upload/${{ matrix.target }}
+
+  release:
+    name: GitHub release
+    needs: [build, macos]
+    # Not a plain success check: an optional matrix leg may fail. Required
+    # targets are enforced by release-assets.mjs, and a leg uploads its bundles
+    # only as its last step, so a missing bundle means a failed build.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') && needs.macos.result == 'success' && needs.build.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      # This job can mint attestations, so it runs no third-party actions: the
+      # script needs only the Node.js that ships with the runner image.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          path: artifacts
+
+      - name: Lay out release assets
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: node .github/scripts/release-assets.mjs
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: assets/*
+
+      # bundles.json goes up last: the publisher waits for it, so its presence
+      # means every other asset is already in place.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ATTESTATION: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -eu
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .message > tag-message.txt
+          channel=stable
+          if grep -qx 'Channel: beta' tag-message.txt; then channel=beta; fi
+          grep -vx 'Channel: beta' tag-message.txt > notes.md || true
+          cp "$ATTESTATION" provenance.sigstore.json
+          # Two stable releases built side by side finish in any order; the one that
+          # finishes last must not take "latest" from a newer one.
+          current=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          if [ "$channel" = "beta" ]; then
+            flags="--prerelease"
+          elif [ -n "$current" ] && [ "$(printf '%s\n%s\n' "$current" "$TAG" | sort -V | tail -n 1)" != "$TAG" ]; then
+            flags="--latest=false"
+          else
+            flags="--latest"
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md $flags
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag $flags \
+              --title "Millida Launcher ${TAG#v}" --notes-file notes.md
+          fi
+          find assets -type f ! -name bundles.json -print0 | xargs -0 gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber provenance.sigstore.json
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber assets/bundles.json

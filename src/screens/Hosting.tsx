@@ -1,0 +1,511 @@
+import { useEffect, useRef, useState } from 'react'
+import { Icon } from '../components/Icon'
+import { formatFixed, intlTag, tx, useT } from '../i18n'
+import { TopbarPortal } from '../components/TopbarPortal'
+import { HostingManage } from './HostingManage'
+import { api, hasMillidaAccount, openExt } from '../lib/api'
+import { HostPlanPicker } from '../components/HostPlanPicker'
+import { loadMillidaProfile, showLogin } from '../lib/session'
+import { hasTauri } from '../ipc/tauri'
+import { addServer, pinServerDat } from '../ipc/commands'
+import { rememberServerName } from '../state/playStats'
+import { useHasMillida } from '../state/auth'
+import { noteHostingServers } from '../state/navHint'
+import { joinStarted, joinWithAuth, showLaunchError } from '../lib/launch'
+import { buildForServer } from '../lib/joinServer'
+import { serverVersions } from '../lib/mcVersion'
+import { anyGameRunning, isGameRunning } from '../state/game'
+import { uiConfirm } from '../state/confirm'
+import { setScreen, showToast } from '../state/ui'
+import { Head } from '../components/Head'
+import { openChat, useFriends } from '../state/friends'
+import { encodeInvite } from '../lib/invite'
+import { usePolling } from '../lib/usePolling'
+import { noteMyServers } from '../state/playInvite'
+import { InviteChip } from '../components/friends/InviteChip'
+import { HostRoads, hostPlanFacts } from '../components/hosting/HostRoads'
+import type { HostPlanLite } from '../components/hosting/HostRoads'
+import { HostScene, HostStat } from '../components/hosting/HostScene'
+import { BalancePill } from '../components/hosting/HostKit'
+// Стиль экрана подключается здесь: App импортируется в main.tsx после кита и
+// 12-pixel.css, поэтому порядок правил сохраняется.
+import '../styles/pixel/hosting2.css'
+import '../styles/pixel/hosting-scene.css'
+import '../styles/pixel/hosting-panel.css'
+import { hostingPlanPrice, useMoney } from '../lib/useMoney'
+import { RemoteScreen } from '../components/RemoteScreen'
+import { remoteUiEnabled } from '../lib/remoteUi'
+import { makeRemoteBridge } from '../lib/remoteUiBridge'
+
+export interface HostServer {
+  id: string
+  name?: string
+  slug?: string
+  status?: string
+  address?: string
+  icon?: string
+  core?: string
+  version?: string
+  preset?: string
+  planName?: string
+  planCode?: string
+  planRamMb?: number
+  planDiskMb?: number
+  planFullAccess?: boolean
+  ramMb?: number
+  maxPlayers?: number
+  planMaxPlayers?: number
+  playersOnline?: number
+  inviteUrl?: string
+  pendingRestart?: string[]
+  planPriceKopecks?: number | null
+  expiresAt?: string | null
+  worldDeleteAt?: string | null
+  lastSeenAt?: string | null
+  diskUsedMb?: number
+}
+
+const fmtDate = (iso?: string | null) => {
+  if (!iso) return ''
+  const d = new Date(iso)
+  return isNaN(d.getTime()) ? '' : d.toLocaleDateString(intlTag(), { day: 'numeric', month: 'long', year: 'numeric' })
+}
+
+type View = 'initial' | 'gate' | 'loading' | 'error' | 'empty' | 'list'
+
+function HostSkeleton() {
+  return (
+    <div className="hsx-scene is-skel" aria-busy="true">
+      <div className="hsx-green">
+        <div className="hsx-id">
+          <span className="skel" style={{ width: 56, height: 56 }}></span>
+          <div className="hsx-id-txt">
+            <span className="skel skel-line" style={{ width: 90 }}></span>
+            <span className="skel skel-line" style={{ width: 200, height: 26, marginTop: 8 }}></span>
+          </div>
+        </div>
+        <span className="skel skel-line" style={{ width: 260, height: 40 }}></span>
+        <div className="hsx-acts">
+          <span className="skel" style={{ width: 180, height: 52 }}></span>
+          <span className="skel" style={{ width: 150, height: 52 }}></span>
+        </div>
+      </div>
+      <div className="hsx-navy">
+        {[0, 1].map((i) => (
+          <span key={i} className="skel" style={{ height: 76 }}></span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+export function Hosting({ on }: { on: boolean }) {
+  const t = useT()
+  useMoney()
+  const [view, setView] = useState<View>('initial')
+  const [err, setErr] = useState('')
+  const [list, setList] = useState<HostServer[]>([])
+  const [manageId, setManageId] = useState<string | null>(null)
+  const [remoteFailed, setRemoteFailed] = useState(false)
+  const [inviteFor, setInviteFor] = useState<string | null>(null)
+  const [picker, setPicker] = useState<{
+    mode: 'create' | 'upgrade'
+    serverId?: string
+    currentCode?: string | null
+    focus?: 'free' | 'paid'
+  } | null>(null)
+  const [plans, setPlans] = useState<HostPlanLite[]>([])
+  const friends = useFriends((s) => s.friends)
+  const millida = useHasMillida()
+  // Экран с сайта сам ходит за списком; родной список в это время не опрашивает и тарифы не тянет.
+  const remoteActive = millida && remoteUiEnabled() && !remoteFailed
+  const loadedRef = useRef(false)
+
+  // Числа платных тарифов нужны и полосе продажи под карточкой сервера.
+  useEffect(() => {
+    if (!on || remoteActive) return
+    let alive = true
+    api('/hosting/plans?brand=millida')
+      .then((r) => alive && setPlans(Array.isArray(r) ? r : []))
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [on, remoteActive])
+
+  useEffect(() => {
+    if (!inviteFor) return
+    const close = (e: MouseEvent) => {
+      if ((e.target as HTMLElement).closest('.host-invite-wrap')) return
+      setInviteFor(null)
+    }
+    document.addEventListener('click', close)
+    return () => document.removeEventListener('click', close)
+  }, [inviteFor])
+
+  const invite = async (uid: string, nick: string, s: HostServer) => {
+    setInviteFor(null)
+    const addr = s.address || ''
+    if (!addr) {
+      showToast(t('Сервер ещё запускается — адрес появится позже'), 'error')
+      return
+    }
+    const text = encodeInvite(addr, s.name || t('Мой сервер'))
+    try {
+      await api('/friends/chat/' + encodeURIComponent(uid), { method: 'POST', body: JSON.stringify({ text }) })
+    } catch {}
+    await openChat(uid, nick)
+    showToast(t('Приглашение отправлено: {nick}', { nick }))
+  }
+
+  const load = async (silent?: boolean) => {
+    if (!hasMillidaAccount()) {
+      setView('gate')
+      return
+    }
+    if (!silent) setView('loading')
+    let data: HostServer[]
+    try {
+      data = await api('/hosting/servers/me')
+    } catch (e) {
+      if (silent) return
+      // Текст ошибки нужен логам, а не игроку: на экране — фраза и «Повторить».
+      console.error('[hosting] servers/me', e)
+      setErr(tx(e))
+      setView('error')
+      return
+    }
+    const arr = Array.isArray(data) ? data : []
+    loadedRef.current = arr.length > 0
+    noteHostingServers(arr.length)
+    setList(arr)
+    setView(arr.length ? 'list' : 'empty')
+    // «Позвать играть» из друзей ждёт сервер: как только у него есть адрес,
+    // приглашение уходит само (state/playInvite).
+    noteMyServers(arr)
+    try {
+      const primary = arr.find((s) => s.address)
+      if (primary) localStorage.setItem('m-host-pin', JSON.stringify({ name: primary.name || t('Мой сервер'), addr: primary.address }))
+      else localStorage.removeItem('m-host-pin')
+    } catch {}
+  }
+
+  useEffect(() => {
+    if (!on) return
+    void load(loadedRef.current)
+    if (hasMillidaAccount()) void loadMillidaProfile()
+  }, [on])
+
+  usePolling(() => void load(true), 20000, { enabled: on && !remoteActive, hiddenMs: 0, immediate: false, realtime: 'hosting' })
+
+  const act = async (sid: string, path: string, label: string, ok: string) => {
+    showToast(label)
+    try {
+      await api('/hosting/servers/' + sid + path, { method: 'POST' })
+      showToast(ok)
+      setTimeout(() => void load(), 1200)
+    } catch (e) {
+      console.error('[hosting] ' + path, e)
+      showToast(t('Не получилось — попробуй ещё раз'), 'error')
+      void load()
+    }
+  }
+
+  const facts = hostPlanFacts(plans)
+  const planGb = (mb: number) => formatFixed(mb / 1024, mb % 1024 === 0 ? 0 : 1)
+
+  const joinServer = async (s: HostServer) => {
+    const addr = s.address || ''
+    if (!addr) {
+      showToast(t('Сервер ещё запускается'))
+      return
+    }
+    if (!hasTauri()) {
+      showToast(t('Вход на сервер — в приложении'))
+      return
+    }
+    const sname = s.name || t('Мой сервер')
+    // Свой сервер тоже не пустит клиент чужой версии: сборку выбираем (или
+    // предлагаем создать) под версию, на которой он крутится.
+    const wanted = serverVersions(s.version ? [s.version] : [])
+    const prof = await buildForServer({ ip: addr, name: sname, licensed: false, versions: wanted }, wanted)
+    if (!prof) return
+    addServer(prof, sname, addr).catch(() => {})
+    rememberServerName(addr, sname)
+    if (anyGameRunning()) {
+      // Вторая копия ради входа на сервер почти всегда не нужна: игра уже
+      // запущена, и сервер достаточно закрепить в её списке.
+      void pinServerDat(prof, sname, addr).catch(() => {})
+      void uiConfirm(
+        isGameRunning(prof)
+          ? t('Игра уже запущена — «{server}» закреплён первым в списке серверов, зайди прямо из неё. Запустить вторую копию игры?', { server: sname })
+          : t('Уже запущена другая сборка. «{server}» закреплён в списке серверов сборки «{build}». Запустить её второй копией?', { server: sname, build: prof }),
+        {
+          title: t('Игра уже запущена'),
+          confirmLabel: t('Запустить вторую копию'),
+          cancelLabel: t('Не запускать'),
+          danger: false,
+        },
+      ).then((ok) => {
+        if (!ok) return
+        joinWithAuth(prof, null, addr, sname, { confirmed: true })
+          .then((res) => {
+            if (joinStarted(res)) showToast(t('Заходим на твой сервер…'))
+          })
+          .catch((e) => showLaunchError(e))
+      })
+      return
+    }
+    joinWithAuth(prof, null, addr, sname)
+      .then((res) => {
+        if (joinStarted(res)) showToast(t('Заходим на твой сервер…'))
+      })
+      .catch((e) => showLaunchError(e))
+  }
+
+  const card = (s: HostServer) => {
+    const ramCap = s.planRamMb || 0
+    const ramMb = s.ramMb || 0
+    const maxP = s.maxPlayers || s.planMaxPlayers || 0
+    const onl = s.playersOnline || 0
+    const running = s.status === 'RUNNING'
+    const addr = s.address || ''
+    const coreTag = [s.core, s.version].filter(Boolean).join(' ')
+    const planFree = !s.planPriceKopecks
+    // Полоса продажи: живые числа платных тарифов и одна кнопка. Верхний тариф
+    // её не показывает — предлагать там нечего.
+    const canUpsell = facts.ramHigh > 0 && (planFree || (s.planRamMb || 0) < facts.ramHigh)
+    const note =
+      s.expiresAt && fmtDate(s.expiresAt)
+        ? t('Оплачен до {date}', { date: fmtDate(s.expiresAt) })
+        : planFree && s.worldDeleteAt && fmtDate(s.worldDeleteAt)
+          ? t('Мир хранится до {date}', { date: fmtDate(s.worldDeleteAt) })
+          : undefined
+    return (
+      <div className="host-card hsx-card" data-sid={s.id} data-addr={addr} key={s.id}>
+        <HostScene
+          name={s.name || s.slug || t('Мой сервер')}
+          status={s.status || ''}
+          address={addr}
+          icon={s.icon}
+          free={planFree}
+          tag={coreTag}
+          note={note}
+          actions={
+            <>
+              {/* Карточка в списке: одна главная кнопка, «Управлять» и «Позвать».
+                  Перезапуск и остановка без подписей отсюда ушли в «Управлять» —
+                  там они с подписью и с подтверждением (приказ 23.09.2026). */}
+              {running ? (
+                <button className="btn lg primary host-join hsx-main" onClick={() => void joinServer(s)}>
+                  <Icon id="i-play" /> {t('Играть')}
+                </button>
+              ) : (
+                <button
+                  className="btn lg primary host-start hsx-main"
+                  disabled={s.status === 'STARTING' || s.status === 'INSTALLING'}
+                  onClick={() => void act(s.id, '/start', t('Запускаем сервер…'), t('Сервер запускается'))}
+                >
+                  <Icon id="i-play" /> {t('Запустить')}
+                </button>
+              )}
+              <button className="btn lg secondary host-manage-btn" onClick={() => setManageId(s.id)}>
+                <Icon id="i-server-cog" /> {t('Управлять')}
+              </button>
+              <div className="host-invite-wrap">
+                <button
+                  className="btn lg secondary host-invite"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setInviteFor(inviteFor === s.id ? null : s.id)
+                  }}
+                >
+                  <Icon id="i-users" /> {t('Позвать')}
+                </button>
+                {inviteFor === s.id ? (
+                  <div className="host-invite-pop" onClick={(e) => e.stopPropagation()}>
+                    <div className="host-invite-cap">{t('Кого позвать')}</div>
+                    {friends.length ? (
+                      friends.map((f) => (
+                        <button
+                          key={f.userId}
+                          className="host-invite-friend"
+                          onClick={() => void invite(f.userId, f.nickname || '', s)}
+                        >
+                          <Head nick={f.nickname} size={40} />
+                          <span className="host-invite-nick">{f.nickname || ''}</span>
+                          <span className={'host-invite-dot' + (f.online ? ' on' : '')}></span>
+                        </button>
+                      ))
+                    ) : (
+                      <button className="btn sm secondary hs-invite-empty" onClick={() => setScreen('friends')}>
+                        <Icon id="i-plus" /> {t('Найти друзей')}
+                      </button>
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            </>
+          }
+          stats={
+            <>
+              <HostStat
+                block={32}
+                big={
+                  <>
+                    {onl}
+                    {maxP ? <small> / {maxP}</small> : null}
+                  </>
+                }
+                small={t('игроков в сети')}
+                pct={maxP ? (onl / maxP) * 100 : null}
+              />
+              {/* ramMb у сервера — выделенная память, а не занятая (тип HostingServer
+                  на сайте): живой расход — только в «Управлять», из /stats. */}
+              {ramCap || ramMb ? <HostStat block={20} big={t('{n} ГБ', { n: planGb(ramCap || ramMb) })} small={t('памяти')} /> : null}
+              {canUpsell ? (
+                <HostStat
+                  block={1}
+                  big={planFree ? t('Тарифы') : s.planName || t('Тариф')}
+                  small={
+                    planFree && facts.minPrice > 0
+                      ? t('от {price} · до {ram} ГБ', { price: (facts.cheapest ? hostingPlanPrice(facts.cheapest.code) : null) ?? '', ram: planGb(facts.ramHigh) })
+                      : t('до {ram} ГБ', { ram: planGb(facts.ramHigh) })
+                  }
+                  onClick={() => setPicker({ mode: 'upgrade', serverId: s.id, currentCode: s.planCode, focus: 'paid' })}
+                />
+              ) : null}
+            </>
+          }
+        />
+      </div>
+    )
+  }
+
+  const manageServer = manageId ? list.find((s) => s.id === manageId) : null
+  if (manageServer) {
+    return (
+      <section className={'screen' + (on ? ' on' : '')} id="s-hosting">
+        <HostingManage
+          server={manageServer}
+          onBack={() => setManageId(null)}
+          onPlay={() => void joinServer(manageServer)}
+          onRefreshList={() => void load(true)}
+          onUpgrade={(sid, code) => setPicker({ mode: 'upgrade', serverId: sid, currentCode: code })}
+        />
+        {picker ? (
+          <HostPlanPicker
+            mode={picker.mode}
+            serverId={picker.serverId}
+            currentCode={picker.currentCode}
+            focus={picker.focus}
+            freeServer={null}
+            onOpenServer={(id) => setManageId(id)}
+            onClose={() => setPicker(null)}
+            onDone={() => setTimeout(() => void load(true), 1500)}
+          />
+        ) : null}
+      </section>
+    )
+  }
+
+  if (millida && remoteUiEnabled() && !remoteFailed) {
+    return (
+      <section className={'screen' + (on ? ' on' : '')} id="s-hosting">
+        <TopbarPortal>
+          <div className="tb-actions">
+            <InviteChip />
+            <BalancePill />
+            <button className="btn sm ghost" id="hostPanel" onClick={() => openExt('https://millida.net/hosting')}>
+              {t('Веб-панель')}
+              <Icon id="i-ext" />
+            </button>
+          </div>
+        </TopbarPortal>
+        <RemoteScreen
+          screen="hosting-servers"
+          onFail={() => setRemoteFailed(true)}
+          bridge={() =>
+            makeRemoteBridge({
+              navigate: (path) => {
+                const id = /^(?:\/[a-z]{2}(?:-[a-z]{2})?)?\/hosting\/s\/([\w-]+)$/i.exec(path)?.[1]
+                if (!id) return false
+                setManageId(id)
+                return true
+              },
+              join: (srv) => {
+                const known = list.find((x) => x.address === srv.address)
+                return joinServer(known ?? { id: srv.address, name: srv.name, address: srv.address, version: srv.version })
+              },
+            })
+          }
+        />
+      </section>
+    )
+  }
+
+  return (
+    <section className={'screen' + (on ? ' on' : '')} id="s-hosting">
+      {/* Заголовок «Хостинг» убран, действия и баланс — в верхней полосе рядом с
+          «← Лобби» (владелец 25.09.2026). */}
+      <TopbarPortal>
+        <div className="tb-actions">
+          <InviteChip />
+          {millida ? <BalancePill /> : null}
+          {view === 'list' && millida ? (
+            <button className="btn sm secondary" onClick={() => setPicker({ mode: 'create', focus: 'paid' })}>
+              <Icon id="i-plus" /> {t('Новый сервер')}
+            </button>
+          ) : null}
+          <button className="btn sm ghost" id="hostPanel" onClick={() => openExt('https://millida.net/hosting')}>
+            {t('Веб-панель')}
+            <Icon id="i-ext" />
+          </button>
+        </div>
+      </TopbarPortal>
+      <div id="hostBody">
+        {view === 'initial' || view === 'loading' ? <HostSkeleton /> : null}
+        {view === 'gate' ? (
+          // Сервер живёт в аккаунте Millida: обе дороги ведут на вход, после него
+          // человек вернётся сюда и выберет тариф по-настоящему.
+          <HostRoads paidId="hostLoginCta" freeId="hostLoginFree" onPaid={() => showLogin()} onFree={() => showLogin()} />
+        ) : null}
+        {view === 'error' ? (
+          <div className="card hs-state" data-err={err}>
+            <Icon id="i-alert" />
+            <b>{t('Серверы не загрузились')}</b>
+            <button className="btn sm secondary" id="hostRetry" onClick={() => void load()}>
+              <Icon id="i-restart" /> {t('Повторить')}
+            </button>
+          </div>
+        ) : null}
+        {view === 'empty' ? (
+          <HostRoads
+            paidId="hostCreate"
+            freeId="hostCreateFree"
+            onPaid={() => setPicker({ mode: 'create', focus: 'paid' })}
+            onFree={() => setPicker({ mode: 'create', focus: 'free' })}
+          />
+        ) : null}
+        {view === 'list' ? list.map(card) : null}
+      </div>
+
+      {picker ? (
+        <HostPlanPicker
+          mode={picker.mode}
+          serverId={picker.serverId}
+          currentCode={picker.currentCode}
+          focus={picker.focus}
+          freeServer={
+            picker.mode === 'create'
+              ? (list.find((s) => !s.planPriceKopecks) ?? null)
+              : null
+          }
+          onOpenServer={(id) => setManageId(id)}
+          onClose={() => setPicker(null)}
+          onDone={() => setTimeout(() => void load(true), 1500)}
+        />
+      ) : null}
+    </section>
+  )
+}

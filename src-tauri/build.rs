@@ -1,0 +1,98 @@
+use std::fs;
+
+/// Команды, которые нужны оверлею поверх игры (аудит 24.09.2026, S-01).
+/// Список собран по коду окна: src/screens/Overlay.tsx, OverlayChat и то, что
+/// они импортируют (чат друзей, сессия, аватары, акцент). Всё остальное оверлею
+/// недоступно, даже если в нём окажется чужой скрипт.
+const OVERLAY_COMMANDS: &[&str] = &[
+    "overlay_state",
+    "overlay_hide",
+    "overlay_ready",
+    "overlay_cleared",
+    "overlay_hit_areas",
+    "overlay_open",
+    "session_status",
+    "millida_api",
+    "head_avatar",
+    "open_url",
+    "ui_prefs",
+    "realtime_relay_state",
+];
+
+/// Те же правила разбора, что и в тесте registered_commands (src/lib.rs):
+/// список generate_handler! — единственный источник имён команд.
+fn registered_commands(src: &str) -> Vec<String> {
+    let start = src
+        .find("generate_handler![")
+        .expect("lib.rs must register its commands through tauri::generate_handler!");
+    let body = &src[start + "generate_handler![".len()..];
+    let end = body.find(']').expect("the generate_handler! list must be closed with ']'");
+    body[..end]
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .flat_map(|l| l.split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.rsplit("::").next())
+        .map(str::to_string)
+        .collect()
+}
+
+fn permission(cmd: &str) -> String {
+    format!("\"allow-{}\"", cmd.replace('_', "-"))
+}
+
+fn set(identifier: &str, description: &str, cmds: &[String]) -> String {
+    let list: Vec<String> = cmds.iter().map(|c| format!("  {}", permission(c))).collect();
+    format!(
+        "[[set]]\nidentifier = \"{identifier}\"\ndescription = \"{description}\"\npermissions = [\n{}\n]\n",
+        list.join(",\n")
+    )
+}
+
+const MAIN_THREAD_STACK: usize = 8 * 1024 * 1024;
+
+fn main() {
+    println!("cargo:rerun-if-env-changed=MILLIDA_MS_CLIENT_ID");
+    // media.rs reads it with option_env!: a release build with MEDIA_REMOTE=1 must not reuse an object built without it.
+    println!("cargo:rerun-if-env-changed=MEDIA_REMOTE");
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    // The release number lives in tauri.conf.json alone: stamping it into Cargo.toml changed the crate's
+    // metadata hash on every release, and with it the key of the incremental cache CI keeps between releases.
+    println!("cargo:rerun-if-changed=tauri.conf.json");
+    let conf: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string("tauri.conf.json").expect("tauri.conf.json")).expect("tauri.conf.json is not JSON");
+    let version = conf["version"].as_str().expect("tauri.conf.json has no version");
+    println!("cargo:rustc-env=MILLIDA_VERSION={version}");
+    // Tauri builds every async command's future on the main thread before a worker takes it, and the launch
+    // pipeline's futures put tens of KB per copy on the stack: Windows' default 1 MB main thread ran out on «Играть».
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/STACK:{}", MAIN_THREAD_STACK);
+    }
+
+    let src = fs::read_to_string("src/lib.rs").expect("src/lib.rs");
+    let all = registered_commands(&src);
+    let overlay: Vec<String> = OVERLAY_COMMANDS.iter().map(|c| c.to_string()).collect();
+    for c in &overlay {
+        assert!(all.contains(c), "OVERLAY_COMMANDS names {c}, but lib.rs does not register it");
+    }
+
+    // Файл генерируется из lib.rs: руками не править.
+    let toml = format!(
+        "# Сгенерировано build.rs из generate_handler! в src/lib.rs. Руками не править.\n\n{}\n{}",
+        set("main-commands", "Все команды ядра — только для главного окна", &all),
+        set("overlay-commands", "Команды, которые нужны оверлею поверх игры", &overlay),
+    );
+    fs::create_dir_all("permissions").expect("permissions dir");
+    let path = "permissions/app-commands.toml";
+    if fs::read_to_string(path).ok().as_deref() != Some(toml.as_str()) {
+        fs::write(path, &toml).expect("write permissions/app-commands.toml");
+    }
+
+    let names: &'static [&'static str] =
+        Box::leak(all.into_iter().map(|c| &*Box::leak(c.into_boxed_str())).collect::<Vec<_>>().into_boxed_slice());
+    tauri_build::try_build(
+        tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(names)),
+    )
+    .expect("tauri_build failed");
+}

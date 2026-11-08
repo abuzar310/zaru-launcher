@@ -1,0 +1,470 @@
+import { useEffect, useMemo, useState } from 'react'
+import { Icon } from '../components/Icon'
+import { Select } from '../components/Select'
+import { BuildIcon, IconPicker } from '../components/playhub/BuildIcon'
+import { hasTauri } from '../ipc/tauri'
+import { applyBuildTemplate, createProfile, deleteBuildTemplate, listBuildTemplates, setFpsBoost, setHorizon } from '../ipc/commands'
+import type { BuildTemplate } from '../ipc/commands'
+import { apiErrorText } from '../lib/apiError'
+import '../styles/pixel/build-extras.css'
+import { hardwareVideo } from '../lib/perfTier'
+import type { McVersion } from '../ipc/commands'
+import { track, trackFailure } from '../lib/telemetry'
+import { BUILD_NAME_MAX } from '../lib/format'
+import { randomIcon } from '../lib/buildIcon'
+import { useProfiles } from '../state/profiles'
+import { autoBuildName, takeNewBuildPreset } from '../state/newBuild'
+import { ensureMcVersionList, useMcVersionList } from '../state/mcVersionList'
+import type { JoinIntent } from '../state/newBuild'
+import { quickJoin } from '../lib/joinServer'
+import { closeModal, showToast, useUi } from '../state/ui'
+import { backdropClose } from '../lib/dismiss'
+import { pickVersionForServer } from '../lib/mcVersion'
+import { AUTO_LOADER_VERSION, hasLoaderVersions, useLoaderBuilds } from '../lib/loaderBuilds'
+import { useLoaderBlocks, versionTag } from '../lib/loaderSupport'
+import type { LoaderId } from '../lib/loaderSupport'
+import '../styles/pixel/newbuild.css'
+import { showReward } from '../components/reward/RewardReveal'
+import { PxIcon } from '../components/PxIcon'
+import { aiPresetFor } from '../lib/aiBuilder'
+import { openMilli } from '../state/milli'
+import { openHubBuild } from '../components/playhub/hubTab'
+import { tx, useT } from '../i18n'
+import { HorizonNewBuildRow, useHorizonFor } from '../components/build/HorizonBeta'
+
+/**
+ * «Новая сборка» (правки владельца 23.09.2026, 19:40): иконка сборки как в
+ * Modrinth, загрузчик с официальным знаком, версия — сеткой без горизонтальной
+ * прокрутки, «Снапшоты, бета, ванила» — переключателем. Загрузчик, который ядро не
+ * поставит на выбранную версию, неактивен и говорит почему.
+ */
+const LOADERS: { id: LoaderId; label: string; logo: string; sub?: string }[] = [
+  { id: 'vanilla', label: 'Vanilla', logo: '/loaders/vanilla.png', sub: 'без модов' },
+  { id: 'fabric', label: 'Fabric', logo: '/loaders/fabric.png', sub: 'косметика' },
+  { id: 'quilt', label: 'Quilt', logo: '/loaders/quilt.svg' },
+  { id: 'forge', label: 'Forge', logo: '/loaders/forge.svg' },
+  { id: 'neoforge', label: 'NeoForge', logo: '/loaders/neoforge.png' },
+  { id: 'legacyfabric', label: 'Legacy Fabric', logo: '/loaders/fabric.png' },
+]
+const DEFAULT_LOADER: LoaderId = 'fabric'
+/** Буст FPS ставит ядро (engine/game/fpsboost.rs) — моды есть под Fabric, Forge, NeoForge и Quilt. */
+const FPS_LOADERS: LoaderId[] = ['fabric', 'forge', 'neoforge', 'quilt']
+
+const asLoader = (v?: string | null): LoaderId =>
+  v === 'vanilla' || v === 'fabric' || v === 'quilt' || v === 'forge' || v === 'neoforge' || v === 'legacyfabric' ? v : DEFAULT_LOADER
+
+export function NewBuildModal() {
+  const t = useT()
+  const modal = useUi((s) => s.modals.nbModal)
+  const profiles = useProfiles((s) => s.profiles)
+  const [name, setName] = useState('')
+  const [nameTouched, setNameTouched] = useState(false)
+  const [ver, setVer] = useState('')
+  const [loader, setLoader] = useState<LoaderId>(DEFAULT_LOADER)
+  const [loaderVer, setLoaderVer] = useState(AUTO_LOADER_VERSION)
+  // Новая сборка — сразу со своей случайной иконкой, как в Modrinth App (владелец 10.10.2026).
+  const [icon, setIcon] = useState<string>(randomIcon)
+  const [pickIcon, setPickIcon] = useState(false)
+  const [fps, setFps] = useState(true)
+  const [horizon, setHorizonOn] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [join, setJoin] = useState<JoinIntent | null>(null)
+  const [query, setQuery] = useState('')
+  const [vanillaAsk, setVanillaAsk] = useState(false)
+  const [templates, setTemplates] = useState<BuildTemplate[]>([])
+  const [tpl, setTpl] = useState<BuildTemplate | null>(null)
+  const mcList = useMcVersionList((s) => s.list)
+  const mcListError = useMcVersionList((s) => s.error)
+  const showAll = useMcVersionList((s) => s.show)
+  const [verLoading, setVerLoading] = useState(false)
+
+  const kindOf = useMemo(() => new Map(mcList.map((v) => [v.id, v.kind])), [mcList])
+  const verKind = kindOf.get(ver) || 'release'
+  const blocks = useLoaderBlocks(ver, verKind, modal.open)
+  const lb = useLoaderBuilds(loader, ver, modal.open && !blocks[loader])
+  const horizonSt = useHorizonFor(ver, loader, modal.open)
+
+  // По умолчанию — только релизы; «Снапшоты и беты» добавляет снапшоты,
+  // pre-release, rc и старые beta/alpha из того же манифеста Mojang.
+  const shown = useMemo<McVersion[]>(() => {
+    const q = query.trim().toLowerCase()
+    return mcList.filter((v) => (showAll || v.kind === 'release') && (!q || v.id.toLowerCase().includes(q)))
+  }, [mcList, showAll, query])
+
+  const autoName = useMemo(
+    () =>
+      autoBuildName(
+        ver,
+        profiles.map((p) => p.name),
+      ),
+    [ver, profiles],
+  )
+  const shownName = nameTouched ? name : autoName
+
+  const loadVersions = (preferred?: string) => {
+    setVerLoading(true)
+    ensureMcVersionList()
+      .then(() => {
+        const rel = useMcVersionList
+          .getState()
+          .list.filter((v) => v.kind === 'release')
+          .map((v) => v.id)
+        const wanted = preferred ? pickVersionForServer(rel, [preferred]) : ''
+        setVer((cur) => wanted || cur || rel[0] || '')
+      })
+      .catch((e) => {
+        console.error('mc version list', e)
+        trackFailure('build_create', e, { step: 'versions' })
+        showToast(t('Версии Minecraft не загрузились'), 'error')
+      })
+      .finally(() => setVerLoading(false))
+  }
+
+  useEffect(() => {
+    if (!modal.open) return
+    const pre = takeNewBuildPreset()
+    setName(pre?.name || '')
+    setNameTouched(!!pre?.name)
+    setLoader(asLoader(pre?.loader))
+    setJoin(pre?.join || null)
+    setIcon(randomIcon())
+    setPickIcon(false)
+    setFps(true)
+    setHorizonOn(false)
+    setBusy(false)
+    setQuery('')
+    setVanillaAsk(false)
+    setLoaderVer(AUTO_LOADER_VERSION)
+    setTpl(null)
+    setTemplates([])
+    if (hasTauri())
+      listBuildTemplates()
+        .then(setTemplates)
+        .catch(() => setTemplates([]))
+    loadVersions(pre?.version)
+  }, [modal.open])
+
+  const pickTemplate = (x: BuildTemplate | null) => {
+    setTpl(x)
+    if (!x) return
+    setVer(x.version)
+    setLoader(asLoader(x.loader))
+    setLoaderVer(x.loaderVersion || AUTO_LOADER_VERSION)
+    if (!nameTouched) {
+      setName(x.name)
+      setNameTouched(true)
+    }
+  }
+
+  // Загрузчик стал недоступен на новой версии — берём Fabric, иначе Vanilla.
+  useEffect(() => {
+    if (!blocks[loader]) return
+    setLoader(!blocks.fabric ? 'fabric' : !blocks.legacyfabric ? 'legacyfabric' : 'vanilla')
+    setLoaderVer(AUTO_LOADER_VERSION)
+  }, [blocks, loader])
+
+  // Vanilla — только вместе со «Снапшоты, бета, ванила» (владелец 24.09.2026,
+  // 19:41): по умолчанию четыре загрузчика. Выключили — Vanilla меняем на Fabric.
+  const snapOff = !showAll
+  useEffect(() => {
+    if (!modal.open || !snapOff || loader !== 'vanilla' || blocks.fabric) return
+    setLoader('fabric')
+    setLoaderVer(AUTO_LOADER_VERSION)
+  }, [modal.open, snapOff, loader, blocks.fabric])
+  // Legacy Fabric takes Fabric's place on the old releases Fabric does not reach.
+  const loaders = LOADERS.filter((l) => l.id !== 'vanilla' || showAll || loader === 'vanilla')
+    .filter((l) => (l.id === 'legacyfabric' ? !!blocks.fabric : l.id !== 'fabric' || !blocks.fabric || !!blocks.legacyfabric))
+
+  if (!modal.open) return null
+  const close = () => closeModal('nbModal')
+
+  const create = () => {
+    if (busy || !ver || blocks[loader]) return
+    const nm = name.trim() || autoName
+    const withFps = fps && FPS_LOADERS.includes(loader)
+    if (!hasTauri()) {
+      showReward({ level: 'mid', items: [{ name: nm, art: <BuildIcon icon={icon} size={60} /> }], title: t('Сборка создана'), sub: nm })
+      useProfiles.setState((s) => ({
+        profiles: [...s.profiles, { name: nm, version: ver, fabric: loader === 'fabric', loader, icon }],
+      }))
+      close()
+      return
+    }
+    setBusy(true)
+    createProfile(nm, ver, loader === 'fabric', loader, icon, loaderVer || null)
+      .then(async (p) => {
+        track('build_create', { mc: ver, loader, loaderVersion: loaderVer || 'auto', fps: withFps ? 1 : 0 })
+        if (tpl)
+          void applyBuildTemplate(tpl.id, p.name)
+            .then((r) =>
+              r.failed.length
+                ? showToast(t('Из шаблона не встало: {list}', { list: r.failed.join('; ') }), 'error')
+                : showToast(t('Шаблон применён: {n} файлов', { n: r.installed.length }), 'ok'),
+            )
+            .catch((e) => showToast(apiErrorText(e, t('Не удалось применить шаблон')), 'error'))
+        if (withFps) await setFpsBoost(p.name, true, false, await hardwareVideo()).catch((e) => console.error('[new-build] fps', e))
+        if (horizon && horizonSt?.available)
+          await setHorizon(p.name, true).catch((e) => showToast(apiErrorText(e, t('Не удалось сохранить настройку')), 'error'))
+        await useProfiles.getState().refresh()
+        showReward({ level: 'mid', items: [{ name: p.name, art: <BuildIcon icon={icon} size={60} /> }], title: t('Сборка создана'), sub: p.name })
+        close()
+        if (!join) return
+        useProfiles.getState().setSelected(p.name)
+        void quickJoin(join.ip, join.name, join.licensed, [ver]).catch(() => {})
+      })
+      .catch((e) => {
+        setBusy(false)
+        trackFailure('build_create', nm.length >= 2 ? String(e).split(nm).join('<build>') : e, { step: 'create', mc: ver, loader })
+        showToast(t('Не удалось создать сборку: {error}', { error: tx(e) }), 'error')
+      })
+  }
+
+  const withLoaderVer = hasLoaderVersions(loader)
+  const verFailed = !mcList.length && !verLoading && !!mcListError
+
+  return (
+    <div
+      className={'modal-bg' + (modal.open ? ' open' : '') + (modal.vis ? ' vis' : '')}
+      id="nbModal"
+      {...backdropClose(close)}
+    >
+      <div className="modal nb-modal nb2">
+        <h3>{t('Новая сборка')}</h3>
+        {templates.length ? (
+          <div className="bx-tags" role="group" aria-label={t('Шаблон')}>
+            {templates.map((x) => (
+              <span key={x.id} className="bx-tpl">
+                <button type="button" className={'bx-tag' + (tpl?.id === x.id ? ' on' : '')} onClick={() => pickTemplate(tpl?.id === x.id ? null : x)}>
+                  {x.name} · {x.version}
+                </button>
+                <button
+                  type="button"
+                  className="bx-tag"
+                  aria-label={t('Удалить шаблон {name}', { name: x.name })}
+                  onClick={() =>
+                    void deleteBuildTemplate(x.id)
+                      .then(() => {
+                        setTemplates((l) => l.filter((y) => y.id !== x.id))
+                        if (tpl?.id === x.id) setTpl(null)
+                      })
+                      .catch((e) => showToast(apiErrorText(e, t('Не удалось удалить')), 'error'))
+                  }
+                >
+                  <Icon id="i-x" />
+                </button>
+              </span>
+            ))}
+          </div>
+        ) : null}
+        {vanillaAsk ? (
+          // Vanilla без Millida (владелец 24.09.2026, 19:42): предупреждаем сразу.
+          <div className="nb2-ask" role="alertdialog" aria-label={t('Внимание')}>
+            <div className="nb2-ask-box">
+              <Icon id="i-alert" />
+              <b>{t('Внимание')}</b>
+              <ul>
+                <li>{t('Не будет косметики Millida')}</li>
+                <li>{t('Не будет оптимизации и буста FPS')}</li>
+                <li>{t('Не поставить моды')}</li>
+              </ul>
+              <div className="nb2-ask-foot">
+                <button type="button" className="btn md primary" data-track="vanilla_keep_fabric" onClick={() => setVanillaAsk(false)}>
+                  {t('Оставить {loader}', { loader: (loader === 'fabric' ? 'Fabric' : LOADERS.find((x) => x.id === loader)?.label) ?? '' })}
+                </button>
+                <button
+                  type="button"
+                  className="btn md secondary"
+                  data-track="vanilla_confirm"
+                  onClick={() => {
+                    setVanillaAsk(false)
+                    setLoader('vanilla')
+                    setLoaderVer(AUTO_LOADER_VERSION)
+                  }}
+                >
+                  {t('Всё равно Vanilla')}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        <div className="nb2-head">
+          <button type="button" className="bi-edit" aria-label={t('Изменить иконку')} data-sound="open" onClick={() => setPickIcon(true)}>
+            <BuildIcon icon={icon} size={72} />
+            <span className="bi-edit-lab" aria-hidden="true">
+              <Icon id="i-edit" />
+              {t('Изменить')}
+            </span>
+          </button>
+          <div className="field nb-field nb2-name">
+            <label htmlFor="nbName">{t('Название')}</label>
+            <div className="input">
+              <input
+                id="nbName"
+                placeholder={autoName}
+                maxLength={BUILD_NAME_MAX}
+                value={shownName}
+                onChange={(e) => {
+                  setName(e.target.value)
+                  setNameTouched(true)
+                }}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="field nb-field">
+          <label>{t('Загрузчик')}</label>
+          <div className="nb2-loaders" style={{ gridTemplateColumns: 'repeat(' + loaders.length + ', minmax(0, 1fr))' }}>
+            {loaders.map((l) => {
+              const why = blocks[l.id]
+              return (
+                <button
+                  key={l.id}
+                  type="button"
+                  className={'nb2-lt' + (loader === l.id ? ' on' : '')}
+                  data-nbl={l.id}
+                  aria-pressed={loader === l.id}
+                  disabled={!!why}
+                  onClick={() => {
+                    if (l.id === 'vanilla' && loader !== 'vanilla') return setVanillaAsk(true)
+                    setLoader(l.id)
+                    setLoaderVer(AUTO_LOADER_VERSION)
+                  }}
+                >
+                  <img src={l.logo} alt="" draggable={false} />
+                  <b>{l.label}</b>
+                  <span>{why || (l.sub ? t(l.sub) : '')}</span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+
+        <div className="field nb-field">
+          <label className="nb2-vhead">
+            <span>{t('Версия Minecraft')}</span>
+            <span className="input nb2-search">
+              <Icon id="i-search" />
+              <input placeholder={t('Найти')} value={query} onChange={(e) => setQuery(e.target.value)} aria-label={t('Найти версию')} />
+            </span>
+            <span
+              className={'tgl sm' + (showAll ? ' on' : '')}
+              role="switch"
+              aria-checked={showAll}
+              aria-labelledby="nbSnapLab"
+              id="nbSnapshots"
+              onClick={() => useMcVersionList.getState().setShow(!showAll)}
+            ></span>
+            <span id="nbSnapLab" className="nb2-tgl-lab" onClick={() => useMcVersionList.getState().setShow(!showAll)}>
+              {t('Снапшоты, бета, ванила')}
+            </span>
+          </label>
+          {verFailed ? (
+            <button type="button" className="nb-retry" onClick={() => loadVersions()}>
+              <Icon id="i-alert" />
+              <span>{t('Нет списка версий')}</span>
+              <Icon id="i-restart" />
+            </button>
+          ) : verLoading && !mcList.length ? (
+            <div className="nb2-vgrid" aria-label={t('Загрузка')}>
+              {Array.from({ length: 18 }, (_, i) => (
+                <span key={i} className="skel nb2-ver-skel" />
+              ))}
+            </div>
+          ) : (
+            <div className="nb2-vgrid" role="listbox" aria-label={t('Версия Minecraft')}>
+              {shown.map((v) => {
+                const tag = versionTag(v.id, v.kind)
+                return (
+                  <button
+                    key={v.id}
+                    type="button"
+                    role="option"
+                    aria-selected={ver === v.id}
+                    className={'nb2-ver' + (ver === v.id ? ' on' : '') + (tag ? ' pre' : '')}
+                    onClick={() => {
+                      setVer(v.id)
+                      setLoaderVer(AUTO_LOADER_VERSION)
+                    }}
+                  >
+                    <b>{v.id}</b>
+                    {tag ? <span>{tag}</span> : null}
+                  </button>
+                )
+              })}
+              {!shown.length ? <span className="nb2-none">{t('Нет такой версии')}</span> : null}
+            </div>
+          )}
+        </div>
+
+        <div className="nb2-opts">
+          <div className="field nb-field">
+            <label>
+              <span>{t('Версия загрузчика')}</span>
+            </label>
+            {withLoaderVer && lb.loading ? (
+              <span className="skel nb-skel" aria-label={t('Загрузка')} />
+            ) : (
+              <Select
+                width="100%"
+                search
+                value={withLoaderVer ? loaderVer : ''}
+                options={withLoaderVer ? lb.options : []}
+                disabled={!withLoaderVer}
+                placeholder={withLoaderVer ? t('Рекомендуемая') : t('Не нужна')}
+                onChange={setLoaderVer}
+              />
+            )}
+          </div>
+          <div className={'nb2-fps' + (FPS_LOADERS.includes(loader) ? '' : ' off')}>
+            <Icon id="i-zap" />
+            <b>{t('Буст FPS')}</b>
+            <span
+              className={'tgl' + (fps && FPS_LOADERS.includes(loader) ? ' on' : '')}
+              role="switch"
+              aria-checked={fps && FPS_LOADERS.includes(loader)}
+              aria-label={t('Буст FPS')}
+              aria-disabled={!FPS_LOADERS.includes(loader)}
+              onClick={() => FPS_LOADERS.includes(loader) && setFps(!fps)}
+            ></span>
+          </div>
+        </div>
+        {horizonSt ? <HorizonNewBuildRow st={horizonSt} on={horizon} onChange={setHorizonOn} /> : null}
+
+        <div className="nb-foot">
+          <button
+            type="button"
+            className="btn md ghost"
+            id="nbAi"
+            data-track="ai_from_new_build"
+            disabled={busy}
+            onClick={() => {
+              close()
+              // Милли живёт в каталоге: ведём в «Ресурсы» и открываем её там.
+              openHubBuild()
+              openMilli({ preset: aiPresetFor(loader, ver), src: 'new_build' })
+            }}
+          >
+            <PxIcon name="sparkle" size={18} />
+            {t('Собрать с Милли')}
+          </button>
+          <button className="btn md secondary" id="nbCancel" data-sound="close" onClick={close}>
+            {t('Отмена')}
+          </button>
+          <button
+            className={'btn md primary nb-create' + (busy ? ' busy' : '')}
+            id="nbCreate"
+            disabled={busy || !ver || !!blocks[loader]}
+            aria-busy={busy}
+            onClick={create}
+          >
+            <span className="nb-create-lab">{t('Создать')}</span>
+            {busy ? <span className="spin nb-create-spin" /> : null}
+          </button>
+        </div>
+      </div>
+      {pickIcon ? <IconPicker icon={icon} onPick={setIcon} onClose={() => setPickIcon(false)} /> : null}
+    </div>
+  )
+}

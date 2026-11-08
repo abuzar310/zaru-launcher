@@ -1,0 +1,224 @@
+import { useEffect, useState } from 'react'
+import { Icon } from './Icon'
+import { fmtSize } from '../lib/format'
+import { hasTauri } from '../ipc/tauri'
+import { copyText } from '../lib/clipboard'
+import { backdropClose } from '../lib/dismiss'
+import { showToast } from '../state/ui'
+import { setPackVisibility, shareProfile, unshareProfile, type PackVisibility, type SharedPack } from '../ipc/commands'
+import '../styles/pixel/build-extras.css'
+import { apiErrorText } from '../lib/apiError'
+import { useT } from '../i18n'
+
+interface Props {
+  profile: string
+  onClose: () => void
+}
+
+const sharedKey = (profile: string) => 'm-shared-' + profile
+
+function wasShared(profile: string): boolean {
+  try {
+    return localStorage.getItem(sharedKey(profile)) === '1'
+  } catch {
+    return false
+  }
+}
+
+const visKey = (profile: string) => 'm-shared-vis-' + profile
+
+function readVis(profile: string): PackVisibility {
+  try {
+    const v = localStorage.getItem(visKey(profile))
+    return v === 'friends' || v === 'private' ? v : 'link'
+  } catch {
+    return 'link'
+  }
+}
+
+function markShared(profile: string, on: boolean) {
+  try {
+    if (on) localStorage.setItem(sharedKey(profile), '1')
+    else localStorage.removeItem(sharedKey(profile))
+  } catch (e) {
+    console.warn('[share] remember', e)
+  }
+}
+
+/// Publishing a build: the code and the link are the whole point, so they are
+/// the first thing on screen once it lands.
+export function SharePackModal({ profile, onClose }: Props) {
+  const t = useT()
+  const [summary, setSummary] = useState('')
+  const [pack, setPack] = useState<SharedPack | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [revoked, setRevoked] = useState(false)
+  const [shared, setShared] = useState(() => wasShared(profile))
+  const [vis, setVis] = useState<PackVisibility>(() => readVis(profile))
+  const [visBusy, setVisBusy] = useState(false)
+
+  const pickVis = (code: string, next: PackVisibility) => {
+    if (next === vis || visBusy) return
+    setVisBusy(true)
+    setPackVisibility(code, next)
+      .then((v) => {
+        setVis(v)
+        try {
+          localStorage.setItem(visKey(profile), v)
+        } catch {
+          /* the choice lives on the server; this only preselects it next time */
+        }
+      })
+      .catch((e) => showToast(apiErrorText(e, t('Не удалось сменить доступ')), 'error'))
+      .finally(() => setVisBusy(false))
+  }
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  // Always sends the build as it is now. The server keeps one code per build and
+  // replaces what is behind it, so a link already sent to friends stays valid and
+  // shows the current mods; showing the stored code without publishing did not.
+  const publish = () => {
+    if (!hasTauri()) return
+    setBusy(true)
+    const update = shared || !!pack
+    shareProfile(profile, summary.trim() || undefined)
+      .then((fresh) => {
+        setRevoked(false)
+        setPack(fresh)
+        setShared(true)
+        // A new code starts open to anyone; the author's earlier choice is put back on it.
+        if (vis !== 'link') void setPackVisibility(fresh.code, vis).catch(() => setVis('link'))
+        markShared(profile, true)
+        if (update) showToast(t('Друзья получат новую версию при следующем запуске'), 'ok')
+      })
+      .catch((e) => {
+        console.error('shareProfile', e)
+        showToast(apiErrorText(e, t('Не получилось выдать код')), 'error')
+      })
+      .finally(() => setBusy(false))
+  }
+
+  return (
+    <div className="modal-bg open vis" style={{ zIndex: 215 }} {...backdropClose(onClose)}>
+      <div className="modal mw-sm">
+        <div className="crash-head">
+          <span className="crash-ic ok">
+            <Icon id="i-link" />
+          </span>
+          <div>
+            <h3>{t('Поделиться сборкой')}</h3>
+            <div className="sub" style={{ marginTop: '2px' }}>
+              «{profile}»
+            </div>
+          </div>
+        </div>
+
+        {pack ? (
+          <>
+            <div className="share-code">{pack.code.slice(0, 4) + '-' + pack.code.slice(4)}</div>
+            <p className="faint-note" style={{ textAlign: 'center' }}>
+              {t('{n} файлов', { n: pack.files }) + (pack.sizeBytes ? ' · ' + fmtSize(pack.sizeBytes) : '') + ' · ' + t('Импорт → По коду')}
+            </p>
+            <div className="wm-row" style={{ marginTop: '12px' }}>
+              <div className="input sm" style={{ flex: 1 }}>
+                <input readOnly value={pack.url} />
+              </div>
+              <button
+                className="btn sm secondary"
+                onClick={() => {
+                  void copyText(pack.url)
+                  showToast(t('Ссылка скопирована'), 'ok')
+                }}
+              >
+                <Icon id="i-copy" /> {t('Ссылка')}
+              </button>
+            </div>
+            <div className="bx-tags" role="radiogroup" aria-label={t('Кто может открыть')}>
+              {(
+                [
+                  ['link', t('Все с кодом')],
+                  ['friends', t('Только друзья')],
+                  ['private', t('Только я')],
+                ] as [PackVisibility, string][]
+              ).map(([id, label]) => (
+                <button key={id} type="button" role="radio" aria-checked={vis === id} className={'bx-tag' + (vis === id ? ' on' : '')} disabled={visBusy} onClick={() => pickVis(pack.code, id)}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            {pack.skipped.length ? (
+              <p className="faint-note" style={{ marginTop: '10px' }}>
+                {t('Не поедут ({n}): {list}', { n: pack.skipped.length, list: pack.skipped.slice(0, 4).join(', ') + (pack.skipped.length > 4 ? '…' : '') })}
+              </p>
+            ) : null}
+            {/* Код живёт, пока автор его не отозвал: без этой кнопки сборку,
+                которой поделились по ошибке, нельзя было убрать из доступа. */}
+            <button
+              className="btn sm ghost"
+              style={{ marginTop: '10px' }}
+              disabled={busy || revoked}
+              onClick={() => {
+                setBusy(true)
+                unshareProfile(pack.code)
+                  .then(() => {
+                    setRevoked(true)
+                    setPack(null)
+                    setShared(false)
+                    markShared(profile, false)
+                    showToast(t('Код отозван — по нему сборка больше не ставится'), 'ok')
+                  })
+                  .catch((e) => showToast('' + e, 'error'))
+                  .finally(() => setBusy(false))
+              }}
+            >
+              {revoked ? t('Код отозван') : t('Отозвать код')}
+            </button>
+          </>
+        ) : (
+          <>
+            <div className="input sm" style={{ marginTop: '12px' }}>
+              <input
+                placeholder={t('Описание — можно пусто')}
+                maxLength={300}
+                value={summary}
+                onChange={(e) => setSummary(e.target.value)}
+              />
+            </div>
+          </>
+        )}
+
+        <div style={{ display: 'flex', gap: '10px', marginTop: '18px' }}>
+          {pack ? (
+            <button
+              className="btn md primary"
+              style={{ flex: 1 }}
+              onClick={() => {
+                void copyText(pack.code)
+                showToast(t('Код скопирован'), 'ok')
+              }}
+            >
+              <Icon id="i-copy" /> {t('Код')}
+            </button>
+          ) : (
+            <button className="btn md primary" style={{ flex: 1 }} disabled={busy} onClick={publish}>
+              {busy ? t('Готовим…') : shared ? t('Обновить у друзей') : t('Получить код')}
+            </button>
+          )}
+          {pack ? (
+            <button className="btn md secondary" data-track="share_update_friends" disabled={busy} onClick={publish}>
+              <Icon id="i-restart" /> {busy ? t('Готовим…') : t('Обновить у друзей')}
+            </button>
+          ) : null}
+          <button className="btn md secondary" onClick={onClose}>
+            {t('Закрыть')}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}

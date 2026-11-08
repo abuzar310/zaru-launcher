@@ -1,0 +1,420 @@
+// Mod update check and install: the sha1 of installed files goes to Modrinth, the new version is downloaded and checked by hash. The old file is deleted only after the swap worked.
+use crate::engine::*;
+use futures::StreamExt;
+use md5::Digest;
+use serde_json::Value;
+use sha1::Sha1;
+use std::path::PathBuf;
+
+#[derive(Clone, serde::Serialize)]
+pub struct UpdateInfo {
+    pub file_name: String,
+    pub new_version_id: String,
+    pub new_version_number: String,
+    pub old_version_number: String,
+    pub title: String,
+    /// The author's notes for the new version, shown before «Обновить всё».
+    pub changelog: String,
+}
+
+const CHANGELOG_MAX_CHARS: usize = 4000;
+
+fn changelog_of(v: &Value) -> String {
+    let text = v["changelog"].as_str().unwrap_or("").trim();
+    if text.chars().count() <= CHANGELOG_MAX_CHARS {
+        return text.to_string();
+    }
+    text.chars().take(CHANGELOG_MAX_CHARS).collect::<String>() + "…"
+}
+
+/// A catalogue pack ships its mods as one tested set on a pinned loader, and it
+/// changes them only with a version of its own. Modrinth picks the newest file by
+/// game version and loader name, never by loader version, so a bulk update pulled
+/// mods that ask for a newer NeoForge than the pack runs, and the pack stopped
+/// starting until it was reinstalled.
+fn mods_update_freely(kind: &str, settings: &Value) -> bool {
+    kind != "mod" || !catalog_pack_settings(settings)
+}
+
+fn pinned(profile: &str, e: &ContentEntry) -> bool {
+    is_content_locked(profile, &e.kind, &e.project_id, &e.file_name)
+}
+
+/// What Modrinth's two bulk answers say about one installed file. `newest` is
+/// its newest file of any channel, `steady` its newest release.
+#[derive(Debug, PartialEq)]
+enum Step<'a> {
+    Take(&'a Value),
+    /// The two answers disagree and neither is the installed file: which one is
+    /// the update depends on the channel of the installed file.
+    Ask,
+}
+
+fn steady_update<'a>(installed_id: &str, newest: Option<&'a Value>, steady: Option<&'a Value>) -> Option<Step<'a>> {
+    let id = |v: &Value| v["id"].as_str().unwrap_or("").to_string();
+    match (newest, steady) {
+        (None, None) => None,
+        (Some(v), None) | (None, Some(v)) => Some(Step::Take(v)),
+        (Some(n), Some(s)) => Some(if id(n) == id(s) || id(n) == installed_id {
+            Step::Take(n)
+        } else if id(s) == installed_id {
+            // On the newest release: the beta above it is not an update.
+            Step::Take(s)
+        } else {
+            Step::Ask
+        }),
+    }
+}
+
+/// Resolves the update of every file in two bulk sha1 requests; entries without
+/// a stored hash, and the few whose channel decides the answer, fall back to
+/// per-project lookups. An update stays on the channel the file is on, see
+/// `pick_update`: «Обновить всё» used to move a release to the newest beta.
+async fn latest_versions(
+    entries: &[ContentEntry],
+    game_version: &str,
+    loaders: &[String],
+    bridge: &[String],
+) -> std::collections::HashMap<String, Value> {
+    let mut out: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let hashed: Vec<&ContentEntry> = entries.iter().filter(|e| !e.sha1.is_empty()).collect();
+    let hashes: Vec<String> = hashed.iter().map(|e| e.sha1.to_lowercase()).collect();
+    // Modrinth answers the bulk request with the newest file of any named
+    // loader, so asking for the bridge too turned a Forge mod into its newer
+    // Fabric build. Only the build's own loader is asked here; bridged jars it
+    // does not answer fall through to the per-project pick, own loader first.
+    let newest = bulk_latest_by_hash(&hashes, game_version, loaders, &[]).await;
+    let steady = bulk_latest_by_hash(&hashes, game_version, loaders, &["release"]).await;
+    for e in &hashed {
+        let key = e.sha1.to_lowercase();
+        if let Some(Step::Take(v)) = steady_update(&e.version_id, newest.get(&key), steady.get(&key)) {
+            out.insert(e.file_name.clone(), v.clone());
+        }
+    }
+    let rest: Vec<(String, String, String)> = entries
+        .iter()
+        .filter(|e| !out.contains_key(&e.file_name))
+        .map(|e| (e.file_name.clone(), e.project_id.clone(), e.version_id.clone()))
+        .collect();
+    if !rest.is_empty() {
+        let gv = game_version.to_string();
+        let ld = loaders.to_vec();
+        let br = bridge.to_vec();
+        let found: Vec<Option<(String, Value)>> = futures::stream::iter(rest.into_iter().map(|(fname, pid, installed)| {
+            let gv = gv.clone();
+            let ld = ld.clone();
+            let br = br.clone();
+            async move { update_version_bridged(&pid, &installed, &gv, &ld, &br).await.ok().map(|v| (fname, v)) }
+        }))
+        .buffer_unordered(8)
+        .collect()
+        .await;
+        for (fname, v) in found.into_iter().flatten() {
+            out.insert(fname, v);
+        }
+    }
+    out
+}
+
+pub async fn check_updates(profile: String, kind: String) -> Result<Vec<UpdateInfo>, String> {
+    if !mods_update_freely(&kind, &profile_settings(&profile)) {
+        return Ok(vec![]);
+    }
+    let prof = load_profiles().into_iter().find(|p| p.name == profile);
+    let gv = prof.as_ref().map(|p| p.version.clone()).unwrap_or_default();
+    let loader_id = prof.map(|p| p.loader_id()).unwrap_or_else(|| "vanilla".into());
+    let loaders = modrinth_loaders(&loader_id, &kind);
+    let bridge = bridge_loaders(&profile, &loader_id, &kind);
+    let entries: Vec<ContentEntry> = load_content_manifest(&profile)
+        .into_iter()
+        .filter(|e| e.kind == kind && !e.project_id.is_empty())
+        .collect();
+    if entries.is_empty() {
+        return Ok(vec![]);
+    }
+    let latest = latest_versions(&entries, &gv, &loaders, &bridge).await;
+    let mut out = vec![];
+    for e in entries {
+        // A pack's load-bearing Fabric API is pinned to what it shipped: a newer
+        // one on Modrinth installs by loader tag yet breaks the pack's bridge at
+        // world load, so it is never offered as an update here.
+        if fabric_api_pinned(&profile, &bridge, &e.project_id) || pinned(&profile, &e) {
+            continue;
+        }
+        let Some(v) = latest.get(&e.file_name) else { continue };
+        let nid = v["id"].as_str().unwrap_or("");
+        if !nid.is_empty() && nid != e.version_id {
+            out.push(UpdateInfo {
+                file_name: e.file_name,
+                new_version_id: nid.to_string(),
+                new_version_number: v["version_number"].as_str().unwrap_or("").to_string(),
+                old_version_number: e.version_number,
+                title: e.title,
+                changelog: changelog_of(v),
+            });
+        }
+    }
+    Ok(out)
+}
+
+async fn apply_update(profile: &str, kind: &str, file_name: &str, ver: &Value) -> Result<String, String> {
+    let project = ver["project_id"].as_str().unwrap_or("").to_string();
+    let project = if project.is_empty() {
+        load_content_manifest(profile)
+            .into_iter()
+            .find(|e| e.kind == kind && e.file_name == file_name)
+            .map(|e| e.project_id)
+            .unwrap_or_default()
+    } else {
+        project
+    };
+    if project.is_empty() {
+        return Err("Файл не привязан к Modrinth".into());
+    }
+    let dir = profile_dir(profile).join(content_dir(kind));
+    let file_name = safe_file_name(file_name)?;
+    let off = safe_child(&dir, &format!("{}.disabled", file_name))?;
+    let on = safe_child(&dir, &file_name)?;
+    let was_disabled = off.exists() && !on.exists();
+    let newname = install_project_version(profile, kind, &project, ver).await?;
+    // A new version may bring a requirement the old one did not have (Advanced
+    // Loot Info 2 needs ACI); swapping the jar alone left a build that stops on
+    // the loader's list of missing mods.
+    let missed = install_required(&ctx_of(profile, kind), mr_deps(ver)).await;
+    if !missed.is_empty() {
+        eprintln!("[update] {}: не встали зависимости новой версии: {}", newname, missed.join("; "));
+    }
+    if newname != file_name {
+        let mut held = false;
+        for cand in [on, off] {
+            // Deletes the old mod file from the same modpack after the new version is installed.
+            if cand.exists() && std::fs::remove_file(&cand).is_err() {
+                held = true;
+            }
+        }
+        // A running game holds the old jar open; left alone, both versions would load next time.
+        if held {
+            queue_delete(profile, kind, &file_name)?;
+        }
+        manifest_remove(profile, kind, &file_name);
+    }
+    if was_disabled { let _ = toggle_content(profile, kind, &newname, false); }
+    Ok(newname)
+}
+
+pub async fn update_content(profile: String, kind: String, file_name: String) -> Result<String, String> {
+    let entry = load_content_manifest(&profile).into_iter()
+        .find(|e| e.kind == kind && e.file_name == file_name)
+        .ok_or("Запись в манифесте не найдена")?;
+    if entry.project_id.is_empty() { return Err("Файл не привязан к Modrinth".into()); }
+    let prof = load_profiles().into_iter().find(|p| p.name == profile);
+    let gv = prof.as_ref().map(|p| p.version.clone()).unwrap_or_default();
+    let loader_id = prof.map(|p| p.loader_id()).unwrap_or_else(|| "vanilla".into());
+    let loaders = modrinth_loaders(&loader_id, &kind);
+    let bridge = bridge_loaders(&profile, &loader_id, &kind);
+    if fabric_api_pinned(&profile, &bridge, &entry.project_id) {
+        return Err("Fabric API этой сборки закреплён под неё — обновлять его отдельно нельзя.".into());
+    }
+    if pinned(&profile, &entry) {
+        return Err("Версия этого файла закреплена — сними замок, чтобы обновить".into());
+    }
+    let ver = update_version_bridged(&entry.project_id, &entry.version_id, &gv, &loaders, &bridge).await
+        .map_err(|e| format!("{}: {}", if entry.title.is_empty() { file_name.clone() } else { entry.title.clone() }, e))?;
+    apply_update(&profile, &kind, &file_name, &ver).await
+}
+
+/// Resolves versions once for the whole batch instead of per file.
+pub async fn update_all(profile: String, kind: String) -> Result<u32, String> {
+    if !mods_update_freely(&kind, &profile_settings(&profile)) {
+        return Ok(0);
+    }
+    let prof = load_profiles().into_iter().find(|p| p.name == profile);
+    let gv = prof.as_ref().map(|p| p.version.clone()).unwrap_or_default();
+    let loader_id = prof.map(|p| p.loader_id()).unwrap_or_else(|| "vanilla".into());
+    let loaders = modrinth_loaders(&loader_id, &kind);
+    let bridge = bridge_loaders(&profile, &loader_id, &kind);
+    let entries: Vec<ContentEntry> = load_content_manifest(&profile)
+        .into_iter()
+        .filter(|e| e.kind == kind && !e.project_id.is_empty())
+        .collect();
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let latest = latest_versions(&entries, &gv, &loaders, &bridge).await;
+    let ids: Vec<String> = entries.iter().map(|e| e.project_id.clone()).collect();
+    warm_projects_meta(&ids).await;
+    let mut n = 0;
+    for e in entries {
+        if fabric_api_pinned(&profile, &bridge, &e.project_id) || pinned(&profile, &e) {
+            continue;
+        }
+        let Some(v) = latest.get(&e.file_name) else { continue };
+        let nid = v["id"].as_str().unwrap_or("");
+        if nid.is_empty() || nid == e.version_id {
+            continue;
+        }
+        if apply_update(&profile, &kind, &e.file_name, v).await.is_ok() {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+pub fn content_exts(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "mod" => &["jar", "zip", "litemod"],
+        _ => &["zip"],
+    }
+}
+
+pub async fn pick_content_files(kind: String) -> Result<Vec<String>, String> {
+    let exts = content_exts(&kind);
+    let (filter, title) = match kind.as_str() {
+        "mod" => (crate::engine::ui("Моды"), crate::engine::ui("Выбери моды")),
+        "resourcepack" => (crate::engine::ui("Ресурспаки"), crate::engine::ui("Выбери ресурспаки")),
+        "datapack" => (crate::engine::ui("Дата-паки"), crate::engine::ui("Выбери дата-паки")),
+        "shader" => (crate::engine::ui("Шейдеры"), crate::engine::ui("Выбери шейдеры")),
+        _ => (crate::engine::ui("Файлы"), crate::engine::ui("Выбери файлы")),
+    };
+    let picked = pick_files(dialog().add_filter(filter, exts).set_title(title)).await.unwrap_or_default();
+    grant_user_files(&picked);
+    Ok(picked.iter().map(|p| p.to_string_lossy().to_string()).collect())
+}
+
+/// Файлы, которые игрок сам отдал лаунчеру: выбрал в системном диалоге или
+/// перетащил в окно. `add_local_file` копирует только их — путь, придуманный
+/// страницей (XSS, UNC-путь `\\host\share` ради NTLM), в сборку не попадёт
+/// (аудит 24.09.2026, CORE-4).
+fn user_files() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+const MAX_USER_FILES: usize = 1024;
+
+pub fn grant_user_files(paths: &[PathBuf]) {
+    let mut set = user_files().lock().unwrap_or_else(|e| e.into_inner());
+    if set.len() + paths.len() > MAX_USER_FILES {
+        set.clear();
+    }
+    set.extend(paths.iter().take(MAX_USER_FILES).cloned());
+}
+
+/// Разрешение одноразовое: файл, который уже скопировали, второй раз по тому же
+/// пути без нового выбора не возьмётся.
+fn take_user_file(path: &std::path::Path) -> bool {
+    user_files().lock().unwrap_or_else(|e| e.into_inner()).remove(path)
+}
+
+fn has_content_ext(kind: &str, path: &std::path::Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    content_exts(kind).contains(&ext.as_str())
+}
+
+pub async fn add_local_file(profile: String, kind: String, src: String) -> Result<String, String> {
+    let srcp = PathBuf::from(&src);
+    if !has_content_ext(&kind, &srcp) {
+        return Err("Файл такого типа в сборку не добавить".into());
+    }
+    if !take_user_file(&srcp) {
+        return Err("Выбери файл кнопкой «С диска» или перетащи его в окно".into());
+    }
+    let meta = std::fs::metadata(&srcp).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("Это не файл".into());
+    }
+    let fname = safe_file_name(&srcp.file_name().ok_or("нет имени файла")?.to_string_lossy())?;
+    if kind == "mod" {
+        if let Some(pin) = loader_pin(&profile) {
+            if let Some(range) = file_loader_shortfall(&srcp, &fname, &pin) {
+                return Err(loader_too_old_text(&fname, &pin, &range));
+            }
+        }
+    }
+    let dir = profile_dir(&profile).join(content_dir(&kind));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dest = safe_child(&dir, &fname)?;
+    // A mod of the same name may be a hard link into the shared store.
+    copy_replacing(&srcp, &dest).map_err(|e| e.to_string())?;
+    // sha1 lookup identifies the file on Modrinth when possible
+    let bytes = std::fs::read(&dest).map_err(|e| e.to_string())?;
+    let mut h = Sha1::new(); h.update(&bytes);
+    let sha1hex: String = h.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+    // Recognizes a file added by hand: its sha1 goes to api.modrinth.com.
+    if let Ok(v) = get_json(&format!("https://api.modrinth.com/v2/version_file/{}?algorithm=sha1", sha1hex)).await {
+        if let Some(pid) = v["project_id"].as_str() {
+            let (pidc, title, icon, summary) = fetch_project_meta(pid).await;
+            let file = v["files"].as_array()
+                .and_then(|fs| fs.iter().find(|f| f["hashes"]["sha1"].as_str() == Some(&sha1hex)).or_else(|| fs.first()));
+            manifest_upsert(&profile, ContentEntry {
+                kind: kind.clone(),
+                file_name: fname.clone(),
+                project_id: pidc,
+                version_id: v["id"].as_str().unwrap_or("").to_string(),
+                version_number: v["version_number"].as_str().unwrap_or("").to_string(),
+                title, icon_url: icon, description: summary,
+                author: v["author_id"].as_str().unwrap_or("").to_string(),
+                download_url: file.and_then(|f| f["url"].as_str()).unwrap_or("").to_string(),
+                sha1: sha1hex.clone(),
+                sha512: file.and_then(|f| f["hashes"]["sha512"].as_str()).unwrap_or("").to_string(),
+                file_size: file.and_then(|f| f["size"].as_u64()).unwrap_or(0),
+            });
+        }
+    }
+    Ok(fname)
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// (installed id, newest of any channel, newest release) -> what the bulk answers settle.
+    #[test]
+    fn two_bulk_answers_settle_most_files_without_a_lookup() {
+        let v = |id: &str| json!({ "id": id });
+        let (beta, release, old) = (v("0.8.15-beta.1"), v("0.8.14"), v("0.8.13"));
+        assert_eq!(steady_update("0.8.14", Some(&beta), Some(&release)), Some(Step::Take(&release)), "on the newest release: no move to the beta");
+        assert_eq!(steady_update("0.8.15-beta.1", Some(&beta), Some(&release)), Some(Step::Take(&beta)), "on the newest beta: no move back to the release");
+        assert_eq!(steady_update("0.8.13", Some(&release), Some(&release)), Some(Step::Take(&release)), "one answer: a plain update");
+        assert_eq!(steady_update("0.8.13", Some(&beta), Some(&release)), Some(Step::Ask), "behind both: the channel of the installed file decides");
+        assert_eq!(steady_update("b1", Some(&beta), None), Some(Step::Take(&beta)), "no release for this build: the project ships betas only");
+        assert_eq!(steady_update("x", None, Some(&old)), Some(Step::Take(&old)));
+        assert_eq!(steady_update("x", None, None), None, "Modrinth does not know the file: per-project lookup");
+    }
+
+    /// (content kind, build settings) -> are its files offered as updates.
+    #[test]
+    fn a_catalogue_pack_keeps_the_mods_it_shipped() {
+        let pack = json!({ "catalogPackSlug": "aeronautics" });
+        let own = json!({ "ramMb": 6144 });
+        let cases: [(&str, &serde_json::Value, bool, &str); 5] = [
+            ("mod", &pack, false, "All of Aeronautics: Quark 487 and Almanac 1.26 asked NeoForge newer than the pack's 21.1.248"),
+            ("mod", &own, true, "a build the player assembled updates as before"),
+            ("mod", &json!({ "catalogPackSlug": "" }), true, "an empty slug is not a catalogue pack"),
+            ("resourcepack", &pack, true, "resource packs do not load against the loader version"),
+            ("shader", &pack, true, "shader packs do not load against the loader version"),
+        ];
+        for (kind, settings, want, why) in cases {
+            assert_eq!(mods_update_freely(kind, settings), want, "{kind} / {settings}: {why}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod user_file_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_granted_file_of_the_right_type_passes_and_only_once() {
+        let picked = PathBuf::from("/tmp/millida-test/picked-mod.jar");
+        assert!(!take_user_file(&picked), "без выбора путь не разрешён");
+        grant_user_files(std::slice::from_ref(&picked));
+        assert!(take_user_file(&picked));
+        assert!(!take_user_file(&picked), "разрешение одноразовое");
+        assert!(has_content_ext("mod", &picked));
+        assert!(!has_content_ext("mod", std::path::Path::new("/etc/passwd")));
+        assert!(!has_content_ext("shader", &picked));
+    }
+}

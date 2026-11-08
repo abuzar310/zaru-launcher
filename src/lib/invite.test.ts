@@ -1,0 +1,97 @@
+import { describe, expect, test } from 'bun:test'
+import { INVITE_PREFIX, encodeInvite, isServerAddr, joinPageUrl, parseInvite } from './invite'
+
+// Значение уходит в кнопку Discord-активности, которую видят посторонние:
+// любой адрес, который смог бы утащить клик на другой хост, обязан отсеяться.
+const CASES: Array<[string, string | null, boolean, string]> = [
+  ['play.millida.net', 'Мой сервер', true, 'обычный домен'],
+  ['play.millida.net:25577', null, true, 'домен с портом'],
+  ['192.0.2.30:25565', null, true, 'ip с портом'],
+  ['', null, false, 'пустой адрес'],
+  ['evil.com/../..', null, false, 'путь в адресе'],
+  ['evil.com?x=1', null, false, 'query в адресе'],
+  ['https://evil.com', null, false, 'схема в адресе'],
+  ['evil.com#frag', null, false, 'якорь в адресе'],
+  ['play.millida.net:25565 evil', null, false, 'пробел и второй хост'],
+]
+
+describe('joinPageUrl', () => {
+  for (const [addr, name, ok, why] of CASES) {
+    test(`${why}: ${addr || '<пусто>'}`, () => {
+      const url = joinPageUrl(addr, name)
+      if (!ok) {
+        expect(url).toBe('')
+        return
+      }
+      expect(url.startsWith('https://millida.net/join?')).toBe(true)
+      expect(new URL(url).searchParams.get('addr')).toBe(addr)
+    })
+  }
+
+  test('имя сервера не подменяет адрес и не тащит разметку', () => {
+    const url = joinPageUrl('play.millida.net', '"><b>hack')
+    const q = new URL(url).searchParams
+    expect(q.get('addr')).toBe('play.millida.net')
+    expect(url).not.toContain('<b>')
+    expect(q.get('name')).toBe('"><b>hack')
+  })
+
+  test('имя, равное адресу, не дублируется в ссылке', () => {
+    expect(joinPageUrl('play.millida.net', 'play.millida.net')).toBe(
+      'https://millida.net/join?addr=play.millida.net',
+    )
+  })
+})
+
+// Приглашение из чата шлётся на любой сервер, не только на millida-хостинг:
+// адрес — единственная проверка, и она обязана быть той же, что у ссылки.
+describe('isServerAddr', () => {
+  const ADDRS: Array<[string, boolean, string]> = [
+    ['hypixel.net', true, 'чужой сервер'],
+    ['mc.example.co.uk:25565', true, 'чужой сервер с портом'],
+    ['play.millida.net', true, 'свой сервер'],
+    [' play.millida.net ', true, 'пробелы по краям обрезаются'],
+    ['', false, 'пустой адрес'],
+    ['-bad.example.net', false, 'дефис в начале'],
+    ['https://evil.com', false, 'схема в адресе'],
+    ['evil.com/join', false, 'путь в адресе'],
+  ]
+  for (const [addr, ok, why] of ADDRS) {
+    test(`${why}: ${addr || '<пусто>'}`, () => {
+      expect(isServerAddr(addr)).toBe(ok)
+    })
+  }
+})
+
+describe('encodeInvite', () => {
+  test('приглашение переживает кодирование и разбор', () => {
+    const back = parseInvite(encodeInvite('mc.example.net:25566', 'Сервер друга'))
+    expect(back).toEqual({ addr: 'mc.example.net:25566', name: 'Сервер друга' })
+  })
+
+  test('обычный текст приглашением не считается', () => {
+    expect(parseInvite('заходи на mc.example.net')).toBe(null)
+  })
+
+  // Версия сборки приглашающего — единственный источник версии для гостя:
+  // без неё лаунчер зайдёт тем, что у гостя выбрано сейчас.
+  test('версия сборки едет в приглашении и обратно', () => {
+    expect(parseInvite(encodeInvite('mc.example.net', 'Сервер', '1.20.1'))).toEqual({
+      addr: 'mc.example.net',
+      name: 'Сервер',
+      version: '1.20.1',
+    })
+  })
+
+  test('версия-мусор из чужого клиента отбрасывается', () => {
+    expect(parseInvite(INVITE_PREFIX + '{"addr":"mc.example.net","name":"Сервер","version":"latest"}')).toEqual({
+      addr: 'mc.example.net',
+      name: 'Сервер',
+    })
+  })
+
+  test('версия уезжает в ссылку страницы входа', () => {
+    expect(new URL(joinPageUrl('mc.example.net', null, '1.21.4')).searchParams.get('version')).toBe('1.21.4')
+    expect(new URL(joinPageUrl('mc.example.net', null, 'снапшот')).searchParams.get('version')).toBe(null)
+  })
+})

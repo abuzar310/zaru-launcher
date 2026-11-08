@@ -1,0 +1,1980 @@
+// Sharing a modpack by code and link. Publishing sends api.millida.net only the file list from the Modrinth and CurseForge catalogs
+// (project, version, hash, size), with the Millida account token. Files, worlds and settings are not sent. The receiver downloads the mods from the catalogs by hash.
+//! Sharing a build by code or link, and the manifest both sharing and cloud
+//! sync are built on.
+//!
+//! A manifest lists catalogue files only — project, version, digest, size. That
+//! is a few kilobytes for a two-gigabyte pack, and it is also what makes the
+//! result reproducible: the receiving launcher fetches each file from the
+//! catalogue and verifies its digest, instead of trusting an archive somebody
+//! uploaded.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tauri::AppHandle;
+
+use crate::engine::*;
+
+const PACKS_PATH: &str = "/launcher/packs";
+pub const PACK_FORMAT: u32 = 1;
+const MAX_SUMMARY: usize = 300;
+const MAX_FILES: usize = 1000;
+/// Codes are read aloud and typed by hand, so the alphabet drops the characters
+/// that get confused: O/0, I/1, and lowercase entirely.
+const CODE_ALPHABET: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const CODE_LEN: usize = 8;
+
+/// Hosts a manifest may point at. The file is verified by digest anyway, but a
+/// digest cannot stop the launcher from being aimed at an intranet address, so
+/// the address itself is checked first.
+const FILE_HOSTS: [&str; 6] = [
+    "cdn.modrinth.com",
+    "api.modrinth.com",
+    "mediafilez.forgecdn.net",
+    "edge.forgecdn.net",
+    "media.forgecdn.net",
+    "cdn.millida.net",
+];
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PackFile {
+    pub path: String,
+    pub kind: String,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub version_id: String,
+    #[serde(default)]
+    pub sha1: String,
+    #[serde(default)]
+    pub size: u64,
+    pub url: String,
+}
+
+/// A small config file carried inline: the receiving launcher writes it only
+/// after the decoded bytes match `sha1`.
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PackOverride {
+    pub path: String,
+    pub sha1: String,
+    pub data: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PackManifest {
+    pub format_version: u32,
+    pub name: String,
+    #[serde(default)]
+    pub summary: String,
+    pub game: String,
+    pub loader: String,
+    #[serde(default)]
+    pub loader_version: String,
+    #[serde(default)]
+    pub icon: String,
+    pub files: Vec<PackFile>,
+    #[serde(default)]
+    pub settings: Value,
+    #[serde(default)]
+    pub servers: Vec<ServerEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<PackOverride>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jars: Vec<PackJar>,
+}
+
+/// A hand-added mod no catalogue serves. It travels through Millida storage to
+/// the author's friends only, and is installed only when the receiving player
+/// approved exactly this file by its sha512.
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PackJar {
+    pub path: String,
+    pub sha1: String,
+    pub sha512: String,
+    pub size: u64,
+}
+
+const MAX_JARS: usize = 20;
+const MAX_JAR_BYTES: u64 = 50 * 1024 * 1024;
+const JAR_HOST: &str = "garage.millida.net";
+const JAR_PUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(110);
+
+fn jar_url_allowed(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else { return false };
+    url.scheme() == "https" && url.host_str() == Some(JAR_HOST)
+}
+
+fn sha512_ok(v: &str) -> bool {
+    v.len() == 128 && v.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn jar_ok(j: &PackJar) -> Result<String, &'static str> {
+    let path = shared_entry_path("mod", &j.path)?;
+    if !path.to_ascii_lowercase().ends_with(".jar") {
+        return Err("не jar");
+    }
+    if !sha1_ok(&j.sha1) || !sha512_ok(&j.sha512) {
+        return Err("нет контрольной суммы");
+    }
+    if j.size == 0 || j.size > MAX_JAR_BYTES {
+        return Err("размер вне пределов");
+    }
+    Ok(path)
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedPack {
+    pub code: String,
+    pub url: String,
+    pub files: u32,
+    /// Files left behind because no catalogue serves them.
+    pub skipped: Vec<String>,
+    pub size_bytes: u64,
+}
+
+/// Shared with «Починить», which restores a mod only from these hosts too: the
+/// record it reads sits in the game folder, where archives and imports can put
+/// their own.
+pub(crate) fn url_allowed(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else { return false };
+    if url.scheme() != "https" {
+        return false;
+    }
+    url.host_str().map(|h| FILE_HOSTS.contains(&h)).unwrap_or(false)
+}
+
+fn settings_of(profile: &str) -> Value {
+    let s: Value = std::fs::read(profile_dir(profile).join("millida-settings.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    // Only the knobs that describe the build travel. Java paths, covers and
+    // anything naming this machine stay here. JVM flags never travel: they are
+    // code execution in someone else's game. Neither does the Modrinth pack
+    // link: "update the pack" wipes mods/ and reinstalls from that slug.
+    serde_json::json!({
+        "width": s["width"].as_u64().unwrap_or(0),
+        "height": s["height"].as_u64().unwrap_or(0),
+        "autoTune": s["autoTune"].as_bool().unwrap_or(true),
+        "fpsBoost": s["fpsBoost"].as_bool().unwrap_or(false),
+    })
+}
+
+/// Builds the manifest for a build on disk. `skipped` names the files that
+/// cannot travel — hand-added jars and edited configs — so the player is told
+/// what the receiving side will be missing instead of discovering it later.
+/// `with_overrides` is off for cloud sync: its snapshot of every build has a
+/// size cap the configs of two builds would already exceed.
+pub fn build_manifest(profile: &str, with_overrides: bool) -> Result<(PackManifest, Vec<String>), String> {
+    let prof = load_profiles()
+        .into_iter()
+        .find(|p| p.name == profile)
+        .ok_or("Сборка не найдена")?;
+    let pdir = profile_dir(profile);
+    let manifest = load_content_manifest(profile);
+    let mut files = vec![];
+    let mut listed: HashSet<String> = HashSet::new();
+    for e in manifest {
+        if e.download_url.is_empty() || e.sha1.is_empty() || !url_allowed(&e.download_url) {
+            continue;
+        }
+        let rel = format!("{}/{}", content_dir(&e.kind), e.file_name);
+        if !pdir.join(&rel).exists() {
+            continue;
+        }
+        listed.insert(rel.clone());
+        files.push(PackFile {
+            path: rel,
+            kind: e.kind,
+            project_id: e.project_id,
+            version_id: e.version_id,
+            sha1: e.sha1,
+            size: e.file_size,
+            url: e.download_url,
+        });
+    }
+    if files.len() > MAX_FILES {
+        return Err(format!("В сборке больше {} файлов из каталогов — такую пока не передать", MAX_FILES));
+    }
+    let mut skipped = vec![];
+    for sub in SHARED_DIRS {
+        let Ok(rd) = std::fs::read_dir(pdir.join(sub)) else { continue };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // The Millida mod and the skin mod are put in by the launcher at launch, the
+            // friend's launcher puts in its own: sent along they read as the author's unchecked jar.
+            if !entry.path().is_file() || name.ends_with(".disabled") || launcher_placed(&name) {
+                continue;
+            }
+            let rel = format!("{}/{}", sub, name);
+            if !listed.contains(&rel) {
+                skipped.push(rel);
+            }
+        }
+    }
+    let overrides = if with_overrides {
+        let (kept, left) = collect_overrides(&pdir);
+        skipped.extend(left);
+        kept
+    } else {
+        vec![]
+    };
+    skipped.sort();
+    Ok((
+        PackManifest {
+            format_version: PACK_FORMAT,
+            name: profile.to_string(),
+            summary: String::new(),
+            game: prof.version.clone(),
+            loader: prof.loader_id(),
+            loader_version: prof.loader_version.clone().unwrap_or_default(),
+            icon: prof.icon.clone().filter(|i| i.starts_with("https://")).unwrap_or_default(),
+            files,
+            settings: settings_of(profile),
+            servers: list_servers(profile),
+            overrides,
+            jars: vec![],
+        },
+        skipped,
+    ))
+}
+
+fn code_ok(code: &str) -> bool {
+    let plain = normalize_code(code);
+    plain.len() == CODE_LEN && plain.chars().all(|c| CODE_ALPHABET.contains(c))
+}
+
+/// Players paste the code with the dash, in lowercase, or as the whole link.
+/// All three mean the same pack.
+pub fn normalize_code(code: &str) -> String {
+    let tail = code.rsplit('/').next().unwrap_or(code);
+    tail.trim().to_uppercase().chars().filter(|c| c.is_ascii_alphanumeric()).collect()
+}
+
+pub fn pack_link(code: &str) -> String {
+    format!("https://millida.net/p/{}", code)
+}
+
+/// Publishes the build and returns the code to pass on. Re-publishing the same
+/// build keeps the code: the link a player already sent to friends must not go
+/// stale because they added a mod.
+pub async fn share_profile(profile: String, summary: Option<String>) -> Result<SharedPack, String> {
+    refuse_protected(&profile)?;
+    let (mut manifest, skipped) = build_manifest(&profile, true)?;
+    let (jars, skipped) = upload_own_jars(&profile_dir(&profile), skipped).await;
+    manifest.jars = jars;
+    if manifest.files.is_empty() && manifest.jars.is_empty() {
+        return Err("В сборке нет файлов из Modrinth или CurseForge — передавать нечего".into());
+    }
+    manifest.summary = summary
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .take(MAX_SUMMARY)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    let body = serde_json::to_value(&manifest).map_err(|e| e.to_string())?;
+    let size_bytes = serde_json::to_vec(&body).map(|v| v.len() as u64).unwrap_or(0);
+    // POST of the manifest to the Millida API with the Millida account token. Only the catalog file list, not the files.
+    let res = millida_api_auth(PACKS_PATH.to_string(), "POST".into(), Some(body)).await?;
+    let code = res["code"].as_str().filter(|c| code_ok(c)).ok_or("Сервер не выдал код сборки")?.to_string();
+    Ok(SharedPack {
+        url: pack_link(&code),
+        code,
+        files: (manifest.files.len() + manifest.jars.len()) as u32,
+        skipped,
+        size_bytes,
+    })
+}
+
+/// Digests of a jar read whole: it is uploaded from the same bytes, so what the
+/// server checks is exactly what was hashed.
+struct OwnJar {
+    rel: String,
+    name: String,
+    bytes: Vec<u8>,
+    sha1: String,
+    sha256: String,
+    sha512: String,
+}
+
+fn read_own_jar(pdir: &Path, rel: &str) -> Result<OwnJar, String> {
+    use sha2::Digest as _;
+    let norm = shared_entry_path("mod", rel).map_err(|why| why.to_string())?;
+    let path = safe_join(pdir, &norm).map_err(|e| e.to_string())?;
+    let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    if len == 0 || len > MAX_JAR_BYTES {
+        return Err("больше 50 МБ".into());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let hex = |d: &[u8]| d.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    Ok(OwnJar {
+        name: file_name_of(&norm),
+        rel: norm,
+        sha1: super::milli_local::sha1_hex(&bytes),
+        sha256: hex(sha2::Sha256::digest(&bytes).as_slice()),
+        sha512: hex(sha2::Sha512::digest(&bytes).as_slice()),
+        bytes,
+    })
+}
+
+async fn upload_own_jar(jar: OwnJar) -> Result<PackJar, String> {
+    let decl = serde_json::json!({
+        "fileName": jar.name,
+        "size": jar.bytes.len(),
+        "sha1": jar.sha1,
+        "sha256": jar.sha256,
+        "sha512": jar.sha512,
+    });
+    // The author's own jar goes to Millida storage: only the author's friends can fetch it back.
+    let res = millida_api_auth(format!("{}/jars", PACKS_PATH), "POST".into(), Some(decl.clone())).await?;
+    if res["status"].as_str() == Some("upload") {
+        let url = res["url"].as_str().filter(|u| jar_url_allowed(u)).ok_or("Сервер выдал чужой адрес для загрузки")?;
+        let size = jar.bytes.len() as u64;
+        let put = client()
+            .put(url)
+            .timeout(JAR_PUT_TIMEOUT)
+            .body(jar.bytes)
+            .send()
+            .await
+            .map_err(|e| net_err(&e))?;
+        if !put.status().is_success() {
+            return Err(format!("хранилище ответило {}", put.status().as_u16()));
+        }
+        millida_api_auth(format!("{}/jars/confirm", PACKS_PATH), "POST".into(), Some(decl)).await?;
+        return Ok(PackJar { path: jar.rel, sha1: jar.sha1, sha512: jar.sha512, size });
+    }
+    let size = jar.bytes.len() as u64;
+    Ok(PackJar { path: jar.rel, sha1: jar.sha1, sha512: jar.sha512, size })
+}
+
+/// Hand-added jars from `skipped` travel as the author's own files; one that
+/// cannot is named in what stays behind, with the reason.
+async fn upload_own_jars(pdir: &Path, skipped: Vec<String>) -> (Vec<PackJar>, Vec<String>) {
+    let mut jars = vec![];
+    let mut left = vec![];
+    for rel in skipped {
+        let own = rel.starts_with("mods/") && rel.to_ascii_lowercase().ends_with(".jar");
+        if !own || jars.len() >= MAX_JARS {
+            left.push(rel);
+            continue;
+        }
+        let (dir, r) = (pdir.to_path_buf(), rel.clone());
+        let read = match tokio::task::spawn_blocking(move || read_own_jar(&dir, &r)).await {
+            Ok(x) => x,
+            Err(e) => Err(e.to_string()),
+        };
+        match read {
+            Ok(jar) => match upload_own_jar(jar).await {
+                Ok(j) => jars.push(j),
+                Err(e) => left.push(format!("{} ({})", rel, e)),
+            },
+            Err(e) => left.push(format!("{} ({})", rel, e)),
+        }
+    }
+    (jars, left)
+}
+
+pub async fn unshare_profile(code: String) -> Result<(), String> {
+    let code = normalize_code(&code);
+    if !code_ok(&code) {
+        return Err("Некорректный код сборки".into());
+    }
+    // The author takes their publication down from the Millida server.
+    millida_api_auth(format!("{}/{}", PACKS_PATH, code), "DELETE".into(), None).await?;
+    Ok(())
+}
+
+/// A pack opened only to the author or the author's friends needs to know who
+/// is asking, so the account token goes along when there is one.
+async fn pack_detail(code: &str) -> Result<Value, String> {
+    millida_api_auth(format!("{}/{}", PACKS_PATH, code), "GET".into(), None)
+        .await
+        .map_err(|e| if e == "http 403" { CLOSED_PACK.to_string() } else { e })
+}
+
+const CLOSED_PACK: &str = "Автор открыл эту сборку только себе или друзьям — войди в аккаунт Millida, если ты его друг";
+
+pub const PACK_VISIBILITIES: [&str; 3] = ["link", "friends", "private"];
+
+/// Who may open the author's code: anyone with it, friends, or only the author.
+pub async fn set_pack_visibility(code: String, visibility: String) -> Result<String, String> {
+    let code = normalize_code(&code);
+    if !code_ok(&code) {
+        return Err("Некорректный код сборки".into());
+    }
+    if !PACK_VISIBILITIES.contains(&visibility.as_str()) {
+        return Err("Неизвестная видимость сборки".into());
+    }
+    let res = millida_api_auth(
+        format!("{}/{}/visibility", PACKS_PATH, code),
+        "PATCH".into(),
+        Some(serde_json::json!({ "visibility": visibility })),
+    )
+    .await?;
+    Ok(res["visibility"].as_str().unwrap_or(&visibility).to_string())
+}
+
+/// The manifest as published, before anything is downloaded: the player sees
+/// what they are about to install.
+pub async fn pack_preview(code: String) -> Result<Value, String> {
+    let code = normalize_code(&code);
+    if !code_ok(&code) {
+        return Err("Такого кода не бывает — проверь, что ввёл".into());
+    }
+    let res = pack_detail(&code).await?;
+    let (manifest, dropped) = parse_manifest_report(&res["manifest"])?;
+    let mods: Vec<Value> = manifest
+        .files
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "name": f.path.rsplit('/').next().unwrap_or(&f.path),
+                "kind": f.kind,
+                "source": file_source(&f.url),
+                "size": f.size,
+            })
+        })
+        .collect();
+    let overrides: Vec<&str> = manifest.overrides.iter().map(|o| o.path.as_str()).collect();
+    let custom: Vec<Value> = manifest
+        .jars
+        .iter()
+        .map(|j| {
+            serde_json::json!({
+                "name": file_name_of(&j.path),
+                "size": j.size,
+                "sha512": j.sha512,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "code": code,
+        "name": manifest.name,
+        "summary": manifest.summary,
+        "game": manifest.game,
+        "loader": manifest.loader,
+        "files": manifest.files.len() + manifest.jars.len(),
+        "author": res["author"].as_str().unwrap_or(""),
+        "installs": res["installs"].as_u64().unwrap_or(0),
+        "updatedAt": res["updatedAt"].as_str().unwrap_or(""),
+        "sizeBytes": manifest.files.iter().map(|f| f.size).sum::<u64>() + manifest.jars.iter().map(|j| j.size).sum::<u64>(),
+        "mods": mods,
+        "customMods": custom,
+        "overrides": overrides,
+        "dropped": dropped,
+    }))
+}
+
+/// Where a manifest says a file comes from. Only a label for the confirmation
+/// list: what is actually downloaded is decided by the catalogue lookup.
+fn file_source(url: &str) -> &'static str {
+    let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)).unwrap_or_default();
+    match host.as_str() {
+        "cdn.modrinth.com" | "api.modrinth.com" => "modrinth",
+        "edge.forgecdn.net" | "mediafilez.forgecdn.net" | "media.forgecdn.net" => "curseforge",
+        "cdn.millida.net" => "millida",
+        _ => "unknown",
+    }
+}
+
+/// Everything a manifest says is untrusted: it came over the network from
+/// another player. Paths, addresses and digests are all re-checked here, in one
+/// place, so no caller can skip a check.
+pub(crate) fn parse_manifest(raw: &Value) -> Result<PackManifest, String> {
+    parse_manifest_report(raw).map(|(manifest, _)| manifest)
+}
+
+/// Same as `parse_manifest`, plus the paths of the entries it refused, so the
+/// player sees what the pack will arrive without.
+pub(crate) fn parse_manifest_report(raw: &Value) -> Result<(PackManifest, Vec<String>), String> {
+    let mut manifest: PackManifest =
+        serde_json::from_value(raw.clone()).map_err(|_| "Сборка записана в неизвестном формате".to_string())?;
+    if manifest.format_version > PACK_FORMAT {
+        return Err("Сборку сделали в более новой версии лаунчера — обнови лаунчер".into());
+    }
+    manifest.game = manifest.game.trim().to_string();
+    if manifest.game.is_empty() {
+        return Err("В сборке не указана версия Minecraft".into());
+    }
+    // the version names a folder and a file under versions/
+    check_version_id(&manifest.game)?;
+    manifest.loader_version = manifest.loader_version.trim().to_string();
+    if !manifest.loader_version.is_empty() {
+        check_loader_version(&manifest.loader_version)?;
+    }
+    if !manifest.icon.starts_with("https://") {
+        manifest.icon.clear();
+    }
+    let mut dropped: Vec<String> = manifest.files.iter().skip(MAX_FILES).map(|f| shown_path(&f.path)).collect();
+    manifest.files.truncate(MAX_FILES);
+    manifest.files.retain_mut(|f| {
+        let kept = match shared_entry_path(&f.kind, &f.path) {
+            // The author names a file freely: under the launcher's own name it would pass for the launcher's mod.
+            Ok(path) if launcher_placed(&file_name_of(&path)) => return false,
+            Ok(path) if url_allowed(&f.url) && sha1_ok(&f.sha1) => {
+                f.path = path;
+                f.sha1 = f.sha1.to_ascii_lowercase();
+                true
+            }
+            _ => false,
+        };
+        if !kept {
+            dropped.push(shown_path(&f.path));
+        }
+        kept
+    });
+    let (overrides, refused) = accept_overrides(std::mem::take(&mut manifest.overrides));
+    manifest.overrides = overrides;
+    dropped.extend(refused);
+    let mut seen_jars: HashSet<String> = HashSet::new();
+    for mut j in std::mem::take(&mut manifest.jars) {
+        // Packs shared before the author's launcher left these out still list them. The
+        // launcher installs its own copy, so the author's is neither shown nor installed.
+        if launcher_placed(&file_name_of(&j.path)) {
+            continue;
+        }
+        match jar_ok(&j) {
+            Ok(path) if manifest.jars.len() < MAX_JARS && seen_jars.insert(path.to_lowercase()) => {
+                j.path = path;
+                j.sha1 = j.sha1.to_ascii_lowercase();
+                j.sha512 = j.sha512.to_ascii_lowercase();
+                manifest.jars.push(j);
+            }
+            _ => dropped.push(shown_path(&j.path)),
+        }
+    }
+    dropped.truncate(MAX_DROPPED_SHOWN);
+    manifest.name = manifest.name.chars().filter(|c| !c.is_control()).take(64).collect();
+    manifest.summary = manifest.summary.chars().filter(|c| !c.is_control() || *c == '\n').take(MAX_SUMMARY).collect();
+    Ok((manifest, dropped))
+}
+
+fn sha1_ok(sha1: &str) -> bool {
+    sha1.len() == 40 && sha1.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn shown_path(path: &str) -> String {
+    path.chars().filter(|c| !c.is_control()).take(160).collect()
+}
+
+/// Overrides that survive every check, in manifest order, and the paths of
+/// those that did not. The caps are counted over what is kept, so a pack
+/// padded with junk entries cannot push its real configs out.
+fn accept_overrides(raw: Vec<PackOverride>) -> (Vec<PackOverride>, Vec<String>) {
+    let mut kept: Vec<PackOverride> = vec![];
+    let mut refused = vec![];
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut total = 0usize;
+    for o in raw {
+        let accepted = (kept.len() < MAX_OVERRIDES)
+            .then(|| decode_override(&o).ok())
+            .flatten()
+            .filter(|(path, bytes)| total + bytes.len() <= MAX_OVERRIDES_TOTAL && seen.insert(path.to_lowercase()));
+        match accepted {
+            Some((path, bytes)) => {
+                total += bytes.len();
+                kept.push(PackOverride { path, sha1: o.sha1.to_ascii_lowercase(), data: o.data });
+            }
+            None => refused.push(shown_path(&o.path)),
+        }
+    }
+    (kept, refused)
+}
+
+/// The decoded bytes of an override and where they may land, or why not.
+fn decode_override(o: &PackOverride) -> Result<(String, Vec<u8>), &'static str> {
+    let path = shared_entry_path(OVERRIDE_KIND, &o.path)?;
+    if !sha1_ok(&o.sha1) {
+        return Err("нет контрольной суммы");
+    }
+    if o.data.len() > MAX_OVERRIDE_BYTES.div_ceil(3) * 4 {
+        return Err("файл больше 64 КиБ");
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(o.data.as_bytes())
+        .map_err(|_| "данные файла повреждены")?;
+    if bytes.len() > MAX_OVERRIDE_BYTES {
+        return Err("файл больше 64 КиБ");
+    }
+    if !super::milli_local::sha1_hex(&bytes).eq_ignore_ascii_case(&o.sha1) {
+        return Err("контрольная сумма не совпала");
+    }
+    Ok((path, bytes))
+}
+
+/// Kinds a manifest may carry, and the only place each may land:
+/// `<content dir of the kind>/<plain file name>`. Anything else (a config, a
+/// launcher service file, a nested path) is not catalogue content.
+const SHARED_KINDS: [&str; 4] = ["mod", "resourcepack", "shader", "datapack"];
+
+/// Config files a pack may carry inline. Only data the game reads: anything a
+/// loader or a scripting mod would execute stays out, whatever folder it sits in.
+const OVERRIDE_KIND: &str = "override";
+const OVERRIDE_ROOTS: [&str; 2] = ["config", "defaultconfigs"];
+const OVERRIDE_EXTS: [&str; 14] = [
+    "json", "json5", "toml", "cfg", "conf", "properties", "txt", "yml", "yaml", "png", "ogg", "mcmeta", "lang", "snbt",
+];
+const OVERRIDE_CODE_EXTS: [&str; 19] = [
+    "jar", "class", "zip", "js", "mjs", "kubejs", "scripts", "exe", "dll", "bat", "cmd", "ps1", "sh", "vbs", "py", "lua",
+    "so", "dylib", "zs",
+];
+const OVERRIDE_CODE_DIRS: [&str; 2] = ["kubejs", "scripts"];
+const MAX_OVERRIDE_PATH: usize = 240;
+const MAX_OVERRIDE_SEGMENT: usize = 96;
+const MAX_OVERRIDE_DEPTH: usize = 8;
+const MAX_OVERRIDE_BYTES: usize = 64 * 1024;
+const MAX_OVERRIDES_TOTAL: usize = 512 * 1024;
+const MAX_OVERRIDES: usize = 200;
+const MAX_OVERRIDE_WALK: usize = 5000;
+const MAX_DROPPED_SHOWN: usize = 200;
+
+/// The one place that decides where a shared manifest may write: catalogue
+/// files and inline overrides alike. Returns the normalised relative path the
+/// installer joins with `safe_join`, or why the entry is refused.
+pub(crate) fn shared_entry_path(kind: &str, path: &str) -> Result<String, &'static str> {
+    if kind == OVERRIDE_KIND {
+        return override_path(path);
+    }
+    if !SHARED_KINDS.contains(&kind) {
+        return Err("неизвестный тип файла");
+    }
+    let (dir, name) = path.split_once('/').ok_or("файл не в папке материалов")?;
+    if dir != content_dir(kind) {
+        return Err("папка не совпадает с типом файла");
+    }
+    let plain = safe_file_name(name).map_err(|_| "небезопасное имя файла")?;
+    if plain != name {
+        return Err("небезопасное имя файла");
+    }
+    if is_launcher_service_file(&plain) {
+        return Err("служебный файл лаунчера");
+    }
+    Ok(format!("{}/{}", dir, plain))
+}
+
+fn override_path(path: &str) -> Result<String, &'static str> {
+    if path.is_empty() || path.len() > MAX_OVERRIDE_PATH {
+        return Err("пустой или слишком длинный путь");
+    }
+    if path.contains('\\') {
+        return Err("обратная косая черта в пути");
+    }
+    if path.chars().any(char::is_control) {
+        return Err("управляющий символ в пути");
+    }
+    if path.starts_with('/') || path.contains(':') {
+        return Err("абсолютный путь");
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 2 || parts.len() > MAX_OVERRIDE_DEPTH {
+        return Err("слишком глубокий путь");
+    }
+    for part in &parts {
+        if part.is_empty() || *part == "." || *part == ".." {
+            return Err("пустой сегмент или переход по дереву");
+        }
+        if part.starts_with('.') {
+            return Err("скрытый файл или папка");
+        }
+        if part.chars().count() > MAX_OVERRIDE_SEGMENT {
+            return Err("слишком длинное имя");
+        }
+        if OVERRIDE_CODE_DIRS.contains(&part.to_lowercase().as_str()) {
+            return Err("папка скриптов");
+        }
+    }
+    let root = parts[0].to_ascii_lowercase();
+    if !OVERRIDE_ROOTS.contains(&root.as_str()) {
+        return Err("настройки кладутся только в config/ и defaultconfigs/");
+    }
+    let name = parts[parts.len() - 1];
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_lowercase()).ok_or("файл без расширения")?;
+    if OVERRIDE_CODE_EXTS.contains(&ext.as_str()) {
+        return Err("исполняемый файл или архив");
+    }
+    if !OVERRIDE_EXTS.contains(&ext.as_str()) {
+        return Err("такой тип файла настройкой не считается");
+    }
+    if is_launcher_service_file(name) {
+        return Err("служебный файл лаунчера");
+    }
+    let normalised = std::iter::once(root.as_str()).chain(parts[1..].iter().copied()).collect::<Vec<_>>().join("/");
+    if !rel_path_ok(&normalised) {
+        return Err("имя, которое система прочтёт иначе");
+    }
+    Ok(normalised)
+}
+
+/// Every config under `config/` and `defaultconfigs/`, sorted, without
+/// following links: a link inside a build may point anywhere on the disk.
+fn override_candidates(pdir: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = vec![];
+    let mut visited = 0usize;
+    let mut stack: Vec<(String, PathBuf, usize)> =
+        OVERRIDE_ROOTS.iter().map(|r| (r.to_string(), pdir.join(r), 1)).collect();
+    while let Some((rel, dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            visited += 1;
+            if visited > MAX_OVERRIDE_WALK {
+                out.sort();
+                return out;
+            }
+            let child = format!("{}/{}", rel, entry.file_name().to_string_lossy());
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() && depth + 1 < MAX_OVERRIDE_DEPTH {
+                stack.push((child, entry.path(), depth + 1));
+            } else if ft.is_file() {
+                out.push((child, entry.path()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Configs that fit the limits travel; the rest are named in `skipped`.
+fn collect_overrides(pdir: &Path) -> (Vec<PackOverride>, Vec<String>) {
+    let mut kept = vec![];
+    let mut skipped = vec![];
+    let mut total = 0usize;
+    for (rel, path) in override_candidates(pdir) {
+        let read = shared_entry_path(OVERRIDE_KIND, &rel).ok().filter(|_| kept.len() < MAX_OVERRIDES).and_then(|norm| {
+            let len = std::fs::metadata(&path).ok()?.len();
+            let fits = len <= MAX_OVERRIDE_BYTES as u64 && total as u64 + len <= MAX_OVERRIDES_TOTAL as u64;
+            let bytes = std::fs::read(&path).ok().filter(|_| fits)?;
+            (bytes.len() <= MAX_OVERRIDE_BYTES && total + bytes.len() <= MAX_OVERRIDES_TOTAL).then_some((norm, bytes))
+        });
+        match read {
+            Some((norm, bytes)) => {
+                total += bytes.len();
+                kept.push(PackOverride {
+                    path: norm,
+                    sha1: super::milli_local::sha1_hex(&bytes),
+                    data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                });
+            }
+            None => skipped.push(rel),
+        }
+    }
+    (kept, skipped)
+}
+
+/// What a catalogue file must still prove once it is on disk.
+#[derive(Clone)]
+enum Proof {
+    Sha512(String),
+    Fingerprint(u32),
+}
+
+/// A manifest line the catalogue vouched for: the address, digests and ids are
+/// the catalogue's own, never the manifest's.
+struct Vouched {
+    rel: String,
+    kind: String,
+    name: String,
+    urls: Vec<String>,
+    sha1: String,
+    size: Option<u64>,
+    proof: Proof,
+    project_id: String,
+    version_id: String,
+}
+
+fn file_name_of(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// Modrinth's answer for the file's sha1, accepted only when the version really
+/// holds a file with that sha1 and gives a sha512 to check it by.
+fn modrinth_vouch(version: &Value, f: &PackFile) -> Option<Vouched> {
+    let file = version["files"]
+        .as_array()?
+        .iter()
+        .find(|x| x["hashes"]["sha1"].as_str().is_some_and(|h| h.eq_ignore_ascii_case(&f.sha1)))?;
+    let url = file["url"].as_str().filter(|u| url_allowed(u))?;
+    let sha512 = file["hashes"]["sha512"]
+        .as_str()
+        .filter(|h| h.len() == 128 && h.bytes().all(|b| b.is_ascii_hexdigit()))?;
+    let project_id = version["project_id"].as_str().filter(|s| !s.is_empty())?;
+    Some(Vouched {
+        rel: f.path.clone(),
+        kind: f.kind.clone(),
+        name: file_name_of(&f.path),
+        urls: vec![url.to_string()],
+        sha1: f.sha1.to_ascii_lowercase(),
+        size: file["size"].as_u64().filter(|s| *s > 0),
+        proof: Proof::Sha512(sha512.to_ascii_lowercase()),
+        project_id: project_id.to_string(),
+        version_id: version["id"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+/// CurseForge ids a manifest line names: project `cf:<mod>` and the file id.
+fn cf_ids(f: &PackFile) -> Option<(u64, u64)> {
+    let project = f.project_id.strip_prefix("cf:").unwrap_or(&f.project_id).parse::<u64>().ok().filter(|v| *v > 0)?;
+    let file = f.version_id.parse::<u64>().ok().filter(|v| *v > 0)?;
+    Some((project, file))
+}
+
+/// CurseForge's record of the file, accepted only when it belongs to the named
+/// project, carries the same sha1 and a fingerprint to check the bytes by.
+fn cf_vouch(file: &Value, mod_id: u64, f: &PackFile) -> Option<Vouched> {
+    if file["modId"].as_u64() != Some(mod_id) {
+        return None;
+    }
+    let sha1 = cf_sha1(file);
+    if !sha1.eq_ignore_ascii_case(&f.sha1) {
+        return None;
+    }
+    let print = file["fileFingerprint"].as_u64().and_then(|v| u32::try_from(v).ok()).filter(|v| *v > 0)?;
+    let cf_name = safe_file_name(file["fileName"].as_str()?).ok()?;
+    let urls: Vec<String> = cf_file_urls(file, &cf_name).into_iter().filter(|u| url_allowed(u)).collect();
+    if urls.is_empty() {
+        return None;
+    }
+    Some(Vouched {
+        rel: f.path.clone(),
+        kind: f.kind.clone(),
+        name: file_name_of(&f.path),
+        urls,
+        sha1: sha1.to_ascii_lowercase(),
+        size: file["fileLength"].as_u64().filter(|s| *s > 0),
+        proof: Proof::Fingerprint(print),
+        project_id: format!("cf:{}", mod_id),
+        version_id: file["id"].as_u64().unwrap_or(0).to_string(),
+    })
+}
+
+fn refused_text(names: &[String]) -> String {
+    format!(
+        "Сборка не установлена: эти файлы не нашлись в Modrinth и CurseForge или не совпали с ними, а непроверенные файлы лаунчер не ставит: {}",
+        names.join(", ")
+    )
+}
+
+/// The sha1 a manifest claims proves nothing on its own: the manifest came from
+/// another player. Every file is looked up in the catalogue first, and the pack
+/// is refused as a whole when any file is unknown there, so nothing is fetched
+/// and no partial build is left behind.
+async fn vouch_files(files: &[PackFile]) -> Result<Vec<Vouched>, String> {
+    let hashes: Vec<String> =
+        files.iter().map(|f| f.sha1.to_ascii_lowercase()).collect::<HashSet<_>>().into_iter().collect();
+    let modrinth = if hashes.is_empty() {
+        HashMap::new()
+    } else {
+        versions_by_hash_checked(&hashes)
+            .await
+            .map_err(|e| format!("Не удалось сверить файлы сборки с Modrinth, попробуй ещё раз: {}", e))?
+    };
+    let mr_vouched: Vec<Option<Vouched>> =
+        files.iter().map(|f| modrinth.get(&f.sha1.to_ascii_lowercase()).and_then(|v| modrinth_vouch(v, f))).collect();
+    let cf_wanted: Vec<u64> = files
+        .iter()
+        .zip(&mr_vouched)
+        .filter(|(_, v)| v.is_none())
+        .filter_map(|(f, _)| cf_ids(f).map(|(_, file)| file))
+        .collect();
+    let mut cf = if cf_wanted.is_empty() { HashMap::new() } else { cf_files_bulk(&cf_wanted).await };
+    let mut vouched = vec![];
+    let mut refused = vec![];
+    for (f, mr) in files.iter().zip(mr_vouched) {
+        if let Some(v) = mr {
+            vouched.push(v);
+            continue;
+        }
+        let from_cf = match cf_ids(f) {
+            Some((mod_id, file_id)) => {
+                if let std::collections::hash_map::Entry::Vacant(slot) = cf.entry(file_id) {
+                    let j = cf_get(&format!("v1/mods/{}/files/{}", mod_id, file_id), &[])
+                        .await
+                        .map_err(|e| format!("Не удалось сверить {} с CurseForge: {}", file_name_of(&f.path), e))?;
+                    if j["data"].is_object() {
+                        slot.insert(j["data"].clone());
+                    }
+                }
+                cf.get(&file_id).and_then(|file| cf_vouch(file, mod_id, f))
+            }
+            None => None,
+        };
+        match from_cf {
+            Some(v) => vouched.push(v),
+            None => refused.push(file_name_of(&f.path)),
+        }
+    }
+    if !refused.is_empty() {
+        return Err(refused_text(&refused));
+    }
+    Ok(vouched)
+}
+
+fn file_sha512(path: &Path) -> Option<String> {
+    use sha2::Digest as _;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut h = sha2::Sha512::new();
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        match std::io::Read::read(&mut file, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => h.update(&buf[..n]),
+            Err(_) => return None,
+        }
+    }
+    Some(h.finalize().iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// Re-hashes the file as it lies on disk. The downloader may have accepted an
+/// existing file by size alone, or linked one from the shared store.
+fn proof_holds(path: &Path, sha1: &str, proof: &Proof) -> bool {
+    if !file_sha1(path).is_some_and(|h| h.eq_ignore_ascii_case(sha1)) {
+        return false;
+    }
+    match proof {
+        Proof::Sha512(want) => file_sha512(path).is_some_and(|h| h.eq_ignore_ascii_case(want)),
+        Proof::Fingerprint(want) => fingerprint_file(path) == Some(*want),
+    }
+}
+
+/// Downloads a vouched file and checks it against the catalogue's digests.
+/// Returns the address it came from.
+async fn fetch_vouched(pdir: &Path, v: &Vouched) -> Result<String, String> {
+    let dest = safe_join(pdir, &v.rel).map_err(|e| format!("Сборка содержит небезопасный путь: {}", e))?;
+    let mut last = String::new();
+    let mut used = None;
+    for url in &v.urls {
+        // A file from a foreign modpack is downloaded only from an allowed host and checked by the hash from the catalog.
+        match download_verify(url, &dest, Some(&v.sha1), v.size).await {
+            Ok(()) => {
+                used = Some(url.clone());
+                break;
+            }
+            Err(e) => last = e,
+        }
+    }
+    let url = used.ok_or_else(|| format!("Не скачался файл {}: {}", v.name, last))?;
+    let (path, sha1, proof) = (dest.clone(), v.sha1.clone(), v.proof.clone());
+    let holds = tokio::task::spawn_blocking(move || proof_holds(&path, &sha1, &proof))
+        .await
+        .map_err(|e| format!("Не удалось проверить файл {}: {}", v.name, e))?;
+    if !holds {
+        // The file does not match the catalog: delete it and stop the install.
+        let removal = std::fs::remove_file(&dest);
+        return Err(match removal {
+            Ok(()) => format!("Файл {} не совпал с каталогом — установка остановлена", v.name),
+            Err(e) => format!("Файл {} не совпал с каталогом и не удалился ({}) — удали его из сборки вручную", v.name, e),
+        });
+    }
+    Ok(url)
+}
+
+/// Installs a manifest as a build. Shared by the code flow and by cloud sync,
+/// so a pack from a friend and a pack from another of your own machines land
+/// through exactly the same checks.
+pub(crate) async fn install_manifest(
+    app: &AppHandle,
+    manifest: &PackManifest,
+    target: Option<String>,
+    jars_from: Option<JarSource<'_>>,
+) -> Result<Profile, String> {
+    let name = match target {
+        Some(n) => n,
+        None => unique_profile_name(if manifest.name.trim().is_empty() { "Сборка друга" } else { &manifest.name }),
+    };
+    let pdir = profile_dir(&name);
+    // parse_manifest already normalised every path; re-derived here so a
+    // caller that builds a manifest by hand cannot skip the check
+    let mut files = Vec::with_capacity(manifest.files.len());
+    for f in &manifest.files {
+        let rel = shared_entry_path(&f.kind, &f.path)
+            .map_err(|why| format!("Сборка содержит небезопасный путь {}: {}", shown_path(&f.path), why))?;
+        if launcher_placed(&file_name_of(&rel)) {
+            continue;
+        }
+        if !sha1_ok(&f.sha1) {
+            return Err(format!("У файла {} нет контрольной суммы — сборку не поставить", shown_path(&f.path)));
+        }
+        files.push(PackFile { path: rel, ..f.clone() });
+    }
+    let mut overrides = Vec::with_capacity(manifest.overrides.len());
+    for o in &manifest.overrides {
+        let (rel, bytes) =
+            decode_override(o).map_err(|why| format!("Настройка {} не принята: {}", shown_path(&o.path), why))?;
+        overrides.push((rel, bytes));
+    }
+    let jars = match &jars_from {
+        Some(src) => approved_jars(manifest, src.approved)?,
+        None => vec![],
+    };
+    emit_share_progress(app, 8.0, "Сверяем файлы с Modrinth и CurseForge…");
+    let vouched = vouch_files(&files).await?;
+
+    std::fs::create_dir_all(pdir.join("mods")).map_err(|e| e.to_string())?;
+    let total = vouched.len().max(1);
+    let mut entries: Vec<ContentEntry> = load_content_manifest(&name);
+    for (i, v) in vouched.iter().enumerate() {
+        let url = fetch_vouched(&pdir, v).await?;
+        entries.retain(|e| !(e.kind == v.kind && e.file_name == v.name));
+        entries.push(ContentEntry {
+            kind: v.kind.clone(),
+            file_name: v.name.clone(),
+            project_id: v.project_id.clone(),
+            version_id: v.version_id.clone(),
+            download_url: url,
+            sha1: v.sha1.clone(),
+            sha512: match &v.proof {
+                Proof::Sha512(h) => h.clone(),
+                Proof::Fingerprint(_) => String::new(),
+            },
+            file_size: v.size.unwrap_or(0),
+            ..Default::default()
+        });
+        emit_share_progress(app, 10.0 + 80.0 * (i as f32 / total as f32), &format!("Файлы сборки {}/{}", i + 1, total));
+    }
+    save_content_manifest(&name, &entries);
+    if let Some(src) = &jars_from {
+        for (i, (rel, jar)) in jars.iter().enumerate() {
+            fetch_own_jar(&pdir, src.code, rel, jar).await?;
+            let msg = format!("Свои моды автора {}/{}", i + 1, jars.len());
+            emit_share_progress(app, 90.0 + 5.0 * (i as f32 / jars.len().max(1) as f32), &msg);
+        }
+    }
+    for (rel, bytes) in &overrides {
+        let dest = safe_join(&pdir, rel).map_err(|e| format!("Сборка содержит небезопасный путь: {}", e))?;
+        write_bytes_atomic(&dest, bytes).map_err(|e| format!("Не записалась настройка {}: {}", rel, e))?;
+    }
+
+    let (loader, loader_version) = {
+        let id = manifest.loader.trim().to_lowercase();
+        let id = if ["vanilla", "fabric", "quilt", "forge", "neoforge"].contains(&id.as_str()) { id } else { "vanilla".into() };
+        let ver = manifest.loader_version.trim();
+        let ver = (!ver.is_empty() && ver.starts_with(|c: char| c.is_ascii_digit())).then(|| ver.to_string());
+        (id, ver)
+    };
+    if let Some(obj) = manifest.settings.as_object() {
+        let mut patch = serde_json::Map::new();
+        // JVM flags and the Modrinth pack link are not accepted from a shared
+        // build at all: flags run code, and the pack link decides what "update"
+        // deletes and downloads. Values are type-checked, not copied as is.
+        for key in ["width", "height"] {
+            if let Some(v) = obj.get(key).and_then(Value::as_u64).filter(|v| *v <= 16384) {
+                patch.insert(key.to_string(), Value::from(v));
+            }
+        }
+        for key in ["autoTune", "fpsBoost"] {
+            if let Some(v) = obj.get(key).and_then(Value::as_bool) {
+                patch.insert(key.to_string(), Value::Bool(v));
+            }
+        }
+        merge_settings(&name, patch);
+    }
+    for s in manifest.servers.iter().take(32) {
+        add_server(&name, s.name.clone(), s.ip.clone());
+    }
+
+    let profile = Profile {
+        name: name.clone(),
+        version: manifest.game.clone(),
+        fabric: loader == "fabric",
+        loader: Some(loader),
+        loader_version,
+        icon: (!manifest.icon.is_empty()).then(|| manifest.icon.clone()),
+    };
+    let mut all = load_profiles();
+    all.retain(|p| p.name != profile.name);
+    all.insert(0, profile.clone());
+    save_profiles(&all)?;
+    Ok(profile)
+}
+
+/// Where the author's own jars of a shared pack come from, and which of them the
+/// player approved after seeing them listed.
+pub(crate) struct JarSource<'a> {
+    pub code: &'a str,
+    pub approved: &'a [String],
+}
+
+/// Every jar of the manifest must be among the approved ones: a pack the author
+/// changed after the player looked is refused, never installed half-seen.
+fn approved_jars(manifest: &PackManifest, approved: &[String]) -> Result<Vec<(String, PackJar)>, String> {
+    let ok: HashSet<String> = approved.iter().map(|h| h.to_ascii_lowercase()).collect();
+    let mut out = vec![];
+    let mut unseen = vec![];
+    for j in &manifest.jars {
+        let rel = jar_ok(j).map_err(|why| format!("Свой мод {} не принят: {}", shown_path(&j.path), why))?;
+        if ok.contains(&j.sha512.to_ascii_lowercase()) {
+            out.push((rel, j.clone()));
+        } else {
+            unseen.push(file_name_of(&j.path));
+        }
+    }
+    if !unseen.is_empty() {
+        return Err(format!(
+            "В сборке есть свои моды автора, которые ты не подтвердил: {}. Открой установку по коду ещё раз и посмотри список",
+            unseen.join(", ")
+        ));
+    }
+    Ok(out)
+}
+
+/// The author's jar, fetched by a link only the author's friends receive, and
+/// kept only when its sha512 is the one the player approved.
+async fn fetch_own_jar(pdir: &Path, code: &str, rel: &str, jar: &PackJar) -> Result<(), String> {
+    let name = file_name_of(rel);
+    // The link is signed for this player only after the server checked they are the author's friend.
+    let res = millida_api_auth(format!("{}/{}/jars/{}", PACKS_PATH, code, jar.sha512), "GET".into(), None)
+        .await
+        .map_err(|e| format!("Свой мод {} не скачался: {}", name, e))?;
+    let url = res["url"]
+        .as_str()
+        .filter(|u| jar_url_allowed(u))
+        .ok_or_else(|| format!("Сервер выдал чужой адрес для мода {}", name))?;
+    let dest = safe_join(pdir, rel).map_err(|e| format!("Сборка содержит небезопасный путь: {}", e))?;
+    download_verify(url, &dest, Some(&jar.sha1), Some(jar.size))
+        .await
+        .map_err(|e| format!("Свой мод {} не скачался: {}", name, e))?;
+    let (path, want) = (dest.clone(), jar.sha512.clone());
+    let holds = tokio::task::spawn_blocking(move || file_sha512(&path).is_some_and(|h| h.eq_ignore_ascii_case(&want)))
+        .await
+        .map_err(|e| format!("Не удалось проверить мод {}: {}", name, e))?;
+    if !holds {
+        return Err(match std::fs::remove_file(&dest) {
+            Ok(()) => format!("Мод {} не совпал с тем, что ты подтвердил — установка остановлена", name),
+            Err(e) => format!("Мод {} не совпал с тем, что ты подтвердил, и не удалился ({}) — удали его из сборки вручную", name, e),
+        });
+    }
+    Ok(())
+}
+
+fn emit_share_progress(app: &AppHandle, pct: f32, msg: &str) {
+    use tauri::Emitter;
+    let _ = app.emit(
+        "launch-progress",
+        serde_json::json!({ "stage": "mod", "pct": pct, "msg": msg }),
+    );
+}
+
+/// Installs a shared build by its code.
+pub async fn install_shared_pack(app: AppHandle, code: String, approved_jars: Vec<String>) -> Result<Profile, String> {
+    let code = normalize_code(&code);
+    if !code_ok(&code) {
+        return Err("Такого кода не бывает — проверь, что ввёл".into());
+    }
+    let res = pack_detail(&code).await?;
+    let manifest = parse_manifest(&res["manifest"])?;
+    if manifest.files.is_empty() && manifest.jars.is_empty() {
+        return Err("В этой сборке не осталось файлов, которые можно скачать".into());
+    }
+    emit_share_progress(&app, 5.0, "Читаем сборку…");
+    let source = JarSource { code: &code, approved: &approved_jars };
+    let profile = install_manifest(&app, &manifest, None, Some(source)).await?;
+    subscribe(&profile.name, &code, res["updatedAt"].as_str().unwrap_or(""), &manifest);
+    // Reported after the files land, so a cancelled install does not inflate
+    // anyone's counter.
+    let _ = millida_api(format!("{}/{}/installed", PACKS_PATH, code), "POST".into(), None, None).await;
+    emit_share_progress(&app, 100.0, "Сборка установлена");
+    Ok(profile)
+}
+
+/// What a friend's build remembers about the pack it came from: the code to
+/// ask, the version it has, and every file that version put on disk with its
+/// sha1. The next version may replace or take away only a file that still
+/// holds exactly those bytes: anything the player added or edited stays.
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct Subscription {
+    code: String,
+    updated_at: String,
+    files: Vec<SubFile>,
+    jars: Vec<String>,
+    #[serde(default)]
+    overrides: Vec<SubFile>,
+    #[serde(default)]
+    game: String,
+    #[serde(default)]
+    loader: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct SubFile {
+    kind: String,
+    path: String,
+    #[serde(default)]
+    sha1: String,
+}
+
+const SUB_KEY: &str = "sharedFrom";
+
+fn sub_files(manifest: &PackManifest) -> Vec<SubFile> {
+    let catalog = manifest.files.iter().filter_map(|f| {
+        shared_entry_path(&f.kind, &f.path).ok().map(|path| SubFile { kind: f.kind.clone(), path, sha1: f.sha1.to_ascii_lowercase() })
+    });
+    let own = manifest
+        .jars
+        .iter()
+        .filter_map(|j| jar_ok(j).ok().map(|path| SubFile { kind: "mod".into(), path, sha1: j.sha1.to_ascii_lowercase() }));
+    catalog.chain(own).collect()
+}
+
+fn sub_overrides(manifest: &PackManifest) -> Vec<SubFile> {
+    manifest
+        .overrides
+        .iter()
+        .filter_map(|o| decode_override(o).ok().map(|(path, _)| SubFile { kind: OVERRIDE_KIND.into(), path, sha1: o.sha1.to_ascii_lowercase() }))
+        .collect()
+}
+
+fn subscribe(profile: &str, code: &str, updated_at: &str, manifest: &PackManifest) {
+    let sub = Subscription {
+        code: code.to_string(),
+        updated_at: updated_at.to_string(),
+        files: sub_files(manifest),
+        jars: manifest.jars.iter().map(|j| j.sha512.to_ascii_lowercase()).collect(),
+        overrides: sub_overrides(manifest),
+        game: manifest.game.clone(),
+        loader: manifest.loader.clone(),
+    };
+    save_subscription(profile, &sub);
+}
+
+fn save_subscription(profile: &str, sub: &Subscription) {
+    let mut patch = serde_json::Map::new();
+    patch.insert(SUB_KEY.into(), serde_json::to_value(sub).unwrap_or(Value::Null));
+    merge_settings(profile, patch);
+}
+
+fn subscription_of(profile: &str) -> Option<Subscription> {
+    let raw: Value = std::fs::read(profile_dir(profile).join("millida-settings.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())?;
+    let sub: Subscription = serde_json::from_value(raw.get(SUB_KEY)?.clone()).ok()?;
+    code_ok(&sub.code).then_some(sub)
+}
+
+/// What a new version would do to the build, shown before anything changes.
+#[derive(Serialize, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedChanges {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    /// Old and new game version, when it changes.
+    pub game: Option<(String, String)>,
+    pub loader: Option<(String, String)>,
+    /// Settings files the author changed and the update will write.
+    pub configs: Vec<String>,
+    /// Files the player has (their own or edited) that the update leaves as they are.
+    pub kept: Vec<String>,
+    /// The author's new own jars, by name and sha512: code from a person, shown first.
+    pub new_jars: Vec<Value>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedSync {
+    /// none: not a friend's build; current: nothing new; stale: a new version
+    /// waits, `changes` says what it brings; updated: it was installed; gone:
+    /// the code was revoked.
+    pub status: String,
+    pub code: String,
+    pub changes: SharedChanges,
+}
+
+fn sync_status(status: &str, code: &str) -> SharedSync {
+    SharedSync { status: status.into(), code: code.into(), ..Default::default() }
+}
+
+/// The update as it will be applied: the manifest without the files that would
+/// land on the player's own, and the old files that may go.
+struct UpdatePlan {
+    manifest: PackManifest,
+    gone: Vec<SubFile>,
+    /// Override records to remember: written ones, and the player's edits as
+    /// they were last synced, so an edit keeps being recognised as one.
+    overrides: Vec<SubFile>,
+    changes: SharedChanges,
+}
+
+fn same_sha(disk: Option<&str>, want: &str) -> bool {
+    disk.is_some_and(|h| h.eq_ignore_ascii_case(want))
+}
+
+/// `disk` reads the sha1 of a file in the build (None: no such file). Pure, so
+/// the rules about the player's files are tested without a disk.
+fn plan_update(sub: &Subscription, manifest: &PackManifest, disk: impl Fn(&str) -> Option<String>) -> UpdatePlan {
+    let old_files: HashMap<&str, &SubFile> = sub.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let mut kept = vec![];
+    // A file of the new version may take a path only if the path is free, holds
+    // the very same bytes, or holds the bytes this subscription put there.
+    let mut lands = |rel: &str, sha1: &str| -> bool {
+        let on_disk = disk(rel);
+        let free = on_disk.is_none()
+            || same_sha(on_disk.as_deref(), sha1)
+            || old_files.get(rel).is_some_and(|f| same_sha(on_disk.as_deref(), &f.sha1));
+        if !free {
+            kept.push(file_name_of(rel));
+        }
+        free
+    };
+    let mut m = manifest.clone();
+    m.files.retain(|f| shared_entry_path(&f.kind, &f.path).map(|rel| lands(&rel, &f.sha1)).unwrap_or(true));
+    m.jars.retain(|j| jar_ok(j).map(|rel| lands(&rel, &j.sha1)).unwrap_or(true));
+
+    let old_overrides: HashMap<&str, &SubFile> = sub.overrides.iter().map(|f| (f.path.as_str(), f)).collect();
+    let mut configs = vec![];
+    let mut remembered = vec![];
+    m.overrides.retain(|o| {
+        let Ok((rel, _)) = decode_override(o) else { return true };
+        let on_disk = disk(&rel);
+        if same_sha(on_disk.as_deref(), &o.sha1) {
+            remembered.push(SubFile { kind: OVERRIDE_KIND.into(), path: rel, sha1: o.sha1.to_ascii_lowercase() });
+            return false;
+        }
+        let untouched = on_disk.is_none() || old_overrides.get(rel.as_str()).is_some_and(|f| same_sha(on_disk.as_deref(), &f.sha1));
+        if untouched {
+            configs.push(rel.clone());
+            remembered.push(SubFile { kind: OVERRIDE_KIND.into(), path: rel, sha1: o.sha1.to_ascii_lowercase() });
+        } else {
+            kept.push(file_name_of(&rel));
+            if let Some(f) = old_overrides.get(rel.as_str()) {
+                remembered.push((*f).clone());
+            }
+        }
+        untouched
+    });
+
+    let fresh: HashSet<String> = sub_files(manifest).into_iter().map(|f| f.path).collect();
+    let before: HashSet<&str> = sub.files.iter().map(|f| f.path.as_str()).collect();
+    // A file the player replaced since the last sync is theirs now: it stays.
+    let gone: Vec<SubFile> = sub
+        .files
+        .iter()
+        .filter(|f| !fresh.contains(&f.path) && same_sha(disk(&f.path).as_deref(), &f.sha1))
+        .cloned()
+        .collect();
+    let added = sub_files(&m).into_iter().filter(|f| !before.contains(f.path.as_str())).map(|f| file_name_of(&f.path)).collect();
+    let changed = |a: &str, b: &str| (!a.is_empty() && a != b).then(|| (a.to_string(), b.to_string()));
+    let changes = SharedChanges {
+        added,
+        removed: gone.iter().map(|f| file_name_of(&f.path)).collect(),
+        game: changed(&sub.game, &manifest.game),
+        loader: changed(&sub.loader, &manifest.loader),
+        configs,
+        kept,
+        new_jars: vec![],
+    };
+    UpdatePlan { manifest: m, gone, overrides: remembered, changes }
+}
+
+fn disk_sha1(pdir: &Path, rel: &str) -> Option<String> {
+    let path = safe_join(pdir, rel).ok()?;
+    if path.is_file() { file_sha1(&path) } else { None }
+}
+
+/// Says what the author's newest version would change in a friend's build, and
+/// with `apply` installs it. Nothing is applied without the player asking:
+/// `apply` comes only from their button. `approved` are sha512s of the
+/// author's new own jars the player saw in that same prompt.
+pub async fn shared_pack_sync(app: AppHandle, profile: String, apply: bool, approved: Vec<String>) -> Result<SharedSync, String> {
+    let Some(sub) = subscription_of(&profile) else { return Ok(sync_status("none", "")) };
+    let res = match pack_detail(&sub.code).await {
+        Ok(r) => r,
+        Err(e) if e == "http 404" || e == CLOSED_PACK => return Ok(sync_status("gone", &sub.code)),
+        Err(e) => return Err(e),
+    };
+    let updated_at = res["updatedAt"].as_str().unwrap_or("").to_string();
+    if updated_at.is_empty() || updated_at == sub.updated_at {
+        return Ok(sync_status("current", &sub.code));
+    }
+    let manifest = parse_manifest(&res["manifest"])?;
+    let pdir = profile_dir(&profile);
+    let plan = {
+        let (dir, s, m) = (pdir.clone(), sub.clone(), manifest.clone());
+        tokio::task::spawn_blocking(move || plan_update(&s, &m, |rel| disk_sha1(&dir, rel)))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    let seen: HashSet<String> = sub.jars.iter().cloned().chain(approved.iter().map(|h| h.to_ascii_lowercase())).collect();
+    let unseen: Vec<Value> = plan
+        .manifest
+        .jars
+        .iter()
+        .filter(|j| !seen.contains(&j.sha512.to_ascii_lowercase()))
+        .map(|j| serde_json::json!({ "name": file_name_of(&j.path), "sha512": j.sha512 }))
+        .collect();
+    if !apply || !unseen.is_empty() {
+        let changes = SharedChanges { new_jars: unseen, ..plan.changes };
+        return Ok(SharedSync { status: "stale".into(), code: sub.code, changes });
+    }
+    emit_share_progress(&app, 5.0, "Обновляем сборку друга…");
+    let trusted: Vec<String> = seen.into_iter().collect();
+    let source = JarSource { code: &sub.code, approved: &trusted };
+    install_manifest(&app, &plan.manifest, Some(profile.clone()), Some(source)).await?;
+    for f in &plan.gone {
+        let Ok(path) = safe_join(&pdir, &f.path) else { continue };
+        // Re-checked right before removal: the game or the player may have
+        // touched the file while the update downloaded.
+        if !same_sha(file_sha1(&path).as_deref(), &f.sha1) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Не удалось убрать {} из сборки: {}. Закрой игру и запусти снова", file_name_of(&f.path), e)),
+        }
+        manifest_remove(&profile, &f.kind, &file_name_of(&f.path));
+    }
+    let next = Subscription {
+        code: sub.code.clone(),
+        updated_at,
+        files: sub_files(&plan.manifest),
+        jars: manifest.jars.iter().map(|j| j.sha512.to_ascii_lowercase()).collect(),
+        overrides: plan.overrides,
+        game: manifest.game.clone(),
+        loader: manifest.loader.clone(),
+    };
+    save_subscription(&profile, &next);
+    emit_share_progress(&app, 100.0, "Сборка друга обновлена");
+    Ok(SharedSync { status: "updated".into(), code: sub.code, changes: plan.changes })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub_with(files: &[(&str, &str)], overrides: &[(&str, &str)]) -> Subscription {
+        let f = |kind: &str, (p, h): &(&str, &str)| SubFile { kind: kind.into(), path: p.to_string(), sha1: h.to_string() };
+        Subscription {
+            code: "AB23CD45".into(),
+            updated_at: "1".into(),
+            files: files.iter().map(|x| f("mod", x)).collect(),
+            overrides: overrides.iter().map(|x| f(OVERRIDE_KIND, x)).collect(),
+            game: "1.20.1".into(),
+            loader: "fabric".into(),
+            ..Default::default()
+        }
+    }
+
+    fn manifest_with(files: &[(&str, &str)], overrides: &[(&str, &[u8])]) -> PackManifest {
+        PackManifest {
+            format_version: PACK_FORMAT,
+            game: "1.20.1".into(),
+            loader: "fabric".into(),
+            files: files
+                .iter()
+                .map(|(p, h)| PackFile { path: p.to_string(), kind: "mod".into(), sha1: h.to_string(), url: "https://cdn.modrinth.com/x.jar".into(), ..Default::default() })
+                .collect(),
+            overrides: overrides
+                .iter()
+                .map(|(p, b)| PackOverride {
+                    path: p.to_string(),
+                    sha1: super::super::milli_local::sha1_hex(b),
+                    data: base64::engine::general_purpose::STANDARD.encode(b),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn h(c: char) -> String {
+        c.to_string().repeat(40)
+    }
+
+    /// disk state, old and new version -> what the update removes. Only a file
+    /// that still holds the bytes the subscription put there may go.
+    #[test]
+    fn only_untouched_files_of_the_old_version_are_removed() {
+        let (a, b, x) = (h('a'), h('b'), h('e'));
+        let sub = sub_with(&[("mods/a.jar", a.as_str()), ("mods/b.jar", b.as_str())], &[]);
+        let next = manifest_with(&[("mods/a.jar", a.as_str())], &[]);
+        let table: [(Option<&str>, bool, &str); 3] = [
+            (Some(b.as_str()), true, "the author dropped b and b is as we installed it"),
+            (Some(x.as_str()), false, "the player replaced b with their own file: it stays"),
+            (None, false, "b is already gone: nothing to remove"),
+        ];
+        for (b_on_disk, removed, why) in table {
+            let plan = plan_update(&sub, &next, |rel| match rel {
+                "mods/a.jar" => Some(a.clone()),
+                "mods/b.jar" => b_on_disk.map(String::from),
+                _ => None,
+            });
+            assert_eq!(plan.gone.iter().any(|f| f.path == "mods/b.jar"), removed, "{why}");
+            assert!(!plan.gone.iter().any(|f| f.path == "mods/a.jar"), "a file the new version keeps must never be removed");
+        }
+    }
+
+    /// disk state -> whether the new version may write the path. A file the
+    /// subscription did not put there is the player's and is never overwritten.
+    #[test]
+    fn the_update_never_writes_over_the_players_files() {
+        let (a, c, mine) = (h('a'), h('c'), h('f'));
+        let old_cfg = h('1');
+        let sub = sub_with(&[("mods/a.jar", a.as_str())], &[("config/x.toml", old_cfg.as_str())]);
+        let cfg_new: &[u8] = b"new = 2";
+        let next = manifest_with(&[("mods/a.jar", c.as_str()), ("mods/new.jar", c.as_str())], &[("config/x.toml", cfg_new), ("config/y.toml", cfg_new)]);
+        let plan = plan_update(&sub, &next, |rel| match rel {
+            "mods/a.jar" => Some(a.clone()),
+            "mods/new.jar" => Some(mine.clone()),
+            "config/x.toml" => Some(h('9')),
+            "config/y.toml" => Some(h('8')),
+            _ => None,
+        });
+        let paths: Vec<&str> = plan.manifest.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"mods/a.jar"), "a file the subscription installed is updated in place");
+        assert!(!paths.contains(&"mods/new.jar"), "the player's own file at that path must not be overwritten");
+        assert!(plan.manifest.overrides.is_empty(), "configs the player edited since the last sync, or that are their own, stay as they are");
+        assert_eq!(plan.changes.kept.len(), 3, "the player is told about every file left alone");
+        let edited = plan.overrides.iter().find(|f| f.path == "config/x.toml").expect("an edited config stays remembered");
+        assert_eq!(edited.sha1, h('1'), "it is remembered by the old bytes, so the edit is still recognised next time");
+        let untouched = plan_update(&sub, &next, |rel| (rel == "config/x.toml").then(|| h('1')));
+        assert_eq!(
+            untouched.changes.configs,
+            vec!["config/x.toml".to_string(), "config/y.toml".to_string()],
+            "an untouched or missing config takes the author's"
+        );
+    }
+
+    /// url -> verdict. A manifest arrives from another player; its addresses are
+    /// what the launcher would otherwise connect to.
+    #[test]
+    fn only_catalogue_hosts_may_serve_a_shared_file() {
+        for good in [
+            "https://cdn.modrinth.com/data/AAA/versions/1/sodium.jar",
+            "https://mediafilez.forgecdn.net/files/1/2/jei.jar",
+        ] {
+            assert!(url_allowed(good), "«{good}» — обычный адрес каталога");
+        }
+        for bad in [
+            "http://cdn.modrinth.com/x.jar",
+            "https://evil.example/cdn.modrinth.com/x.jar",
+            "https://127.0.0.1/x.jar",
+            "https://cdn.modrinth.com.evil.example/x.jar",
+            "file:///C:/Windows/System32/x.dll",
+            "",
+        ] {
+            assert!(
+                !url_allowed(bad),
+                "«{bad}» обязан отклоняться: лаунчер скачает по этому адресу файл и положит его в сборку",
+            );
+        }
+    }
+
+    /// code -> normalised. The code is typed by hand, pasted with the link, and
+    /// read aloud in voice chat.
+    #[test]
+    fn codes_survive_being_typed_by_hand() {
+        assert_eq!(normalize_code("ab23-cd45"), "AB23CD45");
+        assert_eq!(normalize_code("https://millida.net/p/AB23CD45"), "AB23CD45");
+        assert_eq!(normalize_code("  AB23CD45  "), "AB23CD45");
+        assert!(code_ok("AB23-CD45"));
+        assert!(!code_ok("AB23CD4"), "короткий код не должен уходить в запрос");
+        assert!(!code_ok("AB23CD4O"), "O и 0 путают, поэтому O в алфавит не входит");
+        assert!(!code_ok("../secrets"), "код становится сегментом пути запроса");
+    }
+
+    /// A manifest with hostile entries must come back stripped, not rejected in
+    /// full: one bad line should not cost the player the whole pack.
+    #[test]
+    fn manifest_parsing_drops_what_it_cannot_trust() {
+        let raw = serde_json::json!({
+            "formatVersion": 1,
+            "name": "Сборка\u{0007}",
+            "game": "1.21.4",
+            "loader": "fabric",
+            "files": [
+                {"path": "mods/ok.jar", "kind": "mod", "sha1": "a".repeat(40), "url": "https://cdn.modrinth.com/ok.jar"},
+                {"path": "../../evil.jar", "kind": "mod", "sha1": "b".repeat(40), "url": "https://cdn.modrinth.com/evil.jar"},
+                {"path": "mods/evil.jar", "kind": "mod", "sha1": "c".repeat(40), "url": "https://evil.example/x.jar"},
+                {"path": "mods/nohash.jar", "kind": "mod", "sha1": "", "url": "https://cdn.modrinth.com/x.jar"},
+                {"path": "millida-args.txt", "kind": "mod", "sha1": "d".repeat(40), "url": "https://cdn.modrinth.com/a.txt"},
+                {"path": "mods/millida-pack-launch.json", "kind": "mod", "sha1": "d".repeat(40), "url": "https://cdn.modrinth.com/a.json"},
+                {"path": "config/x.toml", "kind": "config", "sha1": "d".repeat(40), "url": "https://cdn.modrinth.com/a.toml"},
+                {"path": "resourcepacks/x.jar", "kind": "mod", "sha1": "d".repeat(40), "url": "https://cdn.modrinth.com/b.jar"},
+                {"path": "mods/sub/x.jar", "kind": "mod", "sha1": "d".repeat(40), "url": "https://cdn.modrinth.com/c.jar"}
+            ]
+        });
+        let m = parse_manifest(&raw).expect("манифест должен разобраться");
+        assert_eq!(
+            m.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            vec!["mods/ok.jar"],
+            "остаться должен только файл с проверяемым хешем и адресом каталога",
+        );
+        assert_eq!(m.name, "Сборка", "управляющие символы в имени станут именем папки");
+    }
+
+    #[test]
+    fn manifest_versions_must_look_like_versions() {
+        let base = |game: &str, lv: &str| serde_json::json!({"formatVersion": 1, "name": "X", "game": game, "loader": "fabric", "loaderVersion": lv, "files": []});
+        assert!(parse_manifest(&base("1.21.4", "0.16.10")).is_ok());
+        assert!(parse_manifest(&base("../../../x", "")).is_err());
+        assert!(parse_manifest(&base("1.21", "../../x")).is_err());
+        assert!(parse_manifest(&base("1.21/x", "")).is_err());
+    }
+
+    #[test]
+    fn shared_settings_carry_no_jvm_args_or_pack_link() {
+        let v = settings_of("профиль-которого-нет-3f9");
+        assert!(v.get("jvmArgs").is_none());
+        assert!(v.get("modpackSlug").is_none());
+        assert!(v.get("modpackVersionId").is_none());
+    }
+
+    #[test]
+    fn a_newer_format_is_refused_instead_of_half_installed() {
+        let raw = serde_json::json!({"formatVersion": PACK_FORMAT + 1, "name": "X", "game": "1.21", "loader": "fabric", "files": []});
+        assert!(parse_manifest(&raw).is_err());
+    }
+
+    /// (kind, path) -> where it lands, or None for refused. Every path a shared
+    /// manifest may write goes through this one function, so each rule it
+    /// enforces is pinned here.
+    #[test]
+    fn shared_entry_paths_follow_one_rulebook() {
+        let cases: &[(&str, &str, Option<&str>, &str)] = &[
+            ("mod", "mods/sodium.jar", Some("mods/sodium.jar"), "a plain catalogue mod lands in mods/"),
+            ("shader", "shaderpacks/bsl.zip", Some("shaderpacks/bsl.zip"), "each kind has its own folder"),
+            ("mod", "resourcepacks/x.jar", None, "a mod outside mods/ would dodge the folder the kind implies"),
+            ("mod", "mods/sub/x.jar", None, "catalogue files are flat; a nested name is a crafted path"),
+            ("mod", "../../evil.jar", None, "climbing out of the build"),
+            ("mod", "mods/millida-pack-launch.json", None, "launcher service files steer the launch"),
+            ("config", "config/x.toml", None, "unknown kinds are refused"),
+            ("override", "config/sodium-options.json", Some("config/sodium-options.json"), "an ordinary config"),
+            ("override", "config/jei/jei-client.ini.toml", Some("config/jei/jei-client.ini.toml"), "nested configs are allowed"),
+            ("override", "defaultconfigs/ftbchunks-world.snbt", Some("defaultconfigs/ftbchunks-world.snbt"), "Forge default configs"),
+            ("override", "Config/Mod.TOML", Some("config/Mod.TOML"), "root and extension are compared case-insensitively"),
+            ("override", "config/a/b/c/d/e/f/g.json", Some("config/a/b/c/d/e/f/g.json"), "eight segments fit the depth cap"),
+            ("override", "config/a/b/c/d/e/f/g/h.json", None, "depth cap"),
+            ("override", "options.txt", None, "only config/ and defaultconfigs/ may be written"),
+            ("override", "mods/config.json", None, "configs never land among mods"),
+            ("override", "config", None, "a bare root is not a file"),
+            ("override", "config/../mods/x.json", None, "climbing out of config/"),
+            ("override", "config/./x.json", None, "dot segments hide the real path"),
+            ("override", "config//x.json", None, "empty segment"),
+            ("override", "/config/x.json", None, "absolute path"),
+            ("override", "C:/config/x.json", None, "drive letter"),
+            ("override", "config/x.json:evil.jar", None, "NTFS alternate data stream"),
+            ("override", "config\\x.json", None, "backslash is a separator on Windows"),
+            ("override", "config/x\u{0}.json", None, "NUL truncates the name in native calls"),
+            ("override", "config/x\n.json", None, "control characters"),
+            ("override", "config/.hidden.json", None, "hidden files are not configs anyone edits by hand"),
+            ("override", "config/.git/config.json", None, "hidden folders"),
+            ("override", "config/x.json ", None, "Windows drops a trailing space, so the extension check would lie"),
+            ("override", "config/x.jar.", None, "Windows drops a trailing dot: this is a jar"),
+            ("override", "config/con.json", None, "reserved Windows name"),
+            ("override", "config/x.jar", None, "jar is code"),
+            ("override", "config/x.JAR", None, "jar in capitals is still code"),
+            ("override", "config/x.class", None, "class is code"),
+            ("override", "config/x.zip", None, "archives may unpack code"),
+            ("override", "config/x.js", None, "scripting mods run js"),
+            ("override", "config/x.mjs", None, "scripting mods run mjs"),
+            ("override", "config/x.zs", None, "CraftTweaker scripts"),
+            ("override", "config/x.exe", None, "native executable"),
+            ("override", "config/x.dll", None, "native library"),
+            ("override", "config/x.so", None, "native library"),
+            ("override", "config/x.dylib", None, "native library"),
+            ("override", "config/x.bat", None, "shell script"),
+            ("override", "config/x.ps1", None, "shell script"),
+            ("override", "config/x.sh", None, "shell script"),
+            ("override", "config/x.py", None, "script"),
+            ("override", "config/x.lua", None, "script"),
+            ("override", "config/x.vbs", None, "script"),
+            ("override", "config/x", None, "no extension"),
+            ("override", "config/x.dat", None, "anything outside the whitelist"),
+            ("override", "config/kubejs/x.json", None, "KubeJS folders hold scripts"),
+            ("override", "config/KubeJS/x.json", None, "folder names are compared case-insensitively"),
+            ("override", "defaultconfigs/scripts/x.txt", None, "script folders anywhere"),
+            ("override", "config/millida-args.json", None, "launcher service file names"),
+            ("override", &format!("config/{}.json", "a".repeat(100)), None, "segment length cap"),
+            ("override", &format!("config/{}/x.json", ["b".repeat(80), "c".repeat(80), "d".repeat(80)].join("/")), None, "path length cap"),
+        ];
+        for (kind, path, want, why) in cases {
+            let got = shared_entry_path(kind, path).ok();
+            assert_eq!(got.as_deref(), *want, "{kind} «{}»: {why}", path.escape_debug());
+        }
+    }
+
+    fn override_of(path: &str, bytes: &[u8]) -> PackOverride {
+        PackOverride {
+            path: path.to_string(),
+            sha1: super::super::milli_local::sha1_hex(bytes),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    /// override -> kept or dropped. The bytes are written to disk on the other
+    /// player's machine, so the digest, the size and the caps are all checked.
+    #[test]
+    fn overrides_are_checked_before_they_are_kept() {
+        let mut forged = override_of("config/b.toml", b"b = 1");
+        forged.sha1 = "0".repeat(40);
+        let mut garbled = override_of("config/c.toml", b"c = 1");
+        garbled.data = "!!!".into();
+        let big = vec![b'x'; MAX_OVERRIDE_BYTES + 1];
+        let (kept, dropped) = accept_overrides(vec![
+            override_of("config/a.toml", b"a = 1"),
+            forged,
+            garbled,
+            override_of("config/big.json", &big),
+            override_of("config/x.jar", b"PK"),
+            override_of("Config/A.toml", b"dup"),
+        ]);
+        assert_eq!(
+            kept.iter().map(|o| o.path.as_str()).collect::<Vec<_>>(),
+            vec!["config/a.toml"],
+            "only the override with a matching digest, a safe path and a sane size may be written",
+        );
+        assert_eq!(dropped.len(), 5, "every refused override is reported so the player sees what is missing");
+
+        let many: Vec<PackOverride> = (0..MAX_OVERRIDES + 5).map(|i| override_of(&format!("config/{i}.txt"), b"x")).collect();
+        let (kept, dropped) = accept_overrides(many);
+        assert_eq!(kept.len(), MAX_OVERRIDES, "the count cap bounds what one pack can write");
+        assert_eq!(dropped.len(), 5);
+
+        let chunk = vec![b'y'; MAX_OVERRIDE_BYTES];
+        let heavy: Vec<PackOverride> = (0..10).map(|i| override_of(&format!("config/{i}.txt"), &chunk)).collect();
+        let (kept, _) = accept_overrides(heavy);
+        assert_eq!(kept.len(), MAX_OVERRIDES_TOTAL / MAX_OVERRIDE_BYTES, "the total cap bounds how much one pack can write");
+    }
+
+    #[test]
+    fn overrides_travel_from_disk_and_back() {
+        let pdir = std::env::temp_dir().join(format!("millida-share-overrides-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pdir);
+        let write = |rel: &str, bytes: &[u8]| {
+            let p = pdir.join(rel);
+            std::fs::create_dir_all(p.parent().expect("test path has a parent")).expect("test dir");
+            std::fs::write(p, bytes).expect("test file");
+        };
+        write("config/sodium.json", b"{\"a\":1}");
+        write("config/nested/deep.toml", b"x = 1");
+        write("defaultconfigs/server.toml", b"y = 2");
+        write("config/evil.jar", b"PK");
+        write("config/huge.json", &vec![b'z'; MAX_OVERRIDE_BYTES + 1]);
+        write("kubejs/server_scripts/x.js", b"evil()");
+        write("options.txt", b"fov:1");
+
+        let (kept, skipped) = collect_overrides(&pdir);
+        let _ = std::fs::remove_dir_all(&pdir);
+        assert_eq!(
+            kept.iter().map(|o| o.path.as_str()).collect::<Vec<_>>(),
+            vec!["config/nested/deep.toml", "config/sodium.json", "defaultconfigs/server.toml"],
+            "configs that pass the validator and the caps travel",
+        );
+        assert_eq!(skipped, vec!["config/evil.jar", "config/huge.json"], "what cannot travel is named, not silently lost");
+
+        let raw = serde_json::json!({
+            "formatVersion": 1, "name": "X", "game": "1.21.4", "loader": "fabric", "files": [],
+            "overrides": serde_json::to_value(&kept).expect("overrides serialize"),
+        });
+        let (m, dropped) = parse_manifest_report(&raw).expect("manifest parses");
+        assert!(dropped.is_empty(), "what the launcher built itself must pass its own checks");
+        let (path, bytes) = decode_override(&m.overrides[1]).expect("override decodes");
+        assert_eq!((path.as_str(), bytes.as_slice()), ("config/sodium.json", b"{\"a\":1}".as_slice()));
+        let wire = serde_json::to_value(&m.overrides[0]).expect("override serializes");
+        assert!(
+            wire.get("path").is_some() && wire.get("sha1").is_some() && wire.get("data").is_some(),
+            "the backend keeps exactly path, sha1 and data",
+        );
+    }
+
+    fn pack_file(path: &str, sha1: &str, project: &str, version: &str) -> PackFile {
+        PackFile {
+            path: path.into(),
+            kind: "mod".into(),
+            project_id: project.into(),
+            version_id: version.into(),
+            sha1: sha1.into(),
+            size: 10,
+            url: "https://cdn.modrinth.com/data/x/versions/y/x.jar".into(),
+        }
+    }
+
+    /// Modrinth answer -> vouched or not. The manifest's own url and ids are
+    /// never used: only what Modrinth returns for the digest.
+    #[test]
+    fn modrinth_vouches_only_for_the_exact_file() {
+        let sha1 = "a".repeat(40);
+        let f = pack_file("mods/x.jar", &sha1, "FAKEID", "FAKEVER");
+        let version = |file_sha1: &str, url: &str, sha512: &str| {
+            serde_json::json!({"id": "VER", "project_id": "PROJ", "files": [
+                {"url": url, "size": 99, "hashes": {"sha1": file_sha1, "sha512": sha512}}
+            ]})
+        };
+        let good_url = "https://cdn.modrinth.com/data/PROJ/versions/VER/x.jar";
+        let sha512 = "b".repeat(128);
+        let v = modrinth_vouch(&version(&sha1, good_url, &sha512), &f).expect("the exact file is vouched for");
+        assert_eq!(v.urls, vec![good_url.to_string()], "the address comes from Modrinth, not from the manifest");
+        assert_eq!((v.project_id.as_str(), v.version_id.as_str()), ("PROJ", "VER"), "ids come from Modrinth");
+        assert!(matches!(v.proof, Proof::Sha512(ref h) if *h == sha512), "sha512 is checked after download");
+        let cases = [
+            (version(&"c".repeat(40), good_url, &sha512), "the version holds a different file"),
+            (version(&sha1, "https://evil.example/x.jar", &sha512), "Modrinth's address must still pass the host list"),
+            (version(&sha1, good_url, ""), "without sha512 there is nothing to check the bytes by"),
+            (serde_json::json!({"id": "VER", "project_id": "PROJ"}), "no files at all"),
+        ];
+        for (answer, why) in cases {
+            assert!(modrinth_vouch(&answer, &f).is_none(), "{why}");
+        }
+    }
+
+    /// CurseForge record -> vouched or not.
+    #[test]
+    fn curseforge_vouches_only_for_the_named_file() {
+        let sha1 = "d".repeat(40);
+        let f = pack_file("mods/jei.jar", &sha1, "cf:238222", "5000001");
+        let record = |mod_id: u64, file_sha1: &str, print: u64| {
+            serde_json::json!({"id": 5000001, "modId": mod_id, "fileName": "jei-1.21.jar", "fileLength": 1234,
+                "fileFingerprint": print, "hashes": [{"algo": 1, "value": file_sha1}]})
+        };
+        let v = cf_vouch(&record(238222, &sha1, 77), 238222, &f).expect("the named file is vouched for");
+        assert!(matches!(v.proof, Proof::Fingerprint(77)), "the fingerprint is checked after download");
+        assert!(v.urls.iter().all(|u| url_allowed(u)) && !v.urls.is_empty(), "downloads only from the host list");
+        assert_eq!(v.project_id, "cf:238222");
+        let cases = [
+            (record(1, &sha1, 77), "the file belongs to another project"),
+            (record(238222, &"e".repeat(40), 77), "CurseForge has a different sha1"),
+            (record(238222, &sha1, 0), "no fingerprint to check the bytes by"),
+        ];
+        for (answer, why) in cases {
+            assert!(cf_vouch(&answer, 238222, &f).is_none(), "{why}");
+        }
+        assert_eq!(cf_ids(&f), Some((238222, 5000001)));
+        assert_eq!(cf_ids(&pack_file("mods/x.jar", &sha1, "AANobbMI", "abc")), None, "Modrinth ids are not CurseForge ids");
+    }
+
+    #[test]
+    fn refusal_names_every_refused_file() {
+        let text = refused_text(&["a.jar".into(), "b.jar".into()]);
+        assert!(text.contains("a.jar") && text.contains("b.jar"), "the player must see which files blocked the pack");
+    }
+
+    #[test]
+    fn preview_labels_the_declared_source() {
+        for (url, want) in [
+            ("https://cdn.modrinth.com/data/x.jar", "modrinth"),
+            ("https://edge.forgecdn.net/files/1/2/x.jar", "curseforge"),
+            ("https://cdn.millida.net/x.jar", "millida"),
+            ("https://evil.example/x.jar", "unknown"),
+        ] {
+            assert_eq!(file_source(url), want, "{url}");
+        }
+    }
+
+    fn own_jar(path: &str, sha512: &str) -> PackJar {
+        PackJar { path: path.into(), sha1: "a".repeat(40), sha512: sha512.into(), size: 1024 }
+    }
+
+    /// jar line -> kept. These lines come from another player and name files the
+    /// launcher would run, so every field is checked before anything is fetched.
+    #[test]
+    fn own_jar_lines_are_checked_like_catalogue_files() {
+        let good = "b".repeat(128);
+        let cases = [
+            (own_jar("mods/strata.jar", &good), true, "a plain jar in mods/ with both digests"),
+            (own_jar("mods/../evil.jar", &good), false, "a path escaping the build folder"),
+            (own_jar("config/strata.jar", &good), false, "a jar outside mods/ is loaded from where nobody looks"),
+            (own_jar("mods/run.exe", &good), false, "only jars are mods"),
+            (own_jar("mods/strata.jar", "b"), false, "without sha512 the bytes cannot be proven"),
+            (PackJar { size: 0, ..own_jar("mods/strata.jar", &good) }, false, "an empty file"),
+            (PackJar { size: MAX_JAR_BYTES + 1, ..own_jar("mods/strata.jar", &good) }, false, "over the 50 MB cap"),
+        ];
+        for (jar, kept, why) in cases {
+            assert_eq!(jar_ok(&jar).is_ok(), kept, "{why}");
+        }
+    }
+
+    #[test]
+    fn own_jars_install_only_when_each_one_was_approved() {
+        let (a, b) = ("a".repeat(128), "c".repeat(128));
+        let manifest = PackManifest { jars: vec![own_jar("mods/a.jar", &a), own_jar("mods/b.jar", &b)], ..Default::default() };
+        assert!(approved_jars(&manifest, &[a.clone(), b.to_uppercase()]).is_ok(), "approval by sha512 ignores letter case");
+        let err = approved_jars(&manifest, std::slice::from_ref(&a)).err().unwrap_or_default();
+        assert!(err.contains("b.jar"), "a jar added after the player looked must stop the install and be named");
+        assert!(approved_jars(&manifest, &[]).is_err(), "no approval means no foreign code");
+    }
+
+    #[test]
+    fn own_jars_come_only_from_millida_storage() {
+        for (url, ok) in [
+            ("https://garage.millida.net/millida-packs/launcher-jars/u/x.jar?X-Amz-Signature=s", true),
+            ("http://garage.millida.net/x.jar", false),
+            ("https://garage.millida.net.evil.example/x.jar", false),
+            ("https://cdn.modrinth.com/x.jar", false),
+        ] {
+            assert_eq!(jar_url_allowed(url), ok, "{url}");
+        }
+    }
+
+    #[test]
+    fn manifest_parsing_keeps_only_sound_own_jars() {
+        let raw = serde_json::json!({
+            "formatVersion": 1,
+            "name": "аддон маркет",
+            "game": "26.3",
+            "loader": "fabric",
+            "files": [],
+            "jars": [
+                {"path": "mods/strata.jar", "sha1": "a".repeat(40), "sha512": "b".repeat(128), "size": 10},
+                {"path": "mods/strata.jar", "sha1": "a".repeat(40), "sha512": "b".repeat(128), "size": 10},
+                {"path": "../evil.jar", "sha1": "a".repeat(40), "sha512": "b".repeat(128), "size": 10}
+            ]
+        });
+        let (m, dropped) = parse_manifest_report(&raw).expect("манифест должен разобраться");
+        assert_eq!(m.jars.iter().map(|j| j.path.as_str()).collect::<Vec<_>>(), vec!["mods/strata.jar"], "a duplicate path and an escaping path must not survive");
+        assert_eq!(dropped.len(), 2, "the player must see what the pack arrives without");
+    }
+
+    /// Catalogue file name -> kept. The hash only proves the file is public somewhere, the name is the
+    /// author's: a jar called like the launcher's mod would skip the check for foreign mods.
+    #[test]
+    fn a_catalogue_file_cannot_take_the_name_of_a_launcher_mod() {
+        let cases: [(&str, bool, &str); 5] = [
+            ("mods/CustomSkinLoader.jar", false, "the skin mod's exact name"),
+            ("mods/customskinloader.JAR", false, "Windows and macOS treat this as the same file"),
+            ("mods/millida-mod-1.4.2.jar", false, "the Millida mod's name"),
+            ("mods/Millida-Mod-1.4.2.jar", false, "the same name in another case"),
+            ("mods/sodium.jar", true, "an ordinary catalogue mod stays"),
+        ];
+        for (path, kept, why) in cases {
+            let raw = serde_json::json!({
+                "formatVersion": 1,
+                "name": "pack",
+                "game": "1.21.1",
+                "loader": "fabric",
+                "files": [{"kind": "mod", "path": path, "url": "https://cdn.modrinth.com/data/a/versions/b/c.jar", "sha1": "a".repeat(40), "size": 10}],
+                "jars": []
+            });
+            let (m, dropped) = parse_manifest_report(&raw).expect("манифест должен разобраться");
+            assert_eq!(m.files.len() == 1, kept, "{path}: {why}");
+            assert!(dropped.is_empty(), "{path}: the launcher brings its own copy, the player misses nothing");
+        }
+    }
+
+    #[test]
+    fn launcher_jars_in_an_old_pack_are_neither_shown_nor_installed() {
+        let raw = serde_json::json!({
+            "formatVersion": 1,
+            "name": "pack",
+            "game": "1.21.1",
+            "loader": "fabric",
+            "files": [],
+            "jars": [
+                {"path": "mods/millida-mod-1.4.2+fabric-1.21.1.jar", "sha1": "a".repeat(40), "sha512": "b".repeat(128), "size": 10},
+                {"path": "mods/CustomSkinLoader.jar", "sha1": "a".repeat(40), "sha512": "c".repeat(128), "size": 10},
+                {"path": "mods/strata.jar", "sha1": "a".repeat(40), "sha512": "d".repeat(128), "size": 10}
+            ]
+        });
+        let (m, dropped) = parse_manifest_report(&raw).expect("манифест должен разобраться");
+        assert_eq!(m.jars.iter().map(|j| j.path.as_str()).collect::<Vec<_>>(), vec!["mods/strata.jar"], "the launcher brings its own Millida and skin mods");
+        assert!(dropped.is_empty(), "nothing the player would miss: the launcher puts these in itself");
+    }
+}
