@@ -35,3 +35,6 @@ export function finishFirstRun() {
 }
 
 export const firstRunState = (): string => readPref(KEY, '')
+
+// No saved Microsoft or offline account: the first screen is that choice, not Millida sign-in.
+if (typeof window !== 'undefined' && !hasGameAccount()) useFirstRun.setState({ open: true })

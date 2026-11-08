@@ -36,7 +36,7 @@ const ChestOpenHost = lazy(() => import('./components/daily/ChestOpen').then((m)
 const ProjectModal = lazy(() => import('./modals/Project').then((m) => ({ default: m.ProjectModal })))
 const NewBuildModal = lazy(() => import('./modals/NewBuild').then((m) => ({ default: m.NewBuildModal })))
 const OnboardingModal = lazy(() => import('./modals/Onboarding').then((m) => ({ default: m.OnboardingModal })))
-import { gameStepPending, hasGameAccount, useFirstRun } from './state/firstRun'
+import { hasGameAccount, useFirstRun } from './state/firstRun'
 import { ImageLightbox } from './components/ImageLightbox'
 import { UpdateBanner } from './components/UpdateBanner'
 import { PartyHost } from './components/party/PartyHost'
@@ -248,7 +248,7 @@ import { initAutostart } from './lib/autostart'
 import { initStreakActivity } from './lib/streakActivity'
 import { useMods } from './state/mods'
 import { refreshMsAccounts } from './state/msLogin'
-import { enterApp, showLogin } from './lib/session'
+import { enterApp } from './lib/session'
 import { initSecrets, refreshSessionState, type SessionCheck } from './lib/secure'
 import { listenGameCrash, listenGameExit, listenGameServer, listenLaunchWarning, listenPackAccessLost, listenTrayExit } from './ipc/events'
 import { useCrash } from './state/crash'
@@ -506,8 +506,8 @@ export function App() {
     const safety = setTimeout(hideBoot, 4000)
     // The "logged in at least once" flag lives in the durable prefs file, so the
     // disk copy has to land before boot decides whether this account may skip login.
-    // No way in without a Millida account (owner 27.10.2026: no guest mode, sign-in only).
-    // The browser preview (dev only) has neither the core nor a sign-in.
+    // Millida sign-in is not a gate. A new start opens the license or offline
+    // choice. Millida stays available later for friends, skins, and its servers.
     const preview = import.meta.env.DEV && !hasTauri()
     // Решение о входе ничего не стирает: showLogin только открывает экран входа (lib/session).
     // «Не смогли проверить» — не «сессии нет» (04.11.2026: «разлогинивает»): ядро не ответило
@@ -519,7 +519,7 @@ export function App() {
       const millida = getMillidaAccount()
       if (millida) markMillidaEver()
       // Ядро не ответило: сессия, скорее всего, жива — открываем лаунчер сразу и переспрашиваем в фоне.
-      if (!preview && millida && check === 'failed') {
+      if (!preview && millida && hasGameAccount() && check === 'failed') {
         if (!entered) {
           entered = true
           enterApp()
@@ -531,19 +531,16 @@ export function App() {
         window.setTimeout(() => void refreshSessionState().then((c) => decide(c, 1)), START_FIRST_RECHECK_MS)
         return
       }
-      if (millida && !hasMillidaAccount() && !preview) {
-        showLogin('start-no-session')
-        showToast(t('Сессия истекла — войди заново'), 'error')
-      } else if (!millida && !preview) {
-        showLogin('start-no-account')
-        if (acc) showToast(t('Войди в аккаунт Millida — это нужно один раз'), 'error')
-      } else if (acc && gameStepPending() && !hasGameAccount()) {
+      if (!hasGameAccount()) {
         useUi.getState().setLogged(false)
         useFirstRun.setState({ open: true })
       } else if (acc) {
         enterApp(entered)
         entered = true
-      } else showLogin('start-no-account')
+      } else {
+        useUi.getState().setLogged(false)
+        useFirstRun.setState({ open: true })
+      }
     }
     void Promise.all([initSecrets(), hydratePrefs()]).then(([check]) => {
       clearTimeout(safety)
@@ -636,11 +633,10 @@ export function App() {
       // Чистим состояние и при logged=false: фоновые опросы (присутствие,
       // телеметрия, синк) идут и до входа в оболочку, и без очистки аккаунт
       // остаётся наполовину залогиненным до перезапуска.
-      const wasLogged = useUi.getState().logged
-      // Настоящий отказ: ядро уже стёрло токены на 401 продления. Строку аккаунта не трогаем —
-      // новый вход займёт её же, а лаунчер не «забывает» аккаунт.
-      showLogin('expired')
-      if (wasLogged) showToast(t('Сессия истекла — войди заново'), 'error')
+      // A dead Millida token must not send the player back to the Millida gate.
+      if (hasGameAccount()) return
+      useUi.getState().setLogged(false)
+      useFirstRun.setState({ open: true })
     }
     window.addEventListener(SESSION_EXPIRED_EVENT, onExpired)
     return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired)
