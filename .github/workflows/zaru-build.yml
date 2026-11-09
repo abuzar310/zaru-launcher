@@ -9,8 +9,10 @@ name: Zaru build
 
 on:
   workflow_dispatch:
+  # zaru-root builds on every push: the repo is public, so the minutes are free, and
+  # a change that breaks a gate shows up in one run instead of at release time.
   push:
-    branches: [ci/zaru-build]
+    branches: [zaru-root, ci/zaru-build]
 
 permissions:
   contents: read
