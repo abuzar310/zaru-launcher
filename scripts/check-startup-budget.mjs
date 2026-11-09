@@ -12,6 +12,8 @@ import { gzipSync } from 'node:zlib'
 // 04.11.2026: +1 КБ на хост LobbyKeeper (3D лобби живёт между заходами), сам он — свой чанк.
 // 04.11.2026: +2 КБ на защиту входа: старт, проверка сессии и выход должны работать с первого кадра.
 // Gzip вслед за ним: 314 → 316 КБ (локально Bun 1.2 даёт 312,5 КБ, в CI свежий Bun — на ~1,4 КБ больше).
+// 10.11.2026: +1 KB for brandVisible, the visible Zaru name. Every translated string goes through
+// it from the first frame, so it cannot move to a lazy chunk; the set came out under 1 KB over.
 //
 // Запуск: после `vite build` из корня репозитория: `bun scripts/check-startup-budget.mjs`.
 
@@ -19,7 +21,7 @@ const LIMITS = {
   /** Входной index-*.js, байт. Цель 300 000 (react-dom ≈183 КБ из них). */
   entryJs: 350_000,
   /** Whole startup JS (index + modulepreload), bytes. */
-  startJs: 833_000,
+  startJs: 834_000,
   /** Весь стартовый CSS, байт. */
   startCss: 415_000,
   /** Startup JS in gzip, bytes. Measured with the Bun that CI installs (setup-bun latest): its gzip
