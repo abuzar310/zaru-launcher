@@ -71,6 +71,15 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
+      # The visible rename, checked on the real code before anything ships.
+      - name: Brand test
+        run: bun test src/i18n/brand.test.ts
+
+      # build:web:release skips tsc, so report type errors here without blocking.
+      - name: Typecheck
+        continue-on-error: true
+        run: bun run typecheck
+
       - name: Build .deb
         run: bun run tauri build --bundles deb --config '{"build":{"beforeBuildCommand":"bun run build:web:release"}}'
 
