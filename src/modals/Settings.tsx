@@ -122,7 +122,7 @@ const accents = (): (Accent & { name: string })[] => [
   { id: 'cyan', name: t('Голубой'), c: '#2CB6E8', h: '#48C6F2', s: 'rgba(44,182,232,.14)' },
   { id: 'blue', name: t('Синий'), c: '#4C8DFF', h: '#639BFF', s: 'rgba(76,141,255,.14)' },
   { id: 'indigo', name: t('Индиго'), c: '#6C6BFF', h: '#8180FF', s: 'rgba(108,107,255,.14)' },
-  { id: 'purple', name: t('Фиолетовый'), c: '#C084FC', h: '#D0A4FF', s: 'rgba(192,132,252,.14)' },
+  { id: 'purple', name: t('Фиолетовый'), c: '#671294', h: '#7c22b0', s: 'rgba(103,18,148,.16)' },
   { id: 'pink', name: t('Розовый'), c: '#FF6BAA', h: '#FF80B8', s: 'rgba(255,107,170,.14)' },
   { id: 'red', name: t('Красный'), c: '#FF6B5E', h: '#FF8073', s: 'rgba(255,107,94,.14)' },
   { id: 'orange', name: t('Оранжевый'), c: '#F5923B', h: '#FFA24F', s: 'rgba(245,146,59,.14)' },
@@ -157,7 +157,7 @@ function initialCustomHex(): string {
     const s = JSON.parse(localStorage.getItem('m-accent') || 'null')
     if (s && s.id === 'custom') return s.c
   } catch {}
-  return '#C084FC'
+  return '#671294'
 }
 
 function initialAccent(): string {

@@ -92,7 +92,7 @@ function restoreAccent() {
     const p = JSON.parse(read(PREV_KEY) || 'null')
     if (p && typeof p.c === 'string' && !isPremiumAccent(JSON.stringify(p))) a = p
   } catch {}
-  const back = a || computeAccent({ id: 'purple', c: '#C084FC', h: '#D0A4FF', s: 'rgba(192,132,252,.14)' })
+  const back = a || computeAccent({ id: 'purple', c: '#671294', h: '#7c22b0', s: 'rgba(103,18,148,.16)' })
   paintAccent(back, true)
   saveAccent(back)
   writePref(PREV_KEY, '')

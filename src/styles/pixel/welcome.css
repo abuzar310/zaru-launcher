@@ -7,7 +7,7 @@
      (владелец 25.09.2026). */
   position: fixed; inset: 0; z-index: 10000;
   display: grid; place-items: center;
-  background: linear-gradient(160deg, #6a2a96 0%, #2c0840 100%);
+  background: linear-gradient(160deg, #7c22b0 0%, #671294 100%);
   cursor: pointer;
 }
 .welcome.is-out { background: none; }

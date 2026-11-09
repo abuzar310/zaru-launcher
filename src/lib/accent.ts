@@ -29,7 +29,7 @@ export interface Accent extends AccentVars {
 
 function hexToRgb(hex: string) {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim())
-  const n = m ? parseInt(m[1], 16) : 0x3f0b5b
+  const n = m ? parseInt(m[1], 16) : 0x671294
   return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 }
 }
 
@@ -180,7 +180,7 @@ export function accentBase(): string {
   const picked = /^#[0-9a-f]{6}$/i.exec(style.getPropertyValue('--m-accent-base').trim())
   if (picked) return picked[0].toLowerCase()
   const m = /^(\d+)\s*,\s*(\d+)\s*,\s*(\d+)$/.exec(style.getPropertyValue('--m-accent-rgb').trim())
-  return m ? toHex(+m[1], +m[2], +m[3]) : '#3f0b5b'
+  return m ? toHex(+m[1], +m[2], +m[3]) : '#671294'
 }
 
 export interface AccentChange {
