@@ -242,7 +242,7 @@ fn build(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     }
     READY.store(false, Ordering::SeqCst);
     let win = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html#overlay".into()))
-        .title("Millida Overlay")
+        .title("Zaru Overlay")
         .decorations(false)
         .transparent(true)
         // The overlay window is always on top, otherwise it is not visible over the game.

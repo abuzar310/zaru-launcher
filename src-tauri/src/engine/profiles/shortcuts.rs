@@ -59,7 +59,7 @@ fn file_label(text: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let clean: String = clean.trim_matches('.').chars().take(80).collect();
-    if clean.is_empty() { "Millida".into() } else { clean }
+    if clean.is_empty() { "Zaru".into() } else { clean }
 }
 
 fn launch_url(profile: &str, quickplay: Option<&str>, key: &str) -> String {
@@ -194,7 +194,7 @@ mod tests {
         let table: [(&str, &str, &str); 4] = [
             ("Выживание", "Выживание", "plain names stay as they are"),
             ("a/b\\c:d*e?", "a b c d e", "path and reserved characters are dropped"),
-            ("...", "Millida", "nothing left gives the default"),
+            ("...", "Zaru", "nothing left gives the default"),
             ("  two   spaces ", "two spaces", "runs of blanks collapse"),
         ];
         for (raw, want, why) in table {

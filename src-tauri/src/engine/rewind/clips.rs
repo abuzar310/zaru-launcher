@@ -6,7 +6,7 @@ use super::mp4;
 use super::ring::Clip;
 use crate::engine::core::safe_child;
 
-const FOLDER: &str = "Millida Clips";
+const FOLDER: &str = "Zaru Clips";
 const EXTENSION: &str = "mp4";
 const PARTIAL: &str = "part";
 const MAX_LISTED: usize = 300;

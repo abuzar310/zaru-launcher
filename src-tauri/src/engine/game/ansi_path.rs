@@ -156,7 +156,7 @@ mod tests {
     fn real_folder_outside_the_code_page_gets_an_ascii_name() {
         let dir = std::env::temp_dir().join("millida-ansi-test").join("Ωmega").join("bin");
         std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("MillidaMinecraft.exe");
+        let exe = dir.join("ZaruMinecraft.exe");
         std::fs::write(&exe, b"x").unwrap();
         let safe = safe_path_in(&exe, Some(1251));
         if safe == exe {
@@ -165,7 +165,7 @@ mod tests {
         }
         assert!(fits_code_page(&safe.to_string_lossy(), Some(1251)), "java.exe would still see `?`: {}", safe.display());
         assert!(safe.is_file(), "the short name must lead to the same file");
-        assert!(safe.ends_with("bin/MillidaMinecraft.exe"), "readable tail names stay long for Discord: {}", safe.display());
+        assert!(safe.ends_with("bin/ZaruMinecraft.exe"), "readable tail names stay long for Discord: {}", safe.display());
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("millida-ansi-test"));
     }
 }

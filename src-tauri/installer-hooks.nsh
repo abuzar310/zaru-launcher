@@ -3,7 +3,7 @@
 !ifdef MAINBINARYNAME
   !define MILLIDA_MAIN_EXE "${MAINBINARYNAME}.exe"
 !else
-  !define MILLIDA_MAIN_EXE "millida-launcher.exe"
+  !define MILLIDA_MAIN_EXE "zaru-launcher.exe"
 !endif
 
 !define MILLIDA_ASIDE ".millida-old"

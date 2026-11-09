@@ -358,7 +358,7 @@ fn apply(client: &mut Option<DiscordIpcClient>, since: &mut Option<i64>, p: &Pre
     // Presence is read by people of every language, so it stays English whatever the launcher's UI language.
     let join_label = "Join server";
     let download_label = "Download launcher";
-    let profile_label = "Millida profile";
+    let profile_label = "Zaru profile";
     let small_text = if p.playing { "In game" } else { "In launcher" };
     let buttons = if join_ok {
         vec![
@@ -370,7 +370,7 @@ fn apply(client: &mut Option<DiscordIpcClient>, since: &mut Option<i64>, p: &Pre
             activity::Button::new(download_label, SITE_URL),
             match profile.as_deref() {
                 Some(url) => activity::Button::new(profile_label, url),
-                None => activity::Button::new("Discord Millida", DISCORD_URL),
+                None => activity::Button::new("Zaru Discord", DISCORD_URL),
             },
         ]
     };

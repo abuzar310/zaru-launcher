@@ -1310,7 +1310,7 @@ pub(crate) fn build_args_on(
             .replace("${library_directory}", &libraries_dir.to_string_lossy())
             .replace("${classpath_separator}", sep)
             .replace("${primary_jar}", &primary_jar)
-            .replace("${launcher_name}", "MillidaLauncher")
+            .replace("${launcher_name}", "ZaruLauncher")
             .replace("${launcher_version}", "0.1")
             .replace("${classpath}", &cp)
     };

@@ -979,7 +979,10 @@ fn download_pct(got: u64, total: Option<u64>) -> Option<u32> {
 
 /// ASCII without spaces: the name goes through the ANSI path rewrite, command
 /// lines and the GPU preference registry key unchanged on every system.
-const GAME_EXE_STEM: &str = "MillidaMinecraft";
+const GAME_EXE_STEM: &str = "ZaruMinecraft";
+
+/// Copies made before the rename. Still a game if one is already running.
+const PREVIOUS_GAME_EXE_STEM: &str = "MillidaMinecraft";
 
 /// Named after the launcher the game was mistaken for it: Task Manager showed
 /// "MillidaLauncher.exe" eating the CPU and memory of Minecraft.
@@ -1006,7 +1009,7 @@ pub(crate) fn is_game_process_name(name: &str) -> bool {
     let low = name.to_ascii_lowercase();
     let stem = low.strip_suffix(".exe").unwrap_or(&low);
     stem.starts_with("java")
-        || [GAME_EXE_STEM, LEGACY_GAME_EXE_STEM].iter().any(|known| {
+        || [GAME_EXE_STEM, PREVIOUS_GAME_EXE_STEM, LEGACY_GAME_EXE_STEM].iter().any(|known| {
             let known = known.to_ascii_lowercase();
             stem == known || (stem.len() == COMM_LEN && known.starts_with(stem))
         })
@@ -1547,15 +1550,18 @@ mod tests {
 
     #[test]
     fn running_games_are_recognised_by_every_name_they_had() {
-        let cases: [(&str, bool, &str); 9] = [
+        let cases: [(&str, bool, &str); 12] = [
             ("java.exe", true, "a launch that fell back to the original java"),
             ("javaw.exe", true, "a game started by an older launcher through javaw"),
             ("java", true, "the Unix launcher"),
-            ("MillidaMinecraft.exe", true, "the current copy on Windows"),
-            ("MillidaMinecraft", true, "the current copy on macOS"),
-            ("MillidaMinecraf", true, "Linux cuts process names to 15 bytes"),
+            ("ZaruMinecraft.exe", true, "the current copy on Windows"),
+            ("ZaruMinecraft", true, "the current copy on macOS"),
+            ("MillidaMinecraft.exe", true, "a game started before the rename is still running"),
+            ("MillidaMinecraft", true, "the previous copy on macOS"),
+            ("MillidaMinecraf", true, "Linux cuts the previous name to 15 bytes"),
             ("MillidaLauncher.exe", true, "a game started by the previous version is still running after the update"),
-            ("Millida Launcher.exe", false, "the launcher itself is not a game"),
+            ("Millida Launcher.exe", false, "the old launcher name is not a game"),
+            ("Zaru Launcher.exe", false, "the launcher itself is not a game"),
             ("chrome.exe", false, "unrelated processes"),
         ];
         for (name, want, why) in cases {
