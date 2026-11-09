@@ -103,7 +103,7 @@ fn shortcut_body(url: &str) -> (String, String) {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn shortcut_body(url: &str) -> (String, String) {
-    ("desktop".into(), format!("[Desktop Entry]\nType=Application\nName=Millida\nIcon=millida-launcher\nExec=xdg-open \"{}\"\nTerminal=false\n", url))
+    ("desktop".into(), format!("[Desktop Entry]\nType=Application\nName=Zaru\nIcon=millida-launcher\nExec=xdg-open \"{}\"\nTerminal=false\n", url))
 }
 
 fn free_path(dir: &std::path::Path, label: &str, ext: &str) -> PathBuf {

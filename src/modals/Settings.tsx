@@ -1150,7 +1150,7 @@ export function Settings({ on }: { on: boolean }) {
         <div className="s2-hero">
           <img src="/millida-logo.svg" alt="" width={48} height={48} />
           <span className="s2-hero-txt">
-            <b>Millida Launcher</b>
+            <b>Zaru Launcher</b>
             <small>
               {upd
                 ? updStaged

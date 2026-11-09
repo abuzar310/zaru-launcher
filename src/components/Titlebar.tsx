@@ -37,7 +37,7 @@ export function Titlebar() {
       <ServiceStatus />
       <div className="tb-center">
         <img src="/millida-logo.svg" alt="" style={{ width: '22px', height: '22px', borderRadius: '6px' }} />
-        <span className="tb-name">MILLIDA LAUNCHER</span>
+        <span className="tb-name">ZARU LAUNCHER</span>
       </div>
       {IS_MAC ? null : (
         <div className="tb-btns">

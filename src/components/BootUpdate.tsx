@@ -26,7 +26,7 @@ export function BootUpdate() {
       <div className="boot-upd-card">
         <img src="/millida-logo.svg" alt="" width={44} height={44} />
         <div className="boot-upd-title">{TITLES[phase]}</div>
-        <div className="boot-upd-sub">{version ? t('Версия {version}', { version }) : 'Millida Launcher'}</div>
+        <div className="boot-upd-sub">{version ? t('Версия {version}', { version }) : 'Zaru Launcher'}</div>
         <div className="boot-upd-bar">
           <span
             className={'boot-upd-fill' + (phase === 'installing' || !pct ? ' pulse' : '')}
