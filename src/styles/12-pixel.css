@@ -48,7 +48,7 @@
     7px 2px, 7px 7px, 2px 7px, 2px calc(100% - 7px), 7px calc(100% - 7px), 7px calc(100% - 2px), calc(100% - 7px) calc(100% - 2px), calc(100% - 7px) calc(100% - 7px), calc(100% - 2px) calc(100% - 7px), calc(100% - 2px) 7px, calc(100% - 7px) 7px, calc(100% - 7px) 2px, 7px 2px
   );
   /* Тёмный текст на акценте: белый на этом зелёном даёт 2,6:1. */
-  --px-on-accent: #06200e;
+  --px-on-accent: #1a0528;
   /* Цвета граней для ступенчатой рамки (см. «Ступенчатая рамка»). */
   --px-plate-t: rgba(255, 255, 255, 0.04);
   --px-plate-b: rgba(0, 0, 0, 0.26);
