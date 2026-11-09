@@ -105,7 +105,7 @@ The VirusTotal report for every installer is at [millida.net/launcher/antivirus]
 <details>
 <summary><b>Something does not work</b></summary>
 
-Write in [Discord](https://discord.gg/mcru) or open an issue. Attach `logs/launcher-latest.log` from the instance folder to your report.
+Write in [Discord](https://discord.gg/Tfd7y4FjP) or open an issue. Attach `logs/launcher-latest.log` from the instance folder to your report.
 </details>
 
 <details>

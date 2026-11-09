@@ -29,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_APP_ID: &str = "1530764069965922354";
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const SITE_URL: &str = "https://millida.net/launcher";
-const DISCORD_URL: &str = "https://discord.gg/mcru";
+const DISCORD_URL: &str = "https://discord.gg/Tfd7y4FjP";
 const PROFILE_BASE: &str = "https://millida.net/u/";
 
 /// Longest a caller waits for the socket before it is told what is known so

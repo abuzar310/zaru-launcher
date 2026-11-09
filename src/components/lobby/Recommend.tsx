@@ -109,7 +109,7 @@ export function Recommend({ on }: { on: boolean }) {
   let body: ReactNode
   if (slide === 'prisonrpg' && packs?.prison) body = <PrisonRecommend pack={packs.prison} hover={hover} dots={null} />
   else if (slide === 'arcania' && packs?.arcania) body = <PackPromo slug={packs.arcaniaSlug} pack={packs.arcania} hover={hover} dots={null} />
-  else if (slide === 'discord' || slide === 'telegram') body = <ChatPromo kind={slide} reward={rewards[slide]} />
+  else if (slide === 'discord' || slide === 'telegram') body = <ChatPromo kind={slide} reward={slide === 'discord' ? 0 : rewards[slide]} />
   else if (slide === 'smp') body = <SmpPromo hover={hover} dots={null} />
   else if (slide === 'invite' && invite) body = <InvitePromo plusDays={invite.plusDays} />
   else body = <AnarchyPromo on={on} hover={hover} dots={null} />

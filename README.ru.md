@@ -109,7 +109,7 @@ curl -fsSL https://launcher-storage.millida.net/setup/install.sh | sh
 <details>
 <summary><b>Что-то не работает</b></summary>
 
-Напиши в [Discord](https://discord.gg/mcru) или заведи issue. К отчёту приложи `logs/launcher-latest.log` из папки сборки.
+Напиши в [Discord](https://discord.gg/Tfd7y4FjP) или заведи issue. К отчёту приложи `logs/launcher-latest.log` из папки сборки.
 </details>
 
 <details>
