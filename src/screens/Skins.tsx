@@ -1662,7 +1662,7 @@ export function Skins({ on }: { on: boolean }) {
           onAccount: true,
         }))
       const design: CapeOption[] = [
-        { id: 'millida', catalogId: 'design:millida', name: 'Millida', url: MILLIDA_CAPE, sub: t('Плащ лаунчера') },
+        { id: 'millida', catalogId: 'design:millida', name: 'Zaru', url: MILLIDA_CAPE, sub: t('Плащ лаунчера') },
       ]
       // Повторы между каталогом Millida, гардеробом аккаунта и списком Mojang
       // схлопывает dedupeCapes: у него один набор правил на все источники.

@@ -58,7 +58,7 @@ function handle(raw: string) {
     // поэтому рядом всегда настоящий адрес, а запоминаем имя только после «да».
     const label = name === addr ? `«${addr}»` : `«${name}» (${addr})`
     void uiConfirm(t('Запустить игру и зайти на сервер {server}?', { server: label }), {
-      title: 'Millida',
+      title: 'Zaru',
       confirmLabel: t('Запустить'),
       danger: false,
     }).then((ok) => {
@@ -88,7 +88,7 @@ function handle(raw: string) {
       return
     }
     void uiConfirm(t('Запустить сборку «{name}»?', { name: profile }), {
-      title: 'Millida',
+      title: 'Zaru',
       confirmLabel: t('Запустить'),
       danger: false,
     }).then((ok) => {
@@ -153,7 +153,7 @@ function handle(raw: string) {
     setScreen('builds')
     const title = q.get('name') || slug
     void uiConfirm(title === slug ? t('Установить сборку «{name}»?', { name: slug }) : t('Установить сборку «{name}» ({slug})?', { name: title, slug }), {
-      title: 'Millida',
+      title: 'Zaru',
       confirmLabel: t('Установить'),
       danger: false,
     }).then((ok) => {
@@ -190,7 +190,7 @@ function handle(raw: string) {
     if (!partyCodeOk(code)) return
     // Any web page can fire a millida:// link, and a party shares voice, so joining asks first.
     void uiConfirm(t('Вступить в пати {code}?', { code: prettyPartyCode(code) }), {
-      title: 'Millida',
+      title: 'Zaru',
       confirmLabel: t('Вступить'),
       danger: false,
     }).then((ok) => {
@@ -230,7 +230,7 @@ function handle(raw: string) {
       const nick = friend.nickname || ''
       // Any web page can fire a millida:// link, so calling someone asks first.
       void uiConfirm(t('Позвонить {nick}?', { nick: nick || t('этому игроку') }), {
-        title: 'Millida',
+        title: 'Zaru',
         confirmLabel: t('Позвонить'),
         danger: false,
       }).then((ok) => {
@@ -266,7 +266,7 @@ async function launchFromShortcut(profile: string, quickplay: string | null, key
   if (!trusted) {
     const what = world ? t('мир «{name}»', { name: world }) : server ? t('сервер {addr}', { addr: server }) : null
     const ok = await uiConfirm(what ? t('Запустить сборку «{name}» и зайти в {target}?', { name: profile, target: what }) : t('Запустить сборку «{name}»?', { name: profile }), {
-      title: 'Millida',
+      title: 'Zaru',
       confirmLabel: t('Запустить'),
       danger: false,
     })

@@ -18,6 +18,7 @@ import { LOADER_LABEL, MILLI_TEXT_MAX, isMilliSizeAsk, milliLeft, milliLook, mil
 import type { MilliError, MilliGreeting, MilliGreetingChip, MilliMessage } from '../../lib/milli'
 import { milliCue, type MilliMode } from './Milli'
 import { useHasMillida } from '../../state/auth'
+import { brandVisible } from '../../i18n/core'
 import {
   cancelMilli,
   closeMilli,
@@ -392,7 +393,7 @@ function Bubble({ m, last, cheer, asked = '' }: { m: MilliMessage; last: boolean
     <div className="ml-msg">
       <MilliAva cheer={cheer} />
       <div className="ml-col">
-        {m.text ? <p className="ml-bubble">{m.text}</p> : null}
+        {m.text ? <p className="ml-bubble">{brandVisible(m.text)}</p> : null}
         {askSize && last ? (
           <MilliSafe>
             <MilliSizePick onPick={pickSize} />
@@ -450,7 +451,7 @@ function ErrorCard({ e }: { e: MilliError }) {
       <div className="ml-limit" role="alert">
         <Milli size={56} mode="think" />
         <span className="ml-limit-text">
-          <b>{e.text}</b>
+          <b>{brandVisible(e.text)}</b>
           {when ? <span>{t('Снова {when}', { when })}</span> : null}
         </span>
         {!status?.plus ? (
@@ -468,7 +469,7 @@ function ErrorCard({ e }: { e: MilliError }) {
       <div className="ml-col">
         <div className="ml-err" role="alert">
           <PxIcon name="alert" size={12} />
-          <span>{e.text}</span>
+          <span>{brandVisible(e.text)}</span>
           {e.retry ? (
             <button type="button" className="btn sm secondary" data-track="milli_retry" onClick={retryMilli}>
               {t('Повторить')}

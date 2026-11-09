@@ -108,10 +108,10 @@ function resetLogin(hint?: string, dropCode = false) {
 }
 
 function nickFromUser(user: LauncherUser): string {
-  if (!user) return 'Millida'
+  if (!user) return 'Zaru'
   if (user.nickname) return user.nickname
   const local = (user.email || '').split('@')[0]
-  return local || 'Millida'
+  return local || 'Zaru'
 }
 
 /// The launcher holds one Millida session, so a second sign-in takes the place of the

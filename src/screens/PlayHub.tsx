@@ -705,7 +705,7 @@ export function PlayHub({ on }: { on?: boolean }) {
               title="PvP"
               online={0}
               index={ownSlides.length}
-              on={!!current && current.kind === 'build' && current.name.startsWith(pvpBuildName(''))}
+              on={!!current && current.kind === 'build' && (current.name.startsWith(pvpBuildName('')) || current.name.startsWith('Millida PvP '))}
               onClick={() => {
                 // PvP — свой раздел лаунчера (12.10.2026), плитка ведёт туда.
                 track('pvp_client_open', { source: 'hub' })

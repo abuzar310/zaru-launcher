@@ -125,7 +125,7 @@ async function chooseBuild(
       pr
         ? t('Поставить «{name}» в сборку «{pack}» ({version} · {loader})?', { name: title, pack: fit[0] ?? '', version: pr.version, loader: LOADER_NAME(pr) })
         : t('Поставить «{name}» в сборку «{pack}»?', { name: title, pack: fit[0] ?? '' }),
-      { title: 'Millida', confirmLabel: t('Поставить'), danger: false },
+      { title: 'Zaru', confirmLabel: t('Поставить'), danger: false },
     )
     return ok ? fit[0] : null
   }
@@ -334,7 +334,7 @@ function packDone(p: Profile | null, title: string, startedAt: number, source: s
 async function confirmPack(title: string, what: string, opts: CatalogInstallOpts): Promise<boolean> {
   if (!opts.fromLink) return true
   return uiConfirm(what ? t('Установить сборку «{name}» ({what})? Она появится отдельной сборкой.', { name: title, what }) : t('Установить сборку «{name}»? Она появится отдельной сборкой.', { name: title }), {
-    title: 'Millida',
+    title: 'Zaru',
     confirmLabel: t('Установить'),
     danger: false,
   })
@@ -460,7 +460,7 @@ async function applySkin(slug: string, opts: CatalogInstallOpts): Promise<boolea
   }
   const name = opts.name || slug
   if (opts.fromLink) {
-    const ok = await uiConfirm(t('Надеть скин «{name}»?', { name }), { title: 'Millida', confirmLabel: t('Надеть'), danger: false })
+    const ok = await uiConfirm(t('Надеть скин «{name}»?', { name }), { title: 'Zaru', confirmLabel: t('Надеть'), danger: false })
     if (!ok) return false
   }
   try {

@@ -28,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // Public application id from the Discord Developer Portal. Discord needs it to show the name and pictures. It is not a secret.
 const DEFAULT_APP_ID: &str = "1530764069965922354";
 const RETRY_AFTER: Duration = Duration::from_secs(30);
-const SITE_URL: &str = "https://millida.net/launcher";
+const SITE_URL: &str = "https://zaru-launcher.vercel.app";
 const DISCORD_URL: &str = "https://discord.gg/Tfd7y4FjP";
 const PROFILE_BASE: &str = "https://millida.net/u/";
 

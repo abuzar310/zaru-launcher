@@ -4,6 +4,7 @@ import { createPortal } from 'react-dom'
 import { PxIcon } from '../PxIcon'
 import { ServerIcon, StatusBadge, buildLabel } from '../hosting/HostKit'
 import { api, mirrorAsset, openExt } from '../../lib/api'
+import { brandVisible } from '../../i18n/core'
 import { installBench } from '../../lib/aiInstall'
 import { copyText } from '../../lib/clipboard'
 import { hasTauri } from '../../ipc/tauri'
@@ -93,7 +94,7 @@ function ServerPick({ pack, projectIds, onClose }: { pack: MilliPack; projectIds
     } catch (e) {
       const m = milliError(e)
       if (m.kind === 'plus') openPlus()
-      else showToast(m.kind === 'failed' ? t('Не встало на сервер — повтори') : m.text, 'error')
+      else showToast(m.kind === 'failed' ? t('Не встало на сервер — повтори') : brandVisible(m.text), 'error')
     } finally {
       setBusy('')
     }

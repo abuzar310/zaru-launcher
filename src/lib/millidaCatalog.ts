@@ -511,7 +511,7 @@ export function cleanTitle(title: string): string {
 export function cardToHit(c: CatalogCard, section: string): ModHit {
   return {
     title: cleanTitle(c.title),
-    author: c.author || 'Millida',
+    author: c.author || 'Zaru',
     desc: clipWords(c.summary || '', 120),
     dl: Math.max(c.downloads || 0, c.sourceDownloads || 0),
     icon: c.icon || c.cover || undefined,

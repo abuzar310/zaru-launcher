@@ -1295,7 +1295,7 @@ pub(crate) fn build_args_on(
             .replace("${user_property_map}", "{}")
             .replace("${auth_session}", &session)
             .replace("${game_assets}", &game_assets)
-            .replace("${profile_name}", "Millida")
+            .replace("${profile_name}", "Zaru")
             .replace("${version_name}", v["id"].as_str().unwrap_or(""))
             .replace("${game_directory}", &game_dir.to_string_lossy())
             .replace("${assets_root}", &assets_root.to_string_lossy())

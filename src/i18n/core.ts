@@ -69,12 +69,12 @@ export function localizeCore(
   depth = 0,
 ): string {
   const text = raw.replace(/^Error:\s*/, '')
-  if (locale === 'ru') return own?.[text] || text
-  if (!CYRILLIC.test(text) || depth > MAX_DEPTH) return text
+  if (locale === 'ru') return finishCore(own?.[text] || text, depth)
+  if (!CYRILLIC.test(text) || depth > MAX_DEPTH) return finishCore(text, depth)
   const exact = own?.[text] || english?.[text]
-  if (exact) return exact
+  if (exact) return finishCore(exact, depth)
   const source = english ?? own
-  if (!source) return text
+  if (!source) return finishCore(text, depth)
   for (const tpl of coreTemplates(source)) {
     const m = tpl.re.exec(text)
     if (!m) continue
@@ -82,9 +82,13 @@ export function localizeCore(
     tpl.slots.forEach((slot, i) => {
       vars[slot] = localizeCore(locale, m[i + 1] ?? '', own, english, depth + 1)
     })
-    return interpolate(lookup(locale, tpl.key, own, english), vars)
+    return finishCore(interpolate(lookup(locale, tpl.key, own, english), vars), depth)
   }
-  return localizeParts(locale, text, own, english, depth) ?? text
+  return finishCore(localizeParts(locale, text, own, english, depth) ?? text, depth)
+}
+
+function finishCore(text: string, depth: number): string {
+  return depth === 0 ? brandVisible(text) : text
 }
 
 /// The core joins several reasons into one line ("a; b") and puts a stage, a file or
@@ -104,6 +108,32 @@ function localizeParts(locale: Locale, text: string, own: Table | null | undefin
   return null
 }
 
+const ADDRESS = /https?:\/\/[^\s<>"')]+|[\w.-]*millida\.(?:net|host)\b[^\s<>"')]*/gi
+
+/// The name a player reads. Addresses stay millida.net so sign-in and joins still open.
+export function brandVisible(text: string): string {
+  if (!text) return text
+  const saved: string[] = []
+  const masked = text.replace(ADDRESS, (url) => {
+    const token = `\u0001${saved.length}\u0001`
+    saved.push(url)
+    return token
+  })
+  const named = masked
+    .replace(/(?<![\\/])Millida/g, 'Zaru')
+    .replace(/(?<![\\/])MILLIDA/g, 'ZARU')
+    .replace(/(?<![А-Яа-яЁё])Миллида(?![А-Яа-яЁё])/g, 'Zaru')
+    .replace(/(?<![А-Яа-яЁё])миллида(?![А-Яа-яЁё])/g, 'Zaru')
+    .replace(/(?<![А-Яа-яЁёІіЇїЄєҐґ])Мілліда(?![А-Яа-яЁёІіЇїЄєҐґ])/g, 'Zaru')
+    .replace(/(?<![А-Яа-яЁёІіЇїЄєҐґ])мілліда(?![А-Яа-яЁёІіЇїЄєҐґ])/g, 'Zaru')
+    .replace(/(?<![А-Яа-яЁё])Милли(?![А-Яа-яЁё])/g, 'Zaru')
+    .replace(/(?<![А-Яа-яЁё])милли(?![А-Яа-яЁё])/g, 'Zaru')
+    .replace(/(?<![А-Яа-яЁёІіЇїЄєҐґ])Міллі(?![А-Яа-яЁёІіЇїЄєҐґ])/g, 'Zaru')
+    .replace(/(?<![А-Яа-яЁёІіЇїЄєҐґ])міллі(?![А-Яа-яЁёІіЇїЄєҐґ])/g, 'Zaru')
+    .replace(/(?<![A-Za-z])Milli(?![A-Za-z])/g, 'Zaru')
+  return named.replace(/\u0001(\d+)\u0001/g, (_, n: string) => saved[Number(n)] ?? '')
+}
+
 export function translate(locale: Locale, key: string, vars: Vars | undefined, own: Table | null | undefined, english: Table | null | undefined): string {
-  return interpolate(lookup(locale, key, own, english), vars)
+  return brandVisible(interpolate(lookup(locale, key, own, english), vars))
 }

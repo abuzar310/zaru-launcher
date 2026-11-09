@@ -260,7 +260,7 @@ function AnarchyPromo({ on, hover, dots }: { on: boolean; hover: Hover; dots: Re
       <span className="an-lava" aria-hidden="true" style={{ '--lava': 'url("' + LAVA_STRIP + '")' } as CSSProperties}>
         <i />
       </span>
-      <span className="lan-co">MCRU.ME × Millida</span>
+      <span className="lan-co">MCRU.ME × Zaru</span>
       <span className="lan-title">
         {t('Полная')}
         <br />

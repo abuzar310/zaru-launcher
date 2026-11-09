@@ -239,7 +239,7 @@ async function prepareVersionBuild(version: string, build: string, wantFps: bool
   return name
 }
 
-export const pvpBuildName = (version: string) => 'Millida PvP ' + version
+export const pvpBuildName = (version: string) => 'Zaru PvP ' + version
 
 export const PVP_VERSIONS = ['1.8.9', '1.12.2', '1.20.1', '1.21.11'] as const
 

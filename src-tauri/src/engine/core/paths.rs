@@ -128,7 +128,7 @@ pub fn move_game_data(from: &std::path::Path, to: &std::path::Path) -> Result<Mo
 /// the launcher then makes its own folder there instead of refusing.
 pub fn game_root_from_pick(picked: PathBuf) -> PathBuf {
     if picked.parent().is_none() && picked.has_root() {
-        picked.join("Millida")
+        picked.join("Zaru")
     } else {
         picked
     }
@@ -424,12 +424,12 @@ mod tests {
     fn a_whole_drive_becomes_a_folder_on_it() {
         let cases: Vec<(PathBuf, PathBuf, &str)> = if cfg!(windows) {
             vec![
-                (PathBuf::from(r"D:\"), PathBuf::from(r"D:\Millida"), "корень диска"),
+                (PathBuf::from(r"D:\"), PathBuf::from(r"D:\Zaru"), "корень диска"),
                 (PathBuf::from(r"D:\Games"), PathBuf::from(r"D:\Games"), "своя папка не меняется"),
             ]
         } else {
             vec![
-                (PathBuf::from("/"), PathBuf::from("/Millida"), "корень файловой системы"),
+                (PathBuf::from("/"), PathBuf::from("/Zaru"), "корень файловой системы"),
                 (PathBuf::from("/home/me/Games"), PathBuf::from("/home/me/Games"), "своя папка не меняется"),
             ]
         };

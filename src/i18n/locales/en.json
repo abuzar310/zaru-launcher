@@ -5744,6 +5744,7 @@
   "Записи пока нет: окно игры было свёрнуто или только что открылось": "Nothing recorded yet: the game window was minimized or just opened",
   "Клип сохранён": "Clip saved",
   "Последние {0} с · Millida Clips": "Last {0} s · Millida Clips",
+  "Последние {0} с · Zaru Clips": "Last {0} s · Zaru Clips",
   "Клип не сохранён": "Clip not saved",
   "Не удалось создать папку клипов: {0}": "Couldn't create the clips folder: {0}",
   "Не удалось сохранить настройки клипов: {0}": "Couldn't save clip settings: {0}",

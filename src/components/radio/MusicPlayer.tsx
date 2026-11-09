@@ -78,7 +78,7 @@ export function MusicPlayer() {
     <>
       <Row
         title={t('Плеер')}
-        hint={cur ? (live?.title || cur.title) + ' · ' + (live?.author || cur.author || 'Millida') : undefined}
+        hint={cur ? (live?.title || cur.title) + ' · ' + (live?.author || cur.author || 'Zaru') : undefined}
         keys="музыка громкость плеер трек"
       >
         {cur ? (

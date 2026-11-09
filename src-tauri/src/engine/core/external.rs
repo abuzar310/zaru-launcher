@@ -47,7 +47,7 @@ fn open_in_app(app: &AppHandle, url: &url::Url) -> Result<(), String> {
         return Ok(());
     }
     WebviewWindowBuilder::new(app, VIEW_LABEL, WebviewUrl::External(url.clone()))
-        .title(url.host_str().unwrap_or("Millida"))
+        .title(url.host_str().unwrap_or("Zaru"))
         .inner_size(1060.0, 780.0)
         .min_inner_size(420.0, 480.0)
         .center()

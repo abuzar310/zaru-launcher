@@ -233,7 +233,7 @@ async function resolveAuth(profile: string | null, server?: string | null): Prom
   const millidaOnly = native || smp || (await profileNeedsMillidaAuth(profile))
   const kind = launchAuthKind(acc, hasMillidaAccount(), millidaOnly, millidaGameNick())
   if (millidaOnly) {
-    const where = smp ? 'Millida SMP' : 'OneBlock'
+    const where = smp ? 'Zaru SMP' : 'OneBlock'
     if (kind !== 'millida')
       throw new Error(native ? t(NATIVE_NEEDS_MILLIDA) : t('{where} пускает только с аккаунтом Millida: войди в Millida и нажми «Играть» ещё раз', { where }))
     if (!native && acc && !isMillidaKind(acc.kind)) showToast(t('{where}: заходим с аккаунтом Millida', { where }))

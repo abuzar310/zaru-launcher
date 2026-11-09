@@ -1241,7 +1241,7 @@ export function InstancePage() {
     const picked = sel.has(md.name)
     const modrinth = md.project_id && !md.project_id.startsWith('cf:') && !md.project_id.startsWith('millida:') ? md.project_id : ''
     const curse = md.project_id && md.project_id.startsWith('cf:') ? md.project_id.slice(3) : ''
-    const src = modrinth ? 'Modrinth' : curse ? 'CurseForge' : md.project_id && md.project_id.startsWith('millida:') ? 'Millida' : t('Файл')
+    const src = modrinth ? 'Modrinth' : curse ? 'CurseForge' : md.project_id && md.project_id.startsWith('millida:') ? 'Zaru' : t('Файл')
     const fresh = freshNames.has(md.name)
     const facts = [
       md.version_number ? t('версия {version}', { version: md.version_number }) : '',

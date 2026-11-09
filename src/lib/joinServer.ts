@@ -180,8 +180,11 @@ export async function buildForServer(join: JoinIntent, wanted: string[]): Promis
 async function millidaSmpBuild(wanted: string[]): Promise<string | null> {
   const version = (await newestReleaseFor(wanted)) || wanted[0] || ''
   if (!version) return null
-  const name = pvpBuildName(version)
-  if (!useProfiles.getState().profiles.some((p) => p.name === name)) showToast(t('Готовим сборку «{name}»', { name }))
+  const fresh = pvpBuildName(version)
+  const legacy = 'Millida PvP ' + version
+  const profiles = useProfiles.getState().profiles
+  const name = profiles.some((p) => p.name === fresh) ? fresh : profiles.some((p) => p.name === legacy) ? legacy : fresh
+  if (!profiles.some((p) => p.name === name)) showToast(t('Готовим сборку «{name}»', { name }))
   const made = await ensureVersionBuild(version, { fps: true, name })
   if (made) await useProfiles.getState().refresh()
   return made

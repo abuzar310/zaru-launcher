@@ -786,7 +786,7 @@ export function Settings({ on }: { on: boolean }) {
           <Segs<SkinSource>
             value={skins}
             options={[
-              ['millida', 'Millida'],
+              ['millida', 'Zaru'],
               ['mojang', t('Лицензия')],
             ]}
             onPick={(v) => {

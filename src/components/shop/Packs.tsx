@@ -138,7 +138,7 @@ function PlusBundle({ tile }: { tile: PlusTile }) {
     <div className={'pb pb2' + (dia ? ' is-diamond' : '')} ref={paused} data-kind="plus_offer" data-id="plus" data-tier={tier}>
       <span className="pb-ribbon">{dia ? t('Всё сразу — в день покупки') : t('Выгоднее, чем просто рубины')}</span>
       <div className="pb-top">
-        <button className="pb-head" aria-label={'Millida ' + tier} data-track="plus_tile_art" onClick={buy}>
+        <button className="pb-head" aria-label={'Zaru ' + tier} data-track="plus_tile_art" onClick={buy}>
           <PlusMark tier={tier} height={dia ? 28 : 38} shine />
         </button>
         {tile.sub || !tile.prices ? null : (

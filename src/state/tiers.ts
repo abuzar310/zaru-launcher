@@ -8,7 +8,7 @@ import { api } from '../lib/api'
  */
 
 /** Сервер дуэлей: туда ведёт «Определить свой тир». Пускает только аккаунт Millida. */
-export const TIER_SERVER = { ip: 'mpvp.millida.host', name: 'Millida SMP', versions: ['26.2'] }
+export const TIER_SERVER = { ip: 'mpvp.millida.host', name: 'Zaru SMP', versions: ['26.2'] }
 
 export interface TierMode {
   tier: string
