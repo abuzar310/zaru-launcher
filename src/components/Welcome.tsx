@@ -150,7 +150,7 @@ export function Welcome() {
       ) : null}
       <div className="welcome-body" aria-live="polite">
         {first && phase === 'in' ? <Burst n={30} spread={320} seed={9} /> : null}
-        <img className="welcome-logo" src="/millida-logo.svg" alt="" />
+        <img className="welcome-logo" src="/zaru-logo.png" alt="" />
         <span className="welcome-hi">{first ? t('Добро пожаловать') : t('С возвращением,')}</span>
         <b className="welcome-nick">{first ? t('в Millida') : nick || t('игрок')}</b>
         {gift ? (

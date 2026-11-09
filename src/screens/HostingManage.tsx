@@ -893,7 +893,7 @@ export function HostingManage({
                       src={cur.icon}
                       alt=""
                       onError={(e) => {
-                        e.currentTarget.src = '/millida-logo.svg'
+                        e.currentTarget.src = '/zaru-logo.png'
                       }}
                       style={{ width: 28, height: 28, borderRadius: 6 }}
                     />
