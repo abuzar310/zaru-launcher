@@ -16,7 +16,7 @@ use super::selfupdate::{fallback_latest, fallback_stage, is_newer, run_installer
 // than a missed recovery.
 const BOOT_GRACE: Duration = Duration::from_secs(25);
 const MAX_ATTEMPTS: u32 = 3;
-const DOWNLOAD_PAGE: &str = "https://millida.net/launcher";
+const DOWNLOAD_PAGE: &str = "https://zaru-launcher.vercel.app";
 const DOWNLOAD_BUTTON: &str = concat!("Скачать", " / Download");
 const CLOSE_BUTTON: &str = concat!("Закрыть", " / Close");
 

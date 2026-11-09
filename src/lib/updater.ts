@@ -30,7 +30,7 @@ export interface UpdateInfo {
   install: () => Promise<void>
 }
 
-export const DOWNLOAD_PAGE = 'https://millida.net/launcher'
+export const DOWNLOAD_PAGE = 'https://zaru-launcher.vercel.app'
 
 const FAILED_KEY = 'm-upd-failed'
 /// The version whose patch update did not install: the full installer is taken for it from then on, in every session.

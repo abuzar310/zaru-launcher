@@ -241,10 +241,9 @@
     },
     "updater": {
       "endpoints": [
-        "https://launcher-storage.millida.net/v2/gh/latest.json?v={{current_version}}",
-        "https://launcher-storage.millida.net/v2/latest.json?v={{current_version}}"
+        "https://zaru-launcher.vercel.app/updates/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI5MzUwRDVGRUE4NUI5NzcKUldSM3VZWHFYdzAxS1VyamhaeUdwQkRTNzZwN3U2WXRjaDFpWDZ6b3FvLzN0bkFvY3JwWEFQeCsK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIxNjhDQTkyMzVFQ0QzNzEKUldSeDArdzFrc3BvSWRZSktaZnFDUGFzME5zM09tenJiQUNoU2FUUU95K3RESU1zcXF4Y3VNQ3AK",
       "windows": {
         "installMode": "passive"
       }

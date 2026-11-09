@@ -1,4 +1,4 @@
-// Fallback launcher update: takes the version list from launcher-storage.millida.net (addresses from tauri.conf.json), downloads the new build from GitHub or from our mirror and checks the Millida signature (minisign).
+// Fallback launcher update: takes the version list from the Zaru site (addresses from tauri.conf.json), downloads the new build and checks the Zaru signature (minisign).
 // If the signature does not match, the file is deleted and not run. Running the installer, replacing the .app on macOS and the AppImage on Linux are described at each function.
 use minisign_verify::{PublicKey, Signature};
 use serde::Serialize;
@@ -19,7 +19,7 @@ use super::paths::open_path;
 // tauri.conf.json, so the fallback is not a hole through which a compromised CDN
 // could run an arbitrary installer.
 // Fallback address of the version list. It returns json with the version, the file link and the signature. The main path goes through the Tauri updater plugin.
-const FALLBACK_ENDPOINTS: &[&str] = &["https://launcher-storage.millida.net/latest.json"];
+const FALLBACK_ENDPOINTS: &[&str] = &["https://zaru-launcher.vercel.app/updates/latest.json"];
 
 // Testing channel. The player opts in from settings and then sees a release
 // before everyone else, so a heavy change lands on a few hundred machines
@@ -168,7 +168,7 @@ fn endpoints(app: &AppHandle) -> Vec<String> {
     channel_order(&configured, beta_channel())
 }
 
-// The public signing key comes from tauri.conf.json. The private part belongs to Millida and is not in this repository.
+// The public signing key comes from tauri.conf.json. The private key is not in this repository.
 fn pubkey(app: &AppHandle) -> Result<String, String> {
     app.config()
         .plugins
@@ -1008,7 +1008,7 @@ mod tests {
             off,
             vec![
                 "https://launcher-storage.millida.net/v2/latest.json".to_string(),
-                "https://launcher-storage.millida.net/latest.json".to_string(),
+                "https://zaru-launcher.vercel.app/updates/latest.json".to_string(),
             ],
             "без галки бета не спрашивается вовсе"
         );
@@ -1019,8 +1019,8 @@ mod tests {
             vec![
                 "https://launcher-storage.millida.net/v2/beta.json".to_string(),
                 "https://launcher-storage.millida.net/v2/latest.json".to_string(),
-                "https://launcher-storage.millida.net/beta.json".to_string(),
-                "https://launcher-storage.millida.net/latest.json".to_string(),
+                "https://zaru-launcher.vercel.app/updates/beta.json".to_string(),
+                "https://zaru-launcher.vercel.app/updates/latest.json".to_string(),
             ],
             "с галкой каждая бета идёт перед своим стабильным соседом"
         );
