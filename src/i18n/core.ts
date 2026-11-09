@@ -110,6 +110,34 @@ function localizeParts(locale: Locale, text: string, own: Table | null | undefin
 
 const ADDRESS = /https?:\/\/[^\s<>"')]+|[\w.-]*millida\.(?:net|host)\b[^\s<>"')]*/gi
 
+/// "Not right after one of these characters", without regex lookbehind. Older WebKit
+/// (some Linux webviews, Safari 13) cannot even parse a lookbehind, so the frontend
+/// gate refuses any chunk that contains one. The callback looks at the real previous
+/// character of the string being replaced, which is exactly what the lookbehind did.
+function swapUnlessAfter(text: string, word: RegExp, to: string, before: RegExp): string {
+  return text.replace(word, (hit: string, at: number, all: string) => (at > 0 && before.test(all[at - 1]) ? hit : to))
+}
+
+const SLASH = /[\\/]/
+const RU = /[А-Яа-яЁё]/
+const UK = /[А-Яа-яЁёІіЇїЄєҐґ]/
+const LATIN = /[A-Za-z]/
+/// Applied in order: the word, what the player reads instead, and the characters that
+/// must not come right before it (a path segment, or the middle of a longer word).
+const RENAMES: ReadonlyArray<readonly [RegExp, string, RegExp]> = [
+  [/Millida/g, 'Zaru', SLASH],
+  [/MILLIDA/g, 'ZARU', SLASH],
+  [/Миллида(?![А-Яа-яЁё])/g, 'Zaru', RU],
+  [/миллида(?![А-Яа-яЁё])/g, 'Zaru', RU],
+  [/Мілліда(?![А-Яа-яЁёІіЇїЄєҐґ])/g, 'Zaru', UK],
+  [/мілліда(?![А-Яа-яЁёІіЇїЄєҐґ])/g, 'Zaru', UK],
+  [/Милли(?![А-Яа-яЁё])/g, 'Zaru', RU],
+  [/милли(?![А-Яа-яЁё])/g, 'Zaru', RU],
+  [/Міллі(?![А-Яа-яЁёІіЇїЄєҐґ])/g, 'Zaru', UK],
+  [/міллі(?![А-Яа-яЁёІіЇїЄєҐґ])/g, 'Zaru', UK],
+  [/Milli(?![A-Za-z])/g, 'Zaru', LATIN],
+]
+
 /// The name a player reads. Addresses stay millida.net so sign-in and joins still open.
 export function brandVisible(text: string): string {
   if (!text) return text
@@ -119,18 +147,7 @@ export function brandVisible(text: string): string {
     saved.push(url)
     return token
   })
-  const named = masked
-    .replace(/(?<![\\/])Millida/g, 'Zaru')
-    .replace(/(?<![\\/])MILLIDA/g, 'ZARU')
-    .replace(/(?<![А-Яа-яЁё])Миллида(?![А-Яа-яЁё])/g, 'Zaru')
-    .replace(/(?<![А-Яа-яЁё])миллида(?![А-Яа-яЁё])/g, 'Zaru')
-    .replace(/(?<![А-Яа-яЁёІіЇїЄєҐґ])Мілліда(?![А-Яа-яЁёІіЇїЄєҐґ])/g, 'Zaru')
-    .replace(/(?<![А-Яа-яЁёІіЇїЄєҐґ])мілліда(?![А-Яа-яЁёІіЇїЄєҐґ])/g, 'Zaru')
-    .replace(/(?<![А-Яа-яЁё])Милли(?![А-Яа-яЁё])/g, 'Zaru')
-    .replace(/(?<![А-Яа-яЁё])милли(?![А-Яа-яЁё])/g, 'Zaru')
-    .replace(/(?<![А-Яа-яЁёІіЇїЄєҐґ])Міллі(?![А-Яа-яЁёІіЇїЄєҐґ])/g, 'Zaru')
-    .replace(/(?<![А-Яа-яЁёІіЇїЄєҐґ])міллі(?![А-Яа-яЁёІіЇїЄєҐґ])/g, 'Zaru')
-    .replace(/(?<![A-Za-z])Milli(?![A-Za-z])/g, 'Zaru')
+  const named = RENAMES.reduce((s, [word, to, before]) => swapUnlessAfter(s, word, to, before), masked)
   return named.replace(/\u0001(\d+)\u0001/g, (_, n: string) => saved[Number(n)] ?? '')
 }
 
